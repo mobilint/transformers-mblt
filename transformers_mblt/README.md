@@ -346,7 +346,9 @@ pprint(available_models)
 
 The same listing is available from the CLI: `transformers-mblt list [--task text-generation] [--json]`.
 
-It will search online to look up available models. When offline, it will list cached models in the current environment.
+It will search online to look up available models. When the Hub is unreachable, it falls back to the models cached in the
+current environment. The local cache does not record repository visibility, so the fallback lists cached models only
+with `include_private=True` (CLI: `--include-private`); otherwise it returns empty lists and explains why on stderr.
 
 ## Keyword Parameters
 

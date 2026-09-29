@@ -85,3 +85,42 @@ def test_main_registers_models_before_handler(monkeypatch: pytest.MonkeyPatch) -
 
     assert cli_main.main() == 0
     assert calls == ["register", "handler"]
+
+
+def _fake_offline_cache(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """Point the HF cache at ``tmp_path`` holding one cached Mobilint repo and make the Hub unreachable."""
+    snapshot = tmp_path / "models--mobilint--Llama-3.2-1B-Instruct" / "snapshots" / "abc123"
+    snapshot.mkdir(parents=True)
+    (snapshot / "README.md").write_text("---\npipeline_tag: text-generation\n---\n")
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path))
+
+    def _hub_down(tasks, *, include_private):
+        raise ConnectionError("hub unreachable")
+
+    monkeypatch.setattr("transformers_mblt.utils.api._list_models_from_hub", _hub_down)
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "expected"),
+    [
+        (["--include-private"], ["mobilint/Llama-3.2-1B-Instruct"]),
+        ([], []),
+    ],
+)
+def test_list_json_stays_valid_on_hub_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path,
+    extra_args: list[str],
+    expected: list[str],
+) -> None:
+    """Fallback diagnostics go to stderr, and cached repos are listed only when private repos are allowed."""
+    _fake_offline_cache(monkeypatch, tmp_path)
+    monkeypatch.setattr(sys, "argv", ["transformers-mblt", "list", "--task", "text-generation", "--json", *extra_args])
+
+    assert cli_main.main() == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {"text-generation": expected}
+    assert "Falling back to local cache" in captured.err
+    if not extra_args:
+        assert "--include-private" in captured.err

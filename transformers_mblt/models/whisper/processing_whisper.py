@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from typing import Any
 
+from transformers import AutoFeatureExtractor
 from transformers.models.whisper.feature_extraction_whisper import (
     WhisperFeatureExtractor as HFWhisperFeatureExtractor,
 )
+
+from .configuration_whisper import MobilintWhisperConfig
 
 
 def _sum_attention_mask_frames(attention_mask: Any) -> Any:
@@ -62,5 +65,9 @@ class MobilintWhisperFeatureExtractor(HFWhisperFeatureExtractor):
 
         return processed
 
+
+# Hub releases name this class in `preprocessor_config.json` (`feature_extractor_type`) and point `auto_map` at the
+# proxy; register it so `AutoFeatureExtractor` resolves it after `transformers_mblt.register()` without remote code.
+AutoFeatureExtractor.register(MobilintWhisperConfig, MobilintWhisperFeatureExtractor, exist_ok=True)
 
 __all__ = ["MobilintWhisperFeatureExtractor"]
