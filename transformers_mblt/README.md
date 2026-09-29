@@ -46,7 +46,7 @@ pip install -e .
 
 ## Quick Start Guide
 
-**transformers-mblt** provides quantized models based on Transformers with the same interfaces. If the `transformers-mblt` package is installed, you can use auto classes from `transformers` such as `pipeline`, `AutoModel`, and `AutoTokenizer` with our models' ids. The following code snippet shows how to use the pre-trained model for inference with `pipeline`. Our models include proxy python codes to import needed config and model classes, so `trust_remote_code=True` must be passed to every `transformers` auto loader that touches the Hub (for example, `AutoTokenizer.from_pretrained(...)`, `AutoProcessor.from_pretrained(...)`, `AutoModel.from_pretrained(...)`, and `pipeline(...)`).
+**transformers-mblt** provides quantized models based on Transformers with the same interfaces. If the `transformers-mblt` package is installed, you can use auto classes from `transformers` such as `pipeline`, `AutoModel`, and `AutoTokenizer` with our models' ids. The following code snippet shows how to use the pre-trained model for inference with `pipeline`. Our models include proxy python codes to import needed config and model classes. When loading through these proxies, `trust_remote_code=True` must be passed to every `transformers` auto loader that touches the Hub (for example, `AutoTokenizer.from_pretrained(...)`, `AutoProcessor.from_pretrained(...)`, `AutoModel.from_pretrained(...)`, and `pipeline(...)`).
 
 Alternatively, call `transformers_mblt.register()` once before loading. It registers every `mobilint-*` model type
 with the Auto classes, so the models load from the installed package without executing Hub remote code:
@@ -184,7 +184,7 @@ pipe(
 )
 ```
 
-Further usage examples can be found in the [tests](../../tests/transformers) directory.
+Further usage examples can be found in the [tests](../tests/transformers) directory.
 
 ### Qwen3-VL release contract
 
@@ -192,8 +192,8 @@ Further usage examples can be found in the [tests](../../tests/transformers) dir
 > currently **unsupported**. Loading either under `qbruntime` 1.4.0 / `mblt_npu` 0.1.0 hits
 > `NPU-only model output order mismatch` and access-violation-crashes at
 > `qbruntime.Model.__init__::get_model_input_shape`. Use the 2B or 4B variants until the 8B
-> repo ships an MXQ compatible with the current runtime; see `CHANGELOG.md` Unreleased for the
-> full withdrawal note.
+> repo ships an MXQ compatible with the current runtime; see the "Known limitations" section of
+> [`CHANGELOG.md` 0.0.0](../CHANGELOG.md#000) for the full withdrawal note.
 
 Qwen3-VL ships on Mobilint as one release per Hugging Face branch: the vision `*.mxq`, the text
 `*.mxq`, `MobilintQwen3VLProcessor`, and `MobilintQwen3VLConfig` are compiled and calibrated
@@ -541,9 +541,11 @@ The parameters below follow the standard `transformers` semantics. For Mobilint 
 
 - `trust_remote_code`
 
-    Must be set to `True` for our model zoo models, because our `auto_map` proxy code is loaded as remote code from the Hugging Face Hub.
-    Pass it to every relevant loader call, including `AutoTokenizer.from_pretrained(...)`, `AutoProcessor.from_pretrained(...)`, `AutoConfig.from_pretrained(...)`, `AutoModel.from_pretrained(...)`, and `pipeline(...)`.
+    Required when loading through the Hub proxy: the `auto_map` proxy code in each `mobilint/*` repository is loaded as remote code from the Hugging Face Hub.
+    In that mode, pass it to every relevant loader call, including `AutoTokenizer.from_pretrained(...)`, `AutoProcessor.from_pretrained(...)`, `AutoConfig.from_pretrained(...)`, `AutoModel.from_pretrained(...)`, and `pipeline(...)`.
     This lets you use the standard `transformers` auto classes while loading Mobilint-specific implementations.
+
+    Not required after `transformers_mblt.register()`: the `mobilint-*` model types then resolve to the installed package, so you can leave `trust_remote_code` unset (or `False`) and no Hub remote code runs. The `transformers-mblt` CLI accepts `--no-trust-remote-code` for the same path.
 
 - `dtype`
 

@@ -132,6 +132,38 @@ def test_register_mobilint_models_respects_trust_remote_code(trust_remote_code: 
     assert calls == [("mobilint/demo-model", "dev", trust_remote_code)]
 
 
+@pytest.mark.parametrize("architectures", ["missing", None, []])
+def test_register_mobilint_models_tolerates_configs_without_architectures(
+    monkeypatch: pytest.MonkeyPatch, architectures: object
+) -> None:
+    """A `mobilint-*` config without `architectures` imports its modeling module and skips class injection."""
+    fields: dict[str, object] = {"model_type": "mobilint-llama"}
+    if architectures != "missing":
+        fields["architectures"] = architectures
+
+    class _FakeAutoConfig:
+        @staticmethod
+        def from_pretrained(model_name_or_path_or_address: str, revision: str | None, trust_remote_code: bool):
+            return type("_Config", (), fields)()
+
+    imported: list[str] = []
+    fake_module = ModuleType("transformers_mblt.models.llama.modeling_llama")
+    monkeypatch.setattr("transformers_mblt._registry.register", lambda **kwargs: {})
+    monkeypatch.setattr(importlib, "import_module", lambda name: imported.append(name) or fake_module)
+
+    # No `models` attribute: reaching the task-mapping patch would raise AttributeError.
+    fake_transformers = type("_Transformers", (), {"AutoConfig": _FakeAutoConfig})()
+    args = type(
+        "_Args",
+        (),
+        {"model_name_or_path_or_address": "local/model", "model_revision": None, "trust_remote_code": False},
+    )()
+
+    chat_cli.register_mobilint_models(args, fake_transformers)
+
+    assert imported == ["transformers_mblt.models.llama.modeling_llama"]
+
+
 def test_register_mobilint_models_imports_hyphenated_model_types_using_package_names(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

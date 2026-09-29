@@ -22,3 +22,15 @@
   Hub repository serves both packages. Import failures that are not a missing package are no longer rewritten into
   a generic install hint.
 - Install hints and CLI help now point to `transformers-mblt`.
+
+### Known limitations
+
+- **Qwen3-VL 8B (regular and `Batch16`) remains withdrawn**, as in mblt-model-zoo 2.5.0. Loading
+  `mobilint/Qwen3-VL-8B-Instruct` or `mobilint/Qwen3-VL-8B-Instruct-Batch16` under `qbruntime` 1.4.0 / `mblt_npu`
+  0.1.0 hits `NPU-only model output order mismatch` and access-violation-crashes at
+  `qbruntime.Model.__init__::get_model_input_shape`. The 8B-only tests and the 8B rows in the parametrized
+  non-batch tuples stay removed until the model repository ships an MXQ compatible with the current runtime.
+  The 2B and 4B variants are supported.
+- Hub `proxy_*.py` files published before this release import only `mblt_model_zoo.hf_transformers`. Until they are
+  re-uploaded, loading with `trust_remote_code=True` requires `mblt-model-zoo`; without it, call
+  `transformers_mblt.register()` and load with `trust_remote_code=False`.

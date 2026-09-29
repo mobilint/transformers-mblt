@@ -25,11 +25,11 @@ def register_mobilint_models(args: Namespace, transformers):
         import importlib
 
         module = importlib.import_module(f"transformers_mblt.models.{module_model_type}.modeling_{module_model_type}")
-        setattr(
-            transformers,
-            config.architectures[0],
-            module.__dict__[config.architectures[0]],
-        )
+        # Importing the modeling module already registers its Auto classes. The class injection and task-mapping
+        # patch below need a concrete architecture name, so skip them when the config omits `architectures`.
+        if not arch_name:
+            return
+        setattr(transformers, arch_name, module.__dict__[arch_name])
 
         MODEL_FOR_CAUSAL_LM_MAPPING_NAMES = transformers.models.auto.modeling_auto.MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
         MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES = (
