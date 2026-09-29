@@ -1,0 +1,5 @@
+# Tests, benchmarks, and debug scripts are development-only. setuptools already builds only the
+# `transformers_mblt*` packages; prune them from the sdist to pin that intent.
+prune tests
+prune benchmark
+prune scripts

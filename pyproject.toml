@@ -1,0 +1,110 @@
+[build-system]
+requires = ["setuptools>=70.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "transformers-mblt"
+dynamic = ["version"]
+description = "Mobilint NPU integrations for Hugging Face Transformers: LLMs, VLMs, ASR, and speculative decoding"
+readme = "README.md"
+authors = [{ name = "Mobilint Inc.", email = "tech-support@mobilint.com" }]
+license = { text = "BSD-3-Clause" }
+requires-python = ">=3.10,<3.13"
+keywords = ["transformers", "NPU", "LLM", "VLM", "pre-quantized models", "inference", "mobilint", "mblt", "aries", "regulus"]
+dependencies = [
+    "mblt-npu-python>=0.1.0",
+    "mobilint-qb-runtime>=1.4.0",
+    "transformers[serving]>=4.54.0,<5.18.0",
+    "torch>=2.4.1",
+    "torchvision",
+    "torchcodec",
+    "numpy>=1.26.0",
+    "huggingface-hub",
+    "datasets>=3.2.0,<=3.6.0",
+    "sentencepiece",
+    "pillow>=11.1.0",
+    "opencv-python>=4.11.0.86",
+    "packaging",
+    "tqdm",
+    "matplotlib",
+    "mblt-tracker>=1.0.1",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: BSD License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+[project.urls]
+Home = "https://www.mobilint.com/"
+Repository = "https://github.com/mobilint/transformers-mblt"
+
+[project.scripts]
+transformers-mblt = "transformers_mblt.cli:main"
+
+[project.optional-dependencies]
+qwen-asr = [
+    "qwen-asr",
+]
+
+[tool.setuptools]
+packages = { find = { where = ["."], include = ["transformers_mblt", "transformers_mblt.*"] } }
+
+[tool.setuptools.dynamic]
+version = { attr = "transformers_mblt.__version__" }
+
+[tool.setuptools.package-data]
+"transformers_mblt" = ["py.typed"]
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.3.0",
+    "pytest>=8.4.2",
+    "jiwer>=3.0.0",
+    "librosa>=0.11.0, <=0.11.0",
+    "numba>=0.60.0, <=0.60.0",
+    "hf_xet",
+    "build",
+    "ruff",
+    "soundfile",
+    "rich",
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "full_matrix: additional transformer model/core matrix cases enabled by --full-matrix.",
+    "requires_network: test downloads models, datasets, or other remote artifacts.",
+    "requires_npu: test requires a configured Mobilint NPU runtime and device.",
+    "upstream_contract: pins invariants of upstream HF transformers classes that our wrappers depend on; deselect with '-m \"not upstream_contract\"' in fast CI.",
+]
+filterwarnings = [
+    "ignore:Keep-all or multi-position `logits_to_keep` on a last-only MXQ:UserWarning",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+# The model and utility modules were extracted verbatim from mblt-model-zoo, where they were also excluded.
+exclude = [
+    "transformers_mblt/models",
+    "transformers_mblt/utils",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = ["PLC0414"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
