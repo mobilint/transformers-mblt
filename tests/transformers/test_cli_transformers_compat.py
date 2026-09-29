@@ -186,6 +186,8 @@ def test_register_mobilint_models_imports_hyphenated_model_types_using_package_n
             raise AssertionError(f"unexpected module import: {module_name}")
         return fake_module
 
+    # Registration of every architecture is covered in tests/test_registry.py; isolate the module-name translation.
+    monkeypatch.setattr("transformers_mblt._registry.register", lambda **kwargs: {})
     monkeypatch.setattr(importlib, "import_module", _fake_import_module)
 
     args = type(

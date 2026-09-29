@@ -33,7 +33,10 @@ _ARCHITECTURES: tuple[str, ...] = (
 )
 _MODULE_KINDS: tuple[str, ...] = ("configuration", "modeling", "processing")
 
-_registered: dict[str, list[str]] | None = None
+# Only successfully imported architectures are cached; skipped ones are retried on every call so a later
+# ``register(strict=True)`` still raises for them (and succeeds once their dependency is installed).
+_registered: dict[str, list[str]] = {}
+_warned_skips: set[str] = set()
 
 
 def _architecture_modules(arch: str) -> list[str]:
@@ -50,21 +53,21 @@ def _architecture_modules(arch: str) -> list[str]:
 def register(*, strict: bool = False) -> dict[str, list[str]]:
     """Import every Mobilint architecture module so the Auto classes know the ``mobilint-*`` model types.
 
-    The call is idempotent: later calls return the cached result.
+    Architectures that were already registered are not imported again. Architectures that failed to import are
+    retried on every call, so a strict call is never satisfied by an earlier non-strict partial result.
 
     Args:
         strict: Re-raise the first import failure instead of warning and skipping that architecture. Architectures
-            such as Qwen3-VL and Qwen3-ASR require newer ``transformers`` releases and are skipped otherwise.
+            such as Qwen3-VL and Qwen3-ASR require newer ``transformers`` releases or optional extras and are
+            skipped otherwise. Each skip is warned about once per process.
 
     Returns:
-        Mapping of architecture name to the module names that were imported.
+        Mapping of architecture name to the module names that were imported. The same mapping object is returned
+        by every call and grows as previously skipped architectures become importable.
     """
-    global _registered
-    if _registered is not None:
-        return _registered
-
-    registered: dict[str, list[str]] = {}
     for arch in _ARCHITECTURES:
+        if arch in _registered:
+            continue
         try:
             modules = _architecture_modules(arch)
             for module_name in modules:
@@ -72,12 +75,13 @@ def register(*, strict: bool = False) -> dict[str, list[str]]:
         except ImportError as exc:
             if strict:
                 raise
-            warnings.warn(f"Skipping Mobilint architecture '{arch}': {exc}", RuntimeWarning, stacklevel=2)
+            if arch not in _warned_skips:
+                _warned_skips.add(arch)
+                warnings.warn(f"Skipping Mobilint architecture '{arch}': {exc}", RuntimeWarning, stacklevel=2)
             continue
-        registered[arch] = modules
+        _registered[arch] = modules
 
-    _registered = registered
-    return registered
+    return _registered
 
 
 def registered_architectures() -> tuple[str, ...]:

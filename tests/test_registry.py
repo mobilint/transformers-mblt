@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import warnings
 
 import pytest
 
@@ -29,18 +30,58 @@ def test_register_exposes_mobilint_model_types_to_auto_config() -> None:
         assert model_type in CONFIG_MAPPING
 
 
-def test_register_strict_reraises_import_errors(monkeypatch: pytest.MonkeyPatch) -> None:
-    def _fail(arch: str) -> list[str]:
-        raise ImportError(f"broken {arch}")
+def _fresh_registry(monkeypatch: pytest.MonkeyPatch, failing: set[str]) -> None:
+    """Reset the registry cache and make ``failing`` architectures raise ImportError."""
 
-    monkeypatch.setattr(_registry, "_registered", None)
-    monkeypatch.setattr(_registry, "_architecture_modules", _fail)
+    def _modules(arch: str) -> list[str]:
+        if arch in failing:
+            raise ImportError(f"broken {arch}")
+        return []
+
+    monkeypatch.setattr(_registry, "_registered", {})
+    monkeypatch.setattr(_registry, "_warned_skips", set())
+    monkeypatch.setattr(_registry, "_architecture_modules", _modules)
+
+
+def test_register_strict_reraises_import_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    _fresh_registry(monkeypatch, failing={"llama"})
     with pytest.raises(ImportError, match="broken llama"):
         _registry.register(strict=True)
 
-    monkeypatch.setattr(_registry, "_registered", None)
+    _fresh_registry(monkeypatch, failing={"llama"})
     with pytest.warns(RuntimeWarning, match="Skipping Mobilint architecture 'llama'"):
-        assert _registry.register() == {}
+        registered = _registry.register()
+    assert "llama" not in registered
+    assert set(registered) == set(_registry.registered_architectures()) - {"llama"}
+
+
+def test_strict_register_is_not_satisfied_by_cached_partial_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-strict call that skipped an architecture must not make a later strict call succeed silently."""
+    failing = {"qwen3_asr"}
+    _fresh_registry(monkeypatch, failing=failing)
+
+    with pytest.warns(RuntimeWarning, match="Skipping Mobilint architecture 'qwen3_asr'"):
+        partial = _registry.register()
+    assert "qwen3_asr" not in partial
+
+    with pytest.raises(ImportError, match="broken qwen3_asr"):
+        _registry.register(strict=True)
+
+    # Once the dependency becomes importable, the skipped architecture is retried and registered.
+    failing.clear()
+    completed = _registry.register(strict=True)
+    assert completed is partial
+    assert set(completed) == set(_registry.registered_architectures())
+
+
+def test_register_warns_once_per_skipped_architecture(monkeypatch: pytest.MonkeyPatch) -> None:
+    _fresh_registry(monkeypatch, failing={"qwen3_asr"})
+    with pytest.warns(RuntimeWarning):
+        _registry.register()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        _registry.register()
 
 
 def test_top_level_lazy_exports() -> None:
