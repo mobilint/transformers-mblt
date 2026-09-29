@@ -5,6 +5,10 @@ def register_mobilint_models(args: Namespace, transformers):
     """Register Mobilint model classes using the active CLI trust and revision settings."""
     revision = getattr(args, "model_revision", None)
     trust_remote_code = getattr(args, "trust_remote_code", False)
+    # Without remote code, AutoConfig can only resolve `mobilint-*` model types that are registered locally.
+    from .._registry import register
+
+    register()
     config = transformers.AutoConfig.from_pretrained(
         args.model_name_or_path_or_address,
         revision=revision,
@@ -20,9 +24,7 @@ def register_mobilint_models(args: Namespace, transformers):
 
         import importlib
 
-        module = importlib.import_module(
-            f"transformers_mblt.models.{module_model_type}.modeling_{module_model_type}"
-        )
+        module = importlib.import_module(f"transformers_mblt.models.{module_model_type}.modeling_{module_model_type}")
         setattr(
             transformers,
             config.architectures[0],

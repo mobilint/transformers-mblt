@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import importlib.util
 
 import pytest
@@ -59,3 +60,17 @@ def test_npu_module_installs_dispatcher_property() -> None:
 
     assert npu.MobilintNPUBackend is MobilintNPUBackend
     assert isinstance(MobilintNPUBackend.__dict__.get("dispatcher"), property)
+
+
+@pytest.mark.parametrize("arch", _registry.registered_architectures())
+def test_model_package_exports_resolve(arch: str) -> None:
+    """Every name a model package advertises in ``__all__`` resolves through its lazy ``__getattr__``."""
+    if arch == "qwen3_asr" and importlib.util.find_spec("qwen_asr") is None:
+        pytest.skip("qwen3_asr requires the qwen-asr extra")
+
+    package = importlib.import_module(f"transformers_mblt.models.{arch}")
+    exported = getattr(package, "__all__", ())
+    assert exported, f"{package.__name__} declares no __all__"
+    for name in exported:
+        # Only resolvability is checked: some exports alias upstream classes (MobilintQwen3ASRProcessor).
+        assert isinstance(getattr(package, name), type)

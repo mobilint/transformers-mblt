@@ -10,11 +10,11 @@ def __getattr__(name: str):
     if name == "MobilintSiglipVisionConfig":
         module = importlib.import_module(".configuration_siglip", __package__)
         return module.MobilintSiglipVisionConfig
-    
-    if name == "MobilintSiglipForConditionalGeneration":
+
+    if name == "MobilintSiglipVisionModel":
         module = importlib.import_module(".modeling_siglip", __package__)
-        return module.MobilintSiglipForConditionalGeneration
+        return module.MobilintSiglipVisionModel
 
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
-__all__ = ["MobilintSiglipVisionConfig", "MobilintSiglipForConditionalGeneration"]
+__all__ = ["MobilintSiglipVisionConfig", "MobilintSiglipVisionModel"]
