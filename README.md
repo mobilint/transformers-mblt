@@ -44,34 +44,36 @@ pip install "transformers-mblt[qwen-asr]"
 ## Quick start
 
 Mobilint models are published on the [Mobilint Hugging Face organization](https://huggingface.co/mobilint).
-Their repositories include small proxy modules, so pass `trust_remote_code=True` to every Auto loader:
+Call `transformers_mblt.register()` once, and the standard `transformers` Auto classes and `pipeline(...)` load them
+from the installed package without running Hub remote code:
 
 ```python
+import transformers_mblt
 from transformers import AutoTokenizer, TextStreamer, pipeline
 
-model_id = "mobilint/Llama-3.2-3B-Instruct"
-tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+transformers_mblt.register()
+
+model_id = "mobilint/Llama-3.2-1B-Instruct"
+tokenizer = AutoTokenizer.from_pretrained(model_id)
 pipe = pipeline(
     "text-generation",
     model=model_id,
+    tokenizer=tokenizer,
     streamer=TextStreamer(tokenizer=tokenizer, skip_prompt=False),
-    trust_remote_code=True,
+    model_kwargs={"core_mode": "single"},
 )
 messages = [{"role": "user", "content": "What is an NPU?"}]
 pipe(messages, max_new_tokens=128)
 pipe.model.dispose()
 ```
 
-As an alternative, register the Mobilint model types once. They then load from the installed package
-without running Hub remote code:
+### Loading through Hub remote code
 
-```python
-import transformers_mblt
-from transformers import AutoModelForCausalLM
-
-transformers_mblt.register()
-model = AutoModelForCausalLM.from_pretrained("mobilint/Llama-3.2-1B-Instruct", core_mode="single")
-```
+Each `mobilint/*` repository also ships `proxy_*.py` remote code, loaded with `trust_remote_code=True`. The proxies
+currently published on the Hub import only `mblt_model_zoo.hf_transformers`, so **this path currently requires
+`mblt-model-zoo` to be installed**. The updated proxies in this package import `transformers_mblt` first and fall
+back to `mblt_model_zoo.hf_transformers`; once they are re-uploaded to the Hub, `trust_remote_code=True` works with
+`transformers-mblt` alone. Until then, use `register()` as shown above.
 
 NPU placement is controlled with keyword arguments. The main ones are `mxq_path`, `dev_no`,
 `core_mode`, `target_cores`, `target_clusters`, `target_device`, `revision`, `embedding_weight`,

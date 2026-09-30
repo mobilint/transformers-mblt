@@ -85,3 +85,50 @@ def test_serve_hook_registers_local_models_without_remote_code(tmp_path: Path) -
 
     assert result.returncode == 0, result.stderr[-4000:]
     assert result.stdout.strip().splitlines()[-1] == "ok"
+
+
+_TWO_MODULE_SCRIPT = textwrap.dedent(
+    """
+    import sys
+
+    import transformers as transformers_before
+
+    from transformers_mblt.cli import transformers_compat as tc
+
+    model_dir = sys.argv[1]
+
+    # Registering the architectures lets Transformers' lazy-import machinery rebind sys.modules["transformers"],
+    # so the serve hook can see two distinct top-level module objects.
+    tc._register_mobilint_model_for_modules(model_dir, transformers_before, trust_remote_code=False)
+    transformers_after = sys.modules["transformers"]
+    modules = {id(transformers_before): transformers_before, id(transformers_after): transformers_after}
+
+    # Route registration explicitly through each object as `extra_transformers`, as the serve hook does.
+    for module in modules.values():
+        tc._register_mobilint_model_for_modules(model_dir, module, trust_remote_code=False)
+
+    for module in modules.values():
+        config = module.AutoConfig.from_pretrained(model_dir, trust_remote_code=False)
+        assert type(config).__name__ == "MobilintLlamaConfig", type(config)
+        assert module.MobilintLlamaForCausalLM.__module__ == "transformers_mblt.models.llama.modeling_llama"
+        mapping = module.models.auto.modeling_auto.MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
+        assert mapping["mobilint-llama"] == "MobilintLlamaForCausalLM"
+    print(f"ok {len(modules)}")
+    """
+)
+
+
+def test_registration_reaches_every_transformers_module_object(tmp_path: Path) -> None:
+    """Each distinct `transformers` module object the serve hook may hold resolves `mobilint-*` without remote code."""
+    _write_mobilint_llama_config(tmp_path)
+
+    result = subprocess.run(
+        [sys.executable, "-c", _TWO_MODULE_SCRIPT, str(tmp_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+
+    assert result.returncode == 0, result.stderr[-4000:]
+    assert result.stdout.strip().splitlines()[-1].startswith("ok ")

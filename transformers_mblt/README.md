@@ -46,6 +46,12 @@ pip install -e .
 
 ## Quick Start Guide
 
+> **Hub proxy rollout state.** The examples below load through the Hub `proxy_*.py` remote code with
+> `trust_remote_code=True`. The proxies currently published on the Hub import only `mblt_model_zoo.hf_transformers`,
+> so these examples currently require `mblt-model-zoo` to be installed. With `transformers-mblt` alone, call
+> `transformers_mblt.register()` first and drop `trust_remote_code` (see the `register()` example below). Once the
+> updated proxies are re-uploaded, the examples work unchanged with either package.
+
 **transformers-mblt** provides quantized models based on Transformers with the same interfaces. If the `transformers-mblt` package is installed, you can use auto classes from `transformers` such as `pipeline`, `AutoModel`, and `AutoTokenizer` with our models' ids. The following code snippet shows how to use the pre-trained model for inference with `pipeline`. Our models include proxy python codes to import needed config and model classes. When loading through these proxies, `trust_remote_code=True` must be passed to every `transformers` auto loader that touches the Hub (for example, `AutoTokenizer.from_pretrained(...)`, `AutoProcessor.from_pretrained(...)`, `AutoModel.from_pretrained(...)`, and `pipeline(...)`).
 
 Alternatively, call `transformers_mblt.register()` once before loading. It registers every `mobilint-*` model type
