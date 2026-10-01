@@ -1,7 +1,7 @@
 """Pre-launch batch-size and core-mode resolvers for the TPS CLI.
 
 Every ``args.batch_size`` / ``args.core_mode`` read in
-``mblt_model_zoo/cli/tps.py`` routes through one of four canonical resolvers:
+``transformers_mblt/cli/tps.py`` routes through one of four canonical resolvers:
 
 * :func:`_resolve_effective_batch_size_pre_launch` — before pipeline
   construction (CLI → config → 1).

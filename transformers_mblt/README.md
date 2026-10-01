@@ -46,12 +46,6 @@ pip install -e .
 
 ## Quick Start Guide
 
-> **Hub proxy rollout state.** The examples below load through the Hub `proxy_*.py` remote code with
-> `trust_remote_code=True`. The proxies currently published on the Hub import only `mblt_model_zoo.hf_transformers`,
-> so these examples currently require `mblt-model-zoo` to be installed. With `transformers-mblt` alone, call
-> `transformers_mblt.register()` first and drop `trust_remote_code` (see the `register()` example below). Once the
-> updated proxies are re-uploaded, the examples work unchanged with either package.
-
 **transformers-mblt** provides quantized models based on Transformers with the same interfaces. If the `transformers-mblt` package is installed, you can use auto classes from `transformers` such as `pipeline`, `AutoModel`, and `AutoTokenizer` with our models' ids. The following code snippet shows how to use the pre-trained model for inference with `pipeline`. Our models include proxy python codes to import needed config and model classes. When loading through these proxies, `trust_remote_code=True` must be passed to every `transformers` auto loader that touches the Hub (for example, `AutoTokenizer.from_pretrained(...)`, `AutoProcessor.from_pretrained(...)`, `AutoModel.from_pretrained(...)`, and `pipeline(...)`).
 
 Alternatively, call `transformers_mblt.register()` once before loading. It registers every `mobilint-*` model type
@@ -353,8 +347,7 @@ pprint(available_models)
 The same listing is available from the CLI: `transformers-mblt list [--task text-generation] [--json]`.
 
 It will search online to look up available models. When the Hub is unreachable, it falls back to the models cached in the
-current environment. The local cache does not record repository visibility, so the fallback lists cached models only
-with `include_private=True` (CLI: `--include-private`); otherwise it returns empty lists and explains why on stderr.
+current environment and prints the Hub error on stderr.
 
 ## Keyword Parameters
 
@@ -553,7 +546,7 @@ The parameters below follow the standard `transformers` semantics. For Mobilint 
     In that mode, pass it to every relevant loader call, including `AutoTokenizer.from_pretrained(...)`, `AutoProcessor.from_pretrained(...)`, `AutoConfig.from_pretrained(...)`, `AutoModel.from_pretrained(...)`, and `pipeline(...)`.
     This lets you use the standard `transformers` auto classes while loading Mobilint-specific implementations.
 
-    Not required after `transformers_mblt.register()`: the `mobilint-*` model types then resolve to the installed package, so you can leave `trust_remote_code` unset (or `False`) and no Hub remote code runs. The `transformers-mblt` CLI accepts `--no-trust-remote-code` for the same path.
+    Not required after `transformers_mblt.register()`: the `mobilint-*` model types then resolve to the installed package, so you can leave `trust_remote_code` unset (or `False`) and no Hub remote code runs.
 
 - `dtype`
 

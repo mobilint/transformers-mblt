@@ -38,7 +38,7 @@ def test_main_delegates_transformers_cli_command(monkeypatch: pytest.MonkeyPatch
         "build_parser",
         lambda: pytest.fail("build_parser should not be called for delegated Transformers commands"),
     )
-    monkeypatch.setattr(sys, "argv", ["mblt-model-zoo", "chat", "--help"])
+    monkeypatch.setattr(sys, "argv", ["transformers-mblt", "chat", "--help"])
 
     assert cli_main_module.main() == 7
 
@@ -148,7 +148,6 @@ def test_register_mobilint_models_tolerates_configs_without_architectures(
 
     imported: list[str] = []
     fake_module = ModuleType("transformers_mblt.models.llama.modeling_llama")
-    monkeypatch.setattr("transformers_mblt._registry.register", lambda **kwargs: {})
     monkeypatch.setattr(importlib, "import_module", lambda name: imported.append(name) or fake_module)
 
     # No `models` attribute: reaching the task-mapping patch would raise AttributeError.
@@ -218,8 +217,6 @@ def test_register_mobilint_models_imports_hyphenated_model_types_using_package_n
             raise AssertionError(f"unexpected module import: {module_name}")
         return fake_module
 
-    # Registration of every architecture is covered in tests/test_registry.py; isolate the module-name translation.
-    monkeypatch.setattr("transformers_mblt._registry.register", lambda **kwargs: {})
     monkeypatch.setattr(importlib, "import_module", _fake_import_module)
 
     args = type(
@@ -354,12 +351,12 @@ def test_install_transformers_serve_registration_hook_respects_serve_trust_remot
 @pytest.mark.parametrize(
     ("argv", "legacy_chat_backend", "expect_hook"),
     [
-        (["mblt-model-zoo", "chat", "mobilint/Llama-3.2-1B-Instruct"], True, True),
-        (["mblt-model-zoo", "chat", "mobilint/Llama-3.2-1B-Instruct", "--help"], True, True),
-        (["mblt-model-zoo", "chat", "mobilint/Llama-3.2-1B-Instruct"], False, False),
-        (["mblt-model-zoo", "env"], False, False),
-        (["mblt-model-zoo", "version"], False, False),
-        (["mblt-model-zoo", "serve", "mobilint/Llama-3.2-1B-Instruct"], False, True),
+        (["transformers-mblt", "chat", "mobilint/Llama-3.2-1B-Instruct"], True, True),
+        (["transformers-mblt", "chat", "mobilint/Llama-3.2-1B-Instruct", "--help"], True, True),
+        (["transformers-mblt", "chat", "mobilint/Llama-3.2-1B-Instruct"], False, False),
+        (["transformers-mblt", "env"], False, False),
+        (["transformers-mblt", "version"], False, False),
+        (["transformers-mblt", "serve", "mobilint/Llama-3.2-1B-Instruct"], False, True),
     ],
 )
 def test_prepare_transformers_cli_installs_serve_hook_only_when_model_loading_may_happen(
@@ -390,8 +387,8 @@ def test_prepare_transformers_cli_installs_serve_hook_only_when_model_loading_ma
 @pytest.mark.parametrize(
     "argv",
     [
-        ["mblt-model-zoo", "chat", "mobilint/Llama-3.2-1B-Instruct", "--help"],
-        ["mblt-model-zoo", "chat", "mobilint/Llama-3.2-1B-Instruct", "--bad-option"],
+        ["transformers-mblt", "chat", "mobilint/Llama-3.2-1B-Instruct", "--help"],
+        ["transformers-mblt", "chat", "mobilint/Llama-3.2-1B-Instruct", "--bad-option"],
     ],
 )
 def test_prepare_transformers_cli_does_not_register_chat_models_during_help_or_parse_errors(
@@ -694,8 +691,8 @@ def test_dispatch_transformers_cli_prefers_v5_entrypoint_and_restores_argv(
     )
     monkeypatch.setattr(sys, "argv", ["python", "-m", "pytest"])
 
-    exit_code = transformers_compat.dispatch_transformers_cli(["mblt-model-zoo", "chat", "--help"])
+    exit_code = transformers_compat.dispatch_transformers_cli(["transformers-mblt", "chat", "--help"])
 
     assert exit_code == 3
-    assert seen_argv == ["mblt-model-zoo", "chat", "--help"]
+    assert seen_argv == ["transformers-mblt", "chat", "--help"]
     assert sys.argv == ["python", "-m", "pytest"]

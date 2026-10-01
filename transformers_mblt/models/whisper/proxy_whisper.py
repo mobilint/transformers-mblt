@@ -1,7 +1,5 @@
 """Proxy exports for the Mobilint Whisper Hub repository."""
 
-from transformers import WhisperProcessor, WhisperTokenizer
-
 try:
     from transformers_mblt.models.whisper.configuration_whisper import (
         MobilintWhisperConfig,
@@ -39,6 +37,4 @@ __all__ = [
     "MobilintWhisperFeatureExtractor",
     "MobilintWhisperConfig",
     "MobilintWhisperForConditionalGeneration",
-    "WhisperProcessor",
-    "WhisperTokenizer",
 ]

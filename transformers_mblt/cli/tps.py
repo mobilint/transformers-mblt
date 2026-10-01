@@ -945,7 +945,13 @@ def _probe_config_core_mode(
         model_type = str(raw_payload.get("model_type", "") or "").lower()
         architectures = raw_payload.get("architectures")
         is_eagle3 = "eagle3" in model_type or any("eagle3" in str(item).lower() for item in architectures or [])
-        role = "base" if is_eagle3 or raw_payload.get("base_core_mode") is not None else "text" if _is_vlm_task(task) else "shared"
+        role = (
+            "base"
+            if is_eagle3 or raw_payload.get("base_core_mode") is not None
+            else "text"
+            if _is_vlm_task(task)
+            else "shared"
+        )
         candidates.extend(_config_core_mode_candidates_common(raw_payload, role=role))
         for candidate in candidates:
             mode = _normalize_config_core_mode_common(candidate)
@@ -3532,43 +3538,6 @@ def _run_vlm_measure(args: argparse.Namespace) -> int:
         llms, "total_memory_mb"
     )
 
-    # Overall (vision + prefill + decode) device metrics per run — time-weighted.
-    def _overall_per_run(attr_dict_key: str, attr_run_key: str) -> list[float]:
-        values: list[float] = []
-        for r, vmetric in zip(runs, vision_metrics_per_run):
-            v_val = vmetric.get(attr_dict_key)
-            v_w = float(r.vision_encode_latency or 0.0) * float(batch_size)
-            p_val = getattr(r.llm, f"prefill_{attr_run_key}", None)
-            p_w = float(getattr(r.llm, "prefill_latency", 0.0) or 0.0)
-            d_val = getattr(r.llm, f"decode_{attr_run_key}", None)
-            d_w = float(getattr(r.llm, "decode_duration", 0.0) or 0.0)
-            combined = _weighted_mean([(v_val, v_w), (p_val, p_w), (d_val, d_w)])
-            if combined is not None:
-                values.append(float(combined))
-        return values
-
-    def _overall_p99_per_run(dict_key: str, run_key: str) -> list[float]:
-        values: list[float] = []
-        for r, vmetric in zip(runs, vision_metrics_per_run):
-            v = vmetric.get(dict_key)
-            p = getattr(r.llm, f"prefill_{run_key}", None)
-            d = getattr(r.llm, f"decode_{run_key}", None)
-            m = _max_ignore_none((v, p, d))
-            if m is not None:
-                values.append(float(m))
-        return values
-
-    avg_power_w = _overall_per_run("avg_power_w", "avg_power_w")
-    p99_power_w = _overall_p99_per_run("p99_power_w", "p99_power_w")
-    avg_utilization_pct = _overall_per_run("avg_utilization_pct", "avg_utilization_pct")
-    p99_utilization_pct = _overall_p99_per_run("p99_utilization_pct", "p99_utilization_pct")
-    avg_temperature_c = _overall_per_run("avg_temperature_c", "avg_temperature_c")
-    p99_temperature_c = _overall_p99_per_run("p99_temperature_c", "p99_temperature_c")
-    avg_memory_used_mb = _overall_per_run("avg_memory_used_mb", "avg_memory_used_mb")
-    p99_memory_used_mb = _overall_p99_per_run("p99_memory_used_mb", "p99_memory_used_mb")
-    avg_memory_used_pct = _overall_per_run("avg_memory_used_pct", "avg_memory_used_pct")
-    p99_memory_used_pct = _overall_p99_per_run("p99_memory_used_pct", "p99_memory_used_pct")
-
     # LLM-only (prefill + decode, no vision) overall device metrics per run — time-weighted.
     # Feeds the llm_avg_*/llm_p99_* rows so their labels match the underlying data.
     def _llm_overall_per_run(run_key: str) -> list[float]:
@@ -4746,7 +4715,6 @@ def _run_vlm_sweep(args: argparse.Namespace) -> int:
     llm_decode_energy_j = [
         r.llm_decode_energy_j for r in llm_runs if getattr(r, "llm_decode_energy_j", None) is not None
     ]
-    llm_total_energy_j = [r.total_energy_j for r in llm_runs if getattr(r, "total_energy_j", None) is not None]
     llm_prefill_tps_per_w = [r.prefill_tps_per_w for r in llm_runs if getattr(r, "prefill_tps_per_w", None) is not None]
     llm_decode_tps_per_w = [r.decode_tps_per_w for r in llm_runs if getattr(r, "decode_tps_per_w", None) is not None]
     llm_prefill_j_per_token = [
@@ -4924,8 +4892,6 @@ def add_tps_parser(
     subparsers: argparse._SubParsersAction[argparse.ArgumentParser],
 ) -> None:
     parser = subparsers.add_parser("tps", help="Measure/sweep tokens-per-second")
-    # Loads models, so main() registers the local Mobilint classes first (see _registry.register).
-    parser.set_defaults(_register_mobilint_models=True)
     parser.epilog = (
         "Examples:\n"
         "  transformers-mblt tps measure --model mobilint/Llama-3.2-3B-Instruct --prefill 128 --decode 32\n"

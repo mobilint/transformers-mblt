@@ -3,7 +3,7 @@
 Mirrors the ``batch benchmark only supports --core-mode single or auto`` enforcement
 in ``benchmark/transformers/benchmark_text_generation_models.py`` and
 ``benchmark_image_text_to_text_models.py`` so a user running
-``mblt-model-zoo tps ... --core-mode global8 --batch-size 16`` on a batched
+``transformers-mblt tps ... --core-mode global8 --batch-size 16`` on a batched
 MXQ receives the same friendly ``SystemExit`` instead of a low-level
 backend error mid-launch (or silently wrong throughput).
 

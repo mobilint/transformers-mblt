@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import argparse
 import importlib
 import json
 import subprocess
@@ -70,23 +69,6 @@ def test_module_entry_point_help() -> None:
     assert "transformers-mblt" in result.stdout
 
 
-def test_tps_parser_requests_model_registration() -> None:
-    args = cli_main.build_parser().parse_args(["tps", "measure", "--model", "mobilint/x"])
-    assert args._register_mobilint_models is True
-    assert getattr(cli_main.build_parser().parse_args(["list"]), "_register_mobilint_models", False) is False
-
-
-def test_main_registers_models_before_handler(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[str] = []
-    namespace = argparse.Namespace(_register_mobilint_models=True, _handler=lambda args: calls.append("handler") or 0)
-    monkeypatch.setattr(argparse.ArgumentParser, "parse_args", lambda self, *a, **k: namespace)
-    monkeypatch.setattr("transformers_mblt._registry.register", lambda: calls.append("register"))
-    monkeypatch.setattr(sys, "argv", ["transformers-mblt", "tps", "measure"])
-
-    assert cli_main.main() == 0
-    assert calls == ["register", "handler"]
-
-
 def _fake_offline_cache(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     """Point the HF cache at ``tmp_path`` holding one cached Mobilint repo and make the Hub unreachable."""
     snapshot = tmp_path / "models--mobilint--Llama-3.2-1B-Instruct" / "snapshots" / "abc123"
@@ -100,27 +82,18 @@ def _fake_offline_cache(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     monkeypatch.setattr("transformers_mblt.utils.api._list_models_from_hub", _hub_down)
 
 
-@pytest.mark.parametrize(
-    ("extra_args", "expected"),
-    [
-        (["--include-private"], ["mobilint/Llama-3.2-1B-Instruct"]),
-        ([], []),
-    ],
-)
+@pytest.mark.parametrize("extra_args", [["--include-private"], []])
 def test_list_json_stays_valid_on_hub_fallback(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     tmp_path,
     extra_args: list[str],
-    expected: list[str],
 ) -> None:
-    """Fallback diagnostics go to stderr, and cached repos are listed only when private repos are allowed."""
+    """Fallback diagnostics go to stderr, and the offline cache lists every cached Mobilint repo."""
     _fake_offline_cache(monkeypatch, tmp_path)
     monkeypatch.setattr(sys, "argv", ["transformers-mblt", "list", "--task", "text-generation", "--json", *extra_args])
 
     assert cli_main.main() == 0
     captured = capsys.readouterr()
-    assert json.loads(captured.out) == {"text-generation": expected}
+    assert json.loads(captured.out) == {"text-generation": ["mobilint/Llama-3.2-1B-Instruct"]}
     assert "Falling back to local cache" in captured.err
-    if not extra_args:
-        assert "--include-private" in captured.err

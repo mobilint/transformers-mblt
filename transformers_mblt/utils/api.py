@@ -32,7 +32,7 @@ def list_models(
             f"Falling back to local cache. Error: {e}",
             file=sys.stderr,
         )
-        return _list_models_from_cache(tasks, include_private=include_private)
+        return _list_models_from_cache(tasks)
 
 
 def _list_models_from_hub(
@@ -61,20 +61,10 @@ def _list_models_from_hub(
     return available_models
 
 
-def _list_models_from_cache(tasks: List[str], include_private: bool = False) -> Dict[str, List[str]]:
+def _list_models_from_cache(tasks: List[str]) -> Dict[str, List[str]]:
     cache_root = _get_hf_cache_root()
     available_models: Dict[str, List[str]] = {task: [] for task in tasks}
     if not os.path.isdir(cache_root):
-        return available_models
-
-    if not include_private:
-        # The local cache does not record repository visibility, so private repositories cannot be filtered out.
-        # Fail closed rather than expose cached private repository IDs.
-        print(
-            "Offline cache listing is skipped because cached repository visibility cannot be verified. "
-            "Pass include_private=True (CLI: --include-private) to list every cached Mobilint model.",
-            file=sys.stderr,
-        )
         return available_models
 
     unmatched: List[str] = []

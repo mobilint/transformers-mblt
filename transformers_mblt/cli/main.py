@@ -40,12 +40,6 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
-    if getattr(args, "_register_mobilint_models", False):
-        # Lets `--no-trust-remote-code` resolve `mobilint-*` model types from this package instead of the Hub proxy.
-        from .._registry import register
-
-        register()
-
     if hasattr(args, "_handler"):
         return args._handler(args)
 

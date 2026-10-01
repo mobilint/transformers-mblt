@@ -70,10 +70,8 @@ pipe.model.dispose()
 ### Loading through Hub remote code
 
 Each `mobilint/*` repository also ships `proxy_*.py` remote code, loaded with `trust_remote_code=True`. The proxies
-currently published on the Hub import only `mblt_model_zoo.hf_transformers`, so **this path currently requires
-`mblt-model-zoo` to be installed**. The updated proxies in this package import `transformers_mblt` first and fall
-back to `mblt_model_zoo.hf_transformers`; once they are re-uploaded to the Hub, `trust_remote_code=True` works with
-`transformers-mblt` alone. Until then, use `register()` as shown above.
+import `transformers_mblt` first and fall back to `mblt_model_zoo.hf_transformers`, so this path works with either
+package installed.
 
 NPU placement is controlled with keyword arguments. The main ones are `mxq_path`, `dev_no`,
 `core_mode`, `target_cores`, `target_clusters`, `target_device`, `revision`, `embedding_weight`,

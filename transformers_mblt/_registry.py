@@ -35,8 +35,7 @@ _MODULE_KINDS: tuple[str, ...] = ("configuration", "modeling", "processing")
 
 # The Auto registries (CONFIG_MAPPING and the model/processor mappings) live in `transformers.models.auto.*` and are
 # shared by every `transformers` top-level module object, including the fresh `_LazyModule` that Transformers'
-# lazy imports can bind to sys.modules["transformers"] mid-process, so one registration serves them all
-# (tests/transformers/test_cli_serve_no_remote_code.py covers this).
+# lazy imports can bind to sys.modules["transformers"] mid-process, so one registration serves them all.
 # Only successfully imported architectures are cached; skipped ones are retried on every call so a later
 # ``register(strict=True)`` still raises for them (and succeeds once their dependency is installed).
 _registered: dict[str, list[str]] = {}

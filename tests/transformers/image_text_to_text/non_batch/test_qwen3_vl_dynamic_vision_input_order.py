@@ -2,7 +2,7 @@
 
 Two compile pipelines currently ship Qwen3-VL dynamic vision MXQs with
 different input orderings and each is expected to load through the same
-mblt-model-zoo wheel:
+transformers-mblt wheel:
 
 * mobilint's shipped 8B build (``mobilint/Qwen3-VL-8B-Instruct``) emits
   ``[rope, pos, folded]``.
@@ -108,9 +108,7 @@ def test_resolve_slots_wrong_input_count_raises():
     config = _vision_config_2b()
 
     with pytest.raises(ValueError, match="exactly 3 inputs"):
-        MobilintQwen3VLVisionModel._resolve_dynamic_input_slots(
-            [(1, -1, 128), (1, -1, 1024)], config
-        )
+        MobilintQwen3VLVisionModel._resolve_dynamic_input_slots([(1, -1, 128), (1, -1, 1024)], config)
 
 
 def test_resolve_slots_unexpected_width_raises():
@@ -131,9 +129,7 @@ def test_resolve_slots_role_width_collision_raises():
 
     # Craft a synthetic (non-realistic) config where rope width equals pos width.
     # head_dim = 64 -> rope = 128; force hidden_size = 128 to collide.
-    config = _CollidingConfig(
-        hidden_size=128, num_heads=2, in_channels=3, temporal_patch_size=2, patch_size=16
-    )
+    config = _CollidingConfig(hidden_size=128, num_heads=2, in_channels=3, temporal_patch_size=2, patch_size=16)
     input_shapes = [(1, -1, 128), (1, -1, 128), (1, -1, 1536)]
 
     with pytest.raises(ValueError, match="role widths collide"):

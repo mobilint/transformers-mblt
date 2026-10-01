@@ -85,11 +85,21 @@ Ownership boundary:
   must be added to `_ARCHITECTURES`, the README task table, and `tests/test_registry.py`.
 - `proxy_<arch>.py` is the remote-code file uploaded to each Hub repository. It imports
   `transformers_mblt` first and falls back to `mblt_model_zoo.hf_transformers`. Keep that fallback
-  until every Hub repository ships the updated proxy.
-- Proxies already on the Hub import only `mblt_model_zoo.hf_transformers`. With
-  `trust_remote_code=True` they need Model Zoo installed. The standalone path is
-  `transformers_mblt.register()` followed by loading without remote code. Uploading proxies to the
-  Hub is an outward-facing release step that needs explicit approval.
+  while `mblt-model-zoo` releases load the same Hub repositories.
+- Every `mobilint/*` repository and branch with a proxy ships the current proxy, except
+  `mobilint/Qwen3-30B-A3B` (`proxy_qwen3_moe.py`), whose architecture this package does not provide.
+  Uploading proxies or configs to the Hub is an outward-facing release step that needs explicit approval.
+- Hub `auto_map` lives only in `config.json`. Map `AutoConfig`, every `AutoModel*` entry, and the
+  `AutoProcessor` / `AutoFeatureExtractor` entries for Mobilint processor classes there, and export
+  every mapped class from the proxy. `tokenizer_config.json`, `preprocessor_config.json`,
+  `video_preprocessor_config.json`, and `processor_config.json` carry no `auto_map` and name only
+  upstream classes (`processor_class`, `feature_extractor_type`, `image_processor_type`,
+  `video_processor_type`, `tokenizer_class`), or omit the key. Across the supported Transformers
+  range (4.54.0 to 5.17.0), `AutoProcessor`, `AutoFeatureExtractor`, `AutoImageProcessor`, and
+  `AutoVideoProcessor` read `config.json` `auto_map` only when those files name no class, and
+  `AutoTokenizer` reads only `tokenizer_config.json` `auto_map` (5.x ignores `config.json`
+  entirely). Tokenizers therefore stay upstream classes. A Mobilint class name left in a side file
+  without its own `auto_map` makes `AutoProcessor` silently return a tokenizer.
 
 ## CLI Contract
 
