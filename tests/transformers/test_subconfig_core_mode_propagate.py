@@ -163,9 +163,7 @@ def test_vlm_benchmark_parser_accepts_vision_text_core_modes() -> None:
     """Verify the VLM benchmark CLI parses vision/text core-mode options for measure and sweep."""
     parser = vlm_bench._build_arg_parser()
     for command in ("measure", "sweep"):
-        args = parser.parse_args(
-            [command, "--core-mode", "single", "--vision-core-mode", "global8"]
-        )
+        args = parser.parse_args([command, "--core-mode", "single", "--vision-core-mode", "global8"])
         assert args.vision_core_mode == "global8"
         assert args.text_core_mode is None
         assert args.core_mode == "single"
@@ -411,10 +409,7 @@ def test_asr_build_run_targets_distinguishes_subconfig_variants() -> None:
         asr_bench._parse_args(common_flags + ["--decoder-core-mode", "global4"])
     )[0][3]
     both_override_base = asr_bench._build_run_targets(
-        asr_bench._parse_args(
-            common_flags
-            + ["--encoder-core-mode", "global8", "--decoder-core-mode", "global4"]
-        )
+        asr_bench._parse_args(common_flags + ["--encoder-core-mode", "global8", "--decoder-core-mode", "global4"])
     )[0][3]
 
     assert default_base.endswith("-single")

@@ -2149,9 +2149,9 @@ def test_text_rebuild_sweep_removes_stale_combined_device_csv_when_all_supersede
 
     text_bench._rebuild_combined_outputs(tmp_path)
 
-    assert not (tmp_path / "combined_device.csv").exists(), (
-        "stale combined_device.csv must be removed when all targets are superseded"
-    )
+    assert not (
+        tmp_path / "combined_device.csv"
+    ).exists(), "stale combined_device.csv must be removed when all targets are superseded"
     for filename in _SWEEP_CHART_FILENAMES:
         assert not (tmp_path / filename).exists(), f"stale PNG {filename} should be removed"
     rows = list(csv.DictReader((tmp_path / "combined.csv").open("r", encoding="utf-8")))

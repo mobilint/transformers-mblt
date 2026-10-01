@@ -191,9 +191,11 @@ def main() -> int:
     # for embeddings is acceptable. Different trainers ship different source dtypes (fp32 historically,
     # fp16 for the JPharmatron-7B release), so accept the common floating point widths and let the
     # downstream cast normalize.
-    assert draft_emb.dtype in (torch.float32, torch.float16, torch.bfloat16), (
-        f"draft embed expected float32/float16/bfloat16, got {draft_emb.dtype}"
-    )
+    assert draft_emb.dtype in (
+        torch.float32,
+        torch.float16,
+        torch.bfloat16,
+    ), f"draft embed expected float32/float16/bfloat16, got {draft_emb.dtype}"
     # Contract: Mobilint EAGLE-3 releases train base and draft at a matched hidden size,
     # so packaged embeddings must be shape-identical. The runtime FCProjector branch in
     # MobilintEagle3DraftModelMixin is legacy/future scaffolding and is NOT grounds to relax
@@ -213,9 +215,9 @@ def main() -> int:
     assert d2t.dtype == torch.int64, f"d2t expected int64, got {d2t.dtype}"
     assert t2d.dim() == 1, f"t2d must be rank-1; got shape {tuple(t2d.shape)}"
     assert t2d.dtype == torch.bool, f"t2d expected bool, got {t2d.dtype}"
-    assert t2d.shape[0] == vocab_size, (
-        f"t2d length {t2d.shape[0]} != target vocab {vocab_size}; t2d must be a per-target-token mask."
-    )
+    assert (
+        t2d.shape[0] == vocab_size
+    ), f"t2d length {t2d.shape[0]} != target vocab {vocab_size}; t2d must be a per-target-token mask."
     draft_vocab = int(d2t.shape[0])
     assert draft_vocab <= vocab_size, (
         f"draft vocab (d2t length) {draft_vocab} exceeds target vocab {vocab_size}; "

@@ -762,9 +762,9 @@ def test_from_pretrained_legacy_config_without_dynamic_vision_silent_false(
 
     assert proc.dynamic_vision is False
     assert proc.video_processor.dynamic_vision is False
-    assert not any("dynamic_vision" in rec.message for rec in caplog.records), (
-        "Legacy config path must not emit a warning."
-    )
+    assert not any(
+        "dynamic_vision" in rec.message for rec in caplog.records
+    ), "Legacy config path must not emit a warning."
 
 
 def test_from_pretrained_warns_when_config_load_fails(

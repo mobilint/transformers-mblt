@@ -459,9 +459,7 @@ def rebuild_summary(log_dir: Path) -> int:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument(
         "-v",
         "--versions",
@@ -509,10 +507,7 @@ def main() -> int:
     ap.add_argument(
         "--core-map",
         default=",".join(DEFAULT_CORE_MAP),
-        help=(
-            "Comma-separated cluster:core assignments for phase A workers "
-            f"(default: {','.join(DEFAULT_CORE_MAP)})."
-        ),
+        help=(f"Comma-separated cluster:core assignments for phase A workers (default: {','.join(DEFAULT_CORE_MAP)})."),
     )
     ap.add_argument(
         "pytest_args",
@@ -582,7 +577,8 @@ def main() -> int:
         )
         if workers > 1:
             print(
-                f"WARNING: --full-matrix detected in pytest args; forcing workers=1 (was {workers}) to avoid NPU BadAlloc.",
+                f"WARNING: --full-matrix detected in pytest args; forcing workers=1 (was {workers}) "
+                "to avoid NPU BadAlloc.",
                 file=sys.stderr,
             )
             workers = 1

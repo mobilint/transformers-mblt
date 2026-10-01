@@ -913,7 +913,8 @@ def _measure_target(
                     if _should_skip_whisper_long_form_sample(model_id, sample):
                         print(
                             "Skipping sample (>30s Whisper limit): "
-                            f"model={model_id} sample_id={sample['id']} duration_s={_sample_audio_duration_s(sample):.2f}"
+                            f"model={model_id} sample_id={sample['id']} "
+                            f"duration_s={_sample_audio_duration_s(sample):.2f}"
                         )
                         continue
                     timings.append(_run_one_sample(pipe, sample, generate_kwargs, native_language=native_language))

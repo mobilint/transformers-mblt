@@ -2250,9 +2250,9 @@ def test_non_generative_models_do_not_expose_generation_hook(caplog: pytest.LogC
     with caplog.at_level("WARNING", logger="transformers.modeling_utils"):
         for cls in non_generative_classes:
             assert cls.can_generate() is False, f"{cls.__name__}.can_generate() must be False"
-            assert not hasattr(cls, "prepare_inputs_for_generation"), (
-                f"{cls.__name__} must not expose prepare_inputs_for_generation"
-            )
+            assert not hasattr(
+                cls, "prepare_inputs_for_generation"
+            ), f"{cls.__name__} must not expose prepare_inputs_for_generation"
 
     generative_warnings = [record for record in caplog.records if "has generative capabilities" in record.getMessage()]
     assert not generative_warnings, (

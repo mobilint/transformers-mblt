@@ -13,8 +13,7 @@ _QWEN3_VL_MODULES = (
 )
 
 _QWEN3_VL_SKIP_REASON = (
-    "Installed transformers does not provide the upstream Qwen3-VL classes "
-    "(requires transformers>=4.57.0)."
+    "Installed transformers does not provide the upstream Qwen3-VL classes (requires transformers>=4.57.0)."
 )
 
 

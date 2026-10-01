@@ -8,7 +8,7 @@ from tests.transformers.image_text_to_text.qwen3_vl_compat import skip_if_transf
 
 skip_if_transformers_lacks_qwen3_vl_support()
 
-from transformers_mblt.models.qwen3_vl.modeling_qwen3_vl import MobilintQwen3VLForConditionalGeneration
+from transformers_mblt.models.qwen3_vl.modeling_qwen3_vl import MobilintQwen3VLForConditionalGeneration  # noqa: E402
 
 
 @pytest.mark.parametrize(

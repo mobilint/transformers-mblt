@@ -328,9 +328,9 @@ def test_huge_max_pixels_still_produces_within_budget_image_grid() -> None:
     per_image_tokens = grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]
 
     assert bool((per_image_tokens > 0).all())
-    assert bool((per_image_tokens <= proc.max_vision_tokens).all()), (
-        f"per-image grid exceeded budget: {per_image_tokens.tolist()} > {proc.max_vision_tokens}"
-    )
+    assert bool(
+        (per_image_tokens <= proc.max_vision_tokens).all()
+    ), f"per-image grid exceeded budget: {per_image_tokens.tolist()} > {proc.max_vision_tokens}"
 
 
 # ---------------------------------------------------------------------------
@@ -474,9 +474,9 @@ def test_huge_videos_kwargs_size_still_produces_within_budget_video_grid() -> No
     assert grid_thw.ndim == 2 and grid_thw.shape[1] == 3
     per_frame_tokens = grid_thw[:, 1] * grid_thw[:, 2]
     assert bool((per_frame_tokens > 0).all())
-    assert bool((per_frame_tokens <= proc.max_vision_tokens).all()), (
-        f"per-frame grid exceeded budget: {per_frame_tokens.tolist()} > {proc.max_vision_tokens}"
-    )
+    assert bool(
+        (per_frame_tokens <= proc.max_vision_tokens).all()
+    ), f"per-frame grid exceeded budget: {per_frame_tokens.tolist()} > {proc.max_vision_tokens}"
 
 
 # ---------------------------------------------------------------------------

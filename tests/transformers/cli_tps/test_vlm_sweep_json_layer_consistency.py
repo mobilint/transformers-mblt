@@ -18,7 +18,6 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -190,9 +189,7 @@ def test_vlm_sweep_vision_runs_use_canonical_keys(monkeypatch, tmp_path):
         def measure_llm_full(self, *args, **kwargs):
             del args, kwargs
             return BenchmarkResult(
-                prefill_sweep=SweepData(
-                    x_values=[128, 256], tps_values=[10.0, 20.0], time_values=[0.1, 0.2]
-                ),
+                prefill_sweep=SweepData(x_values=[128, 256], tps_values=[10.0, 20.0], time_values=[0.1, 0.2]),
                 decode_sweep=SweepData(
                     x_values=[128, 256, 512],
                     tps_values=[30.0, 40.0, 50.0],
@@ -203,9 +200,7 @@ def test_vlm_sweep_vision_runs_use_canonical_keys(monkeypatch, tmp_path):
     monkeypatch.setattr(tps_cli, "_build_pipeline", lambda **kwargs: object())
     monkeypatch.setattr(tps_cli, "_resolve_cli_batch_size", lambda args, pipeline: 2)
     monkeypatch.setattr(tps_cli, "_build_device_tracker", lambda args, pipeline: _FakeTracker())
-    monkeypatch.setattr(
-        tps_cli, "_build_phase_trackers", lambda args, pipeline: (_FakeTracker(), _FakeTracker())
-    )
+    monkeypatch.setattr(tps_cli, "_build_phase_trackers", lambda args, pipeline: (_FakeTracker(), _FakeTracker()))
     monkeypatch.setattr(tps_cli, "_print_device_status", lambda args, tracker: None)
     monkeypatch.setattr(tps_cli, "_stop_tracker_safe", lambda tracker: None)
     monkeypatch.setattr(
@@ -282,9 +277,7 @@ def test_vlm_sweep_llm_aggregate_has_device_metrics(monkeypatch, tmp_path):
         def measure_llm_full(self, *args, **kwargs):
             del args, kwargs
             return BenchmarkResult(
-                prefill_sweep=SweepData(
-                    x_values=[128, 256], tps_values=[10.0, 20.0], time_values=[0.1, 0.2]
-                ),
+                prefill_sweep=SweepData(x_values=[128, 256], tps_values=[10.0, 20.0], time_values=[0.1, 0.2]),
                 decode_sweep=SweepData(
                     x_values=[128, 256, 512],
                     tps_values=[30.0, 40.0, 50.0],
@@ -295,9 +288,7 @@ def test_vlm_sweep_llm_aggregate_has_device_metrics(monkeypatch, tmp_path):
     monkeypatch.setattr(tps_cli, "_build_pipeline", lambda **kwargs: object())
     monkeypatch.setattr(tps_cli, "_resolve_cli_batch_size", lambda args, pipeline: 2)
     monkeypatch.setattr(tps_cli, "_build_device_tracker", lambda args, pipeline: _FakeTracker())
-    monkeypatch.setattr(
-        tps_cli, "_build_phase_trackers", lambda args, pipeline: (_FakeTracker(), _FakeTracker())
-    )
+    monkeypatch.setattr(tps_cli, "_build_phase_trackers", lambda args, pipeline: (_FakeTracker(), _FakeTracker()))
     monkeypatch.setattr(tps_cli, "_print_device_status", lambda args, tracker: None)
     monkeypatch.setattr(tps_cli, "_stop_tracker_safe", lambda tracker: None)
     monkeypatch.setattr(

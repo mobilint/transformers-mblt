@@ -68,13 +68,7 @@ _BASE_INFO_NULL_KEYS = (
 
 def _escape_token_text(text: str) -> str:
     """Escape backslash, quote, and whitespace control characters for tree display."""
-    return (
-        text.replace("\\", "\\\\")
-        .replace("\n", "\\n")
-        .replace("\r", "\\r")
-        .replace("\t", "\\t")
-        .replace('"', '\\"')
-    )
+    return text.replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t").replace('"', '\\"')
 
 
 def _decode_token(token_id: int) -> str:
@@ -402,7 +396,7 @@ def _render_tree_ascii(
         return (
             f"{prefix}{connector}{acc_marker}{best_marker} "
             f"id={node['node_id']:3d} d={node['depth']} tok={node['token_id']:>6d} "
-            f"pw={warped_str:>7s} pr={raw_str:>7s} {greedy_str} \"{text}\""
+            f'pw={warped_str:>7s} pr={raw_str:>7s} {greedy_str} "{text}"'
         )
 
     def format_parent_topk_line(node: dict[str, Any], sub_prefix: str) -> Optional[str]:
@@ -412,7 +406,7 @@ def _render_tree_ascii(
         entries = []
         for entry in topk:
             esc_text = _escape_token_text(entry["token_text"])
-            entries.append(f"(tok={entry['token_id']}, \"{esc_text}\", p={float(entry['prob']):.3f})")
+            entries.append(f'(tok={entry["token_id"]}, "{esc_text}", p={float(entry["prob"]):.3f})')
         joined = ", ".join(entries)
         return f"{sub_prefix}    parent top-10: [{joined}]"
 

@@ -329,9 +329,7 @@ class TestLlmForwardSingle:
         npu_prefill_chunk_size: Optional[int] = None,
     ):
         model = make_model(mxq)
-        inputs_embeds = torch.arange(seq_len * hidden_size, dtype=torch.float32).reshape(
-            1, seq_len, hidden_size
-        )
+        inputs_embeds = torch.arange(seq_len * hidden_size, dtype=torch.float32).reshape(1, seq_len, hidden_size)
         cache_position = torch.arange(seq_len)
         logits = model.llm_forward(
             inputs_embeds=inputs_embeds,
@@ -402,9 +400,7 @@ class TestLlmForwardSingle:
 
     def test_dynamic_axis_keep_all_returns_every_position(self) -> None:
         mxq = DynamicAxisMxq(vocab_size=5, max_width=4)
-        model, logits = self._run(
-            mxq, seq_len=6, hidden_size=3, logits_to_keep=0, npu_prefill_chunk_size=3
-        )
+        model, logits = self._run(mxq, seq_len=6, hidden_size=3, logits_to_keep=0, npu_prefill_chunk_size=3)
 
         assert model._mxq_supports_all_logits() is True
         assert logits.shape == (6, mxq.vocab_size)
@@ -418,10 +414,7 @@ class TestLlmForwardSingle:
         for chunk_len in (3, 3):
             offset = cache_size_running * mxq.vocab_size
             expected_chunks.append(
-                np.arange(chunk_len * mxq.vocab_size, dtype=np.float32).reshape(
-                    1, chunk_len, mxq.vocab_size
-                )
-                + offset
+                np.arange(chunk_len * mxq.vocab_size, dtype=np.float32).reshape(1, chunk_len, mxq.vocab_size) + offset
             )
             cache_size_running += chunk_len
         expected = np.concatenate(expected_chunks, axis=1).squeeze(0)
@@ -429,17 +422,13 @@ class TestLlmForwardSingle:
 
     def test_dynamic_axis_keep_last_n_slices_expected_positions(self) -> None:
         mxq = DynamicAxisMxq(vocab_size=5, max_width=4)
-        _model, logits = self._run(
-            mxq, seq_len=6, hidden_size=3, logits_to_keep=2, npu_prefill_chunk_size=3
-        )
+        _model, logits = self._run(mxq, seq_len=6, hidden_size=3, logits_to_keep=2, npu_prefill_chunk_size=3)
         assert logits.shape == (2, mxq.vocab_size)
 
     def test_dynamic_axis_tensor_indices_pick_out_positions(self) -> None:
         mxq = DynamicAxisMxq(vocab_size=5, max_width=4)
         indices = torch.tensor([0, 2, 5])
-        _model, logits = self._run(
-            mxq, seq_len=6, hidden_size=3, logits_to_keep=indices, npu_prefill_chunk_size=3
-        )
+        _model, logits = self._run(mxq, seq_len=6, hidden_size=3, logits_to_keep=indices, npu_prefill_chunk_size=3)
         assert logits.shape == (3, mxq.vocab_size)
 
     def test_dynamic_axis_tensor_preserves_caller_order_and_duplicates(self) -> None:
@@ -493,9 +482,7 @@ class TestLlmForwardSingle:
     def test_fallback_interleaves_size_one_infer_for_kept_positions(self) -> None:
         mxq = StaticLastOnlyMxq(vocab_size=5, max_width=4)
         indices = torch.tensor([2, 5])
-        _model, logits = self._run(
-            mxq, seq_len=6, hidden_size=3, logits_to_keep=indices, npu_prefill_chunk_size=4
-        )
+        _model, logits = self._run(mxq, seq_len=6, hidden_size=3, logits_to_keep=indices, npu_prefill_chunk_size=4)
 
         # Fallback: prefill 0..2 (chunk of 2), size-1 at 2, prefill 3..5 (chunk of 2), size-1 at 5.
         # The prefix stride is clamped to the next kept position, not the caller's chunk size.
@@ -517,9 +504,7 @@ class TestLlmForwardSingle:
         """
         mxq = StaticLastOnlyMxq(vocab_size=5, max_width=4)
         indices = torch.tensor([2, 5])
-        _model, _logits = self._run(
-            mxq, seq_len=6, hidden_size=3, logits_to_keep=indices, npu_prefill_chunk_size=4
-        )
+        _model, _logits = self._run(mxq, seq_len=6, hidden_size=3, logits_to_keep=indices, npu_prefill_chunk_size=4)
         # Chunks: (0..2 prefill), (2..3 capture), (3..5 prefill), (5..6 capture).
         # cache_size at each infer entry equals the running "processed so far"
         # count, which is the chunk's ``start`` position.
@@ -802,9 +787,7 @@ class TestLlmForwardBatch:
         ],
         ids=["path2_dynamic_axis_keep_all", "path3_last_only_tensor_selector"],
     )
-    def test_zero_length_row_raises_value_error_across_all_paths(
-        self, mxq_cls, logits_to_keep
-    ) -> None:
+    def test_zero_length_row_raises_value_error_across_all_paths(self, mxq_cls, logits_to_keep) -> None:
         """Lock in the unified zero-length contract: the check fires before any
         is_default_keep / supports_all decision, so Path 2 (dynamic-axis with
         keep-all) and Path 3 (last-only with tensor selector) both raise —
@@ -938,9 +921,7 @@ class TestLlmForwardBatch:
         [0, 0] (walk-set collapses to {0} after dedup).
         """
         mxq = StaticLastOnlyMxq(vocab_size=5, max_width=4)
-        attention_mask = torch.tensor(
-            [[1, 1, 1, 1, 1, 1], [1, 0, 0, 0, 0, 0]], dtype=torch.long
-        )
+        attention_mask = torch.tensor([[1, 1, 1, 1, 1, 1], [1, 0, 0, 0, 0, 0]], dtype=torch.long)
         _model, logits = self._run(
             mxq,
             attention_mask=attention_mask,
@@ -971,9 +952,7 @@ class TestLlmForwardBatch:
         """
         mxq = StaticLastOnlyMxq(vocab_size=5, max_width=4)
         # Item 0 seq_len=2 keeps {1}; item 1 seq_len=6 keeps {5} via last-index.
-        attention_mask = torch.tensor(
-            [[1, 1, 0, 0, 0, 0], [1, 1, 1, 1, 1, 1]], dtype=torch.long
-        )
+        attention_mask = torch.tensor([[1, 1, 0, 0, 0, 0], [1, 1, 1, 1, 1, 1]], dtype=torch.long)
         _model, logits = self._run(
             mxq,
             attention_mask=attention_mask,
@@ -1030,9 +1009,7 @@ class TestBatchedEmptySelection:
     ):
         model = make_model(mxq, max_batch_size=max_batch_size)
         batch, seq_len = attention_mask.shape
-        inputs_embeds = torch.arange(batch * seq_len * hidden_size, dtype=dtype).reshape(
-            batch, seq_len, hidden_size
-        )
+        inputs_embeds = torch.arange(batch * seq_len * hidden_size, dtype=dtype).reshape(batch, seq_len, hidden_size)
         cache_position = torch.arange(seq_len)
         logits = model.llm_forward(
             inputs_embeds=inputs_embeds,
@@ -1161,11 +1138,7 @@ class TestLastOnlySlowPathWarning:
 
     @staticmethod
     def _slow_path_warnings(caught: list[warnings.WarningMessage]) -> list[warnings.WarningMessage]:
-        return [
-            w
-            for w in caught
-            if issubclass(w.category, UserWarning) and "logits_to_keep" in str(w.message)
-        ]
+        return [w for w in caught if issubclass(w.category, UserWarning) and "logits_to_keep" in str(w.message)]
 
     def _run_single(
         self,
@@ -1176,9 +1149,7 @@ class TestLastOnlySlowPathWarning:
         hidden_size: int = 3,
         npu_prefill_chunk_size: int = 4,
     ) -> None:
-        inputs_embeds = torch.arange(seq_len * hidden_size, dtype=torch.float32).reshape(
-            1, seq_len, hidden_size
-        )
+        inputs_embeds = torch.arange(seq_len * hidden_size, dtype=torch.float32).reshape(1, seq_len, hidden_size)
         cache_position = torch.arange(seq_len)
         model.llm_forward(
             inputs_embeds=inputs_embeds,
@@ -1230,13 +1201,9 @@ class TestLastOnlySlowPathWarning:
         attention_mask = torch.tensor([[1, 1, 1, 1], [1, 1, 1, 1]], dtype=torch.long)
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            self._run_batched(
-                model, attention_mask=attention_mask, logits_to_keep=torch.tensor([2, 3])
-            )
+            self._run_batched(model, attention_mask=attention_mask, logits_to_keep=torch.tensor([2, 3]))
             after_first = len(self._slow_path_warnings(caught))
-            self._run_batched(
-                model, attention_mask=attention_mask, logits_to_keep=torch.tensor([2, 3])
-            )
+            self._run_batched(model, attention_mask=attention_mask, logits_to_keep=torch.tensor([2, 3]))
             after_second = len(self._slow_path_warnings(caught))
 
         assert after_first == 1
@@ -1245,9 +1212,7 @@ class TestLastOnlySlowPathWarning:
 
     def test_no_warning_on_fast_path(self) -> None:
         single_model = make_model(StaticLastOnlyMxq(vocab_size=5, max_width=4))
-        batched_model = make_model(
-            StaticLastOnlyMxq(vocab_size=5, max_width=4), max_batch_size=4
-        )
+        batched_model = make_model(StaticLastOnlyMxq(vocab_size=5, max_width=4), max_batch_size=4)
         attention_mask = torch.tensor([[1, 1, 1], [1, 1, 1]], dtype=torch.long)
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
@@ -1258,9 +1223,7 @@ class TestLastOnlySlowPathWarning:
 
     def test_no_warning_on_dynamic_axis(self) -> None:
         single_model = make_model(DynamicAxisMxq(vocab_size=5, max_width=4))
-        batched_model = make_model(
-            DynamicAxisMxq(vocab_size=5, max_width=4), max_batch_size=4
-        )
+        batched_model = make_model(DynamicAxisMxq(vocab_size=5, max_width=4), max_batch_size=4)
         attention_mask = torch.tensor([[1, 1, 1], [1, 1, 1]], dtype=torch.long)
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
@@ -1323,9 +1286,7 @@ class TestBatchCpuCopyHoist:
             calls.append((id(cpu_indices), seq_len))
             return orig_fn(cls, cpu_indices, seq_len)
 
-        monkeypatch.setattr(
-            MobilintModelMixin, "_output_positions_from_cpu_indices", spy
-        )
+        monkeypatch.setattr(MobilintModelMixin, "_output_positions_from_cpu_indices", spy)
         return calls
 
     @staticmethod
@@ -1360,9 +1321,7 @@ class TestBatchCpuCopyHoist:
         """
         calls = self._spy_from_cpu_indices(monkeypatch)
         model = make_model(DynamicAxisMxq(vocab_size=5, max_width=4), max_batch_size=4)
-        attention_mask = torch.tensor(
-            [[1, 1, 1], [1, 1, 1], [1, 1, 1], [1, 1, 1]], dtype=torch.long
-        )
+        attention_mask = torch.tensor([[1, 1, 1], [1, 1, 1], [1, 1, 1], [1, 1, 1]], dtype=torch.long)
         self._run_batched(
             model,
             attention_mask=attention_mask,
@@ -1379,9 +1338,7 @@ class TestBatchCpuCopyHoist:
         """
         calls = self._spy_from_cpu_indices(monkeypatch)
         model = make_model(DynamicAxisMxq(vocab_size=5, max_width=4), max_batch_size=3)
-        attention_mask = torch.tensor(
-            [[1, 1, 1, 0], [1, 1, 1, 1], [1, 1, 0, 0]], dtype=torch.long
-        )
+        attention_mask = torch.tensor([[1, 1, 1, 0], [1, 1, 1, 1], [1, 1, 0, 0]], dtype=torch.long)
         self._run_batched(
             model,
             attention_mask=attention_mask,
@@ -1405,9 +1362,7 @@ class TestBatchCpuCopyHoist:
         attention_mask = torch.tensor([[1, 1, 1], [1, 1, 1]], dtype=torch.long)
         # int == 0 is not the default fast path (that's int == 1), so this
         # exercises the shared branch with an int selector.
-        self._run_batched(
-            model, attention_mask=attention_mask, logits_to_keep=0, npu_prefill_chunk_size=3
-        )
+        self._run_batched(model, attention_mask=attention_mask, logits_to_keep=0, npu_prefill_chunk_size=3)
         assert calls == []
 
 
@@ -1515,9 +1470,7 @@ class TestBatchPath3PhaseTiming:
 
         self._run_batched(
             model,
-            attention_mask=torch.tensor(
-                [[1, 1, 1, 1, 1, 1], [1, 0, 0, 0, 0, 0]], dtype=torch.long
-            ),
+            attention_mask=torch.tensor([[1, 1, 1, 1, 1, 1], [1, 0, 0, 0, 0, 0]], dtype=torch.long),
             logits_to_keep=torch.tensor([0, -1]),
             npu_prefill_chunk_size=4,
         )
@@ -1704,9 +1657,7 @@ class TestLogitsShapeMatrix:
         """
         mxq = mxq_cls(vocab_size=self._VOCAB_SIZE, max_width=self._SEQ_LEN)
         model = make_model(mxq, max_batch_size=2)
-        attention_mask = torch.tensor(
-            [[1, 1, 1, 0, 0], [1, 1, 1, 1, 1]], dtype=torch.long
-        )
+        attention_mask = torch.tensor([[1, 1, 1, 0, 0], [1, 1, 1, 1, 1]], dtype=torch.long)
         inputs_embeds = torch.zeros(2, self._SEQ_LEN, self._HIDDEN_SIZE)
         cache_position = torch.arange(self._SEQ_LEN)
         logits = model.llm_forward(

@@ -13,8 +13,6 @@ after upstream returns and applies them as one group.
 
 from __future__ import annotations
 
-import pytest
-
 from tests.transformers.image_text_to_text.qwen3_vl_compat import (
     skip_if_transformers_lacks_qwen3_vl_support,
 )

@@ -249,7 +249,9 @@ class LLMCompareMetric(BaseCompareMetric):
             prefill_latency_ms = _summary_mean(summary, "ttft_ms")
             decode_duration_ms = _summary_mean(summary, "decode_duration_ms")
             return cls(
-                prefill_tps={prefill_token: prefill_tps} if prefill_token is not None and prefill_tps is not None else {},
+                prefill_tps={prefill_token: prefill_tps}
+                if prefill_token is not None and prefill_tps is not None
+                else {},
                 decode_tps={decode_token: decode_tps} if decode_token is not None and decode_tps is not None else {},
                 prefill_latency_ms=(
                     {prefill_token: prefill_latency_ms}
@@ -285,6 +287,7 @@ class LLMCompareMetric(BaseCompareMetric):
         decode = benchmark.get("decode_sweep", {})
         if not isinstance(prefill, Mapping) or not isinstance(decode, Mapping):
             return None
+
         def _token_map(phase: Mapping[str, Any], value_key: str, *, ms: bool = False) -> dict[int, float]:
             out: dict[int, float] = {}
             for token, value in zip(phase.get("x_values", []), phase.get(value_key, [])):
@@ -555,7 +558,11 @@ def collect_metrics(
         if not isinstance(payload, Mapping):
             continue
         detected_benchmark_type = payload_benchmark_type(payload)
-        if benchmark_type is not None and detected_benchmark_type is not None and detected_benchmark_type != benchmark_type:
+        if (
+            benchmark_type is not None
+            and detected_benchmark_type is not None
+            and detected_benchmark_type != benchmark_type
+        ):
             print(
                 f"Warning: skipping {path.name} because benchmark_type '{detected_benchmark_type}' "
                 f"does not match requested benchmark_type '{benchmark_type}'."
@@ -583,10 +590,7 @@ def collect_metrics(
             status = payload.get("status")
             if isinstance(status, str) and status:
                 reason = payload.get("reason", "")
-                print(
-                    f"Warning: skipping status-only payload {path} "
-                    f"(status={status}, reason={reason})."
-                )
+                print(f"Warning: skipping status-only payload {path} (status={status}, reason={reason}).")
             continue
         norm_key = normalize_model_key(path, model_id, strip_owner=strip_owner)
         if norm_key not in normalized:

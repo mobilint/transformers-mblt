@@ -242,9 +242,7 @@ def _input_output_hash_tuple(capture: Optional[dict[str, Any]]) -> tuple[tuple[s
     for arg_desc in capture.get("input_args", []):
         walk(arg_desc)
 
-    output_hashes = tuple(
-        str(o.get("sha256", "")) for o in capture.get("outputs", []) if isinstance(o, dict)
-    )
+    output_hashes = tuple(str(o.get("sha256", "")) for o in capture.get("outputs", []) if isinstance(o, dict))
     return tuple(input_hashes), output_hashes
 
 

@@ -104,9 +104,7 @@ class _StaticVisionStub:
         hidden_states: torch.Tensor,
         grid_thw: torch.Tensor,
     ) -> list[torch.Tensor]:
-        return MobilintQwen3VLVisionModel._split_hidden_states_by_grid(
-            self, hidden_states, grid_thw
-        )
+        return MobilintQwen3VLVisionModel._split_hidden_states_by_grid(self, hidden_states, grid_thw)
 
 
 def test_encode_images_rejects_video_grid_on_static_vision() -> None:
@@ -168,9 +166,7 @@ def test_encode_images_allows_image_grid_on_static_vision() -> None:
     grid_thw = torch.tensor([[1, 1, 1]], dtype=torch.long)
     hidden_states = torch.zeros((1, 8), dtype=torch.float32)
 
-    image_embeds, deepstack = MobilintQwen3VLVisionModel._encode_images(
-        dummy, hidden_states, grid_thw
-    )
+    image_embeds, deepstack = MobilintQwen3VLVisionModel._encode_images(dummy, hidden_states, grid_thw)
     assert image_embeds.shape == (1, 8)
     assert len(deepstack) == 3
     assert len(dummy.mxq_inputs) == 1

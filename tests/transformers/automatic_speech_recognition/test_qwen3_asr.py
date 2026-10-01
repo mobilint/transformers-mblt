@@ -4,9 +4,7 @@ from transformers import pipeline
 
 from tests.pipe_teardown import pipe_fixture
 
-MODEL_PATHS = (
-    "mobilint/Qwen3-ASR-1.7B",
-)
+MODEL_PATHS = ("mobilint/Qwen3-ASR-1.7B",)
 
 
 @pipe_fixture(params=MODEL_PATHS)

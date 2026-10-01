@@ -93,7 +93,9 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--n-warmup-runs", type=int, default=3, help="Outer mode: subprocess count WITH warmup.")
     parser.add_argument("--n-baseline-runs", type=int, default=3, help="Outer mode: subprocess count WITHOUT warmup.")
-    parser.add_argument("--output-dir", default="debug/warmup_probe", help="Outer mode: directory for probe_report.json.")
+    parser.add_argument(
+        "--output-dir", default="debug/warmup_probe", help="Outer mode: directory for probe_report.json."
+    )
     parser.add_argument(
         "--python",
         default=sys.executable,
@@ -219,9 +221,7 @@ def _run_inner(args: argparse.Namespace) -> int:
     token_ids = [int(t) for t in row.detach().cpu().tolist()]
     decoded = tokenizer.decode(token_ids, skip_special_tokens=False)
     decoded_sha256 = hashlib.sha256(decoded.encode("utf-8")).hexdigest()
-    output_ids_sha256 = hashlib.sha256(
-        json.dumps(token_ids, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+    output_ids_sha256 = hashlib.sha256(json.dumps(token_ids, separators=(",", ":")).encode("utf-8")).hexdigest()
 
     payload = {
         "pid": int(os.getpid()),
@@ -240,10 +240,14 @@ def _inner_cli_args(args: argparse.Namespace, *, skip_warmup: bool) -> list[str]
     """Build the argv slice passed to an inner subprocess, mirroring the current common args."""
     cli: list[str] = [
         "--inner",
-        "--model", str(args.model),
-        "--prompt", str(args.prompt),
-        "--seed", str(int(args.seed)),
-        "--max-new-tokens", str(int(args.max_new_tokens)),
+        "--model",
+        str(args.model),
+        "--prompt",
+        str(args.prompt),
+        "--seed",
+        str(int(args.seed)),
+        "--max-new-tokens",
+        str(int(args.max_new_tokens)),
     ]
     cli.append("--do-sample" if bool(args.do_sample) else "--no-do-sample")
     if args.temperature is not None:
@@ -268,13 +272,11 @@ def _parse_inner_output(stdout: str) -> dict[str, Any]:
     for line in reversed(stdout.splitlines()):
         stripped = line.strip()
         if stripped.startswith("__PROBE_JSON__ "):
-            return json.loads(stripped[len("__PROBE_JSON__ "):])
+            return json.loads(stripped[len("__PROBE_JSON__ ") :])
     raise RuntimeError("inner subprocess did not emit a __PROBE_JSON__ result line")
 
 
-def _launch_inner(
-    args: argparse.Namespace, *, skip_warmup: bool, index: int, label: str
-) -> dict[str, Any]:
+def _launch_inner(args: argparse.Namespace, *, skip_warmup: bool, index: int, label: str) -> dict[str, Any]:
     """Run one inner subprocess, print a live status line, and return the parsed payload."""
     cmd = [str(args.python), str(Path(__file__).resolve()), *_inner_cli_args(args, skip_warmup=skip_warmup)]
     result = subprocess.run(
@@ -293,9 +295,7 @@ def _launch_inner(
         )
         result.check_returncode()
     payload = _parse_inner_output(result.stdout)
-    print(
-        f"{label} run {index + 1} (pid {payload['pid']}): decoded_sha256 = {payload['decoded_sha256'][:12]}..."
-    )
+    print(f"{label} run {index + 1} (pid {payload['pid']}): decoded_sha256 = {payload['decoded_sha256'][:12]}...")
     return payload
 
 
@@ -361,9 +361,7 @@ def _print_block(title: str, results: list[dict[str, Any]], summary: dict[str, A
         note = ""
         if idx > 0 and payload["decoded_sha256"] != results[0]["decoded_sha256"]:
             note = "   <-- differs from process 1"
-        print(
-            f"process {idx + 1} (pid {payload['pid']}): decoded_sha256 = {payload['decoded_sha256'][:16]}{note}"
-        )
+        print(f"process {idx + 1} (pid {payload['pid']}): decoded_sha256 = {payload['decoded_sha256'][:16]}{note}")
     print()
     print(f"{title} unique output count: {summary['unique_count']} / {summary['count']}")
     print(f"{title} all-identical: {summary['all_identical']}")
@@ -397,24 +395,30 @@ def _run_outer(args: argparse.Namespace) -> int:
         warmup_results.append(_launch_inner(args, skip_warmup=False, index=i, label="warmup"))
     print()
 
-    baseline_summary = _summarize(baseline_results) if baseline_results else {
-        "count": 0,
-        "unique_count": 0,
-        "all_identical": True,
-        "digests": [],
-        "unique_digests": [],
-    }
-    warmup_summary = _summarize(warmup_results) if warmup_results else {
-        "count": 0,
-        "unique_count": 0,
-        "all_identical": True,
-        "digests": [],
-        "unique_digests": [],
-    }
-
-    threads_label = (
-        f" [torch.num_threads={int(args.set_num_threads)}]" if args.set_num_threads is not None else ""
+    baseline_summary = (
+        _summarize(baseline_results)
+        if baseline_results
+        else {
+            "count": 0,
+            "unique_count": 0,
+            "all_identical": True,
+            "digests": [],
+            "unique_digests": [],
+        }
     )
+    warmup_summary = (
+        _summarize(warmup_results)
+        if warmup_results
+        else {
+            "count": 0,
+            "unique_count": 0,
+            "all_identical": True,
+            "digests": [],
+            "unique_digests": [],
+        }
+    )
+
+    threads_label = f" [torch.num_threads={int(args.set_num_threads)}]" if args.set_num_threads is not None else ""
     if baseline_results:
         _print_block(f"Baseline (no warmup, --skip-warmup){threads_label}", baseline_results, baseline_summary)
     if warmup_results:

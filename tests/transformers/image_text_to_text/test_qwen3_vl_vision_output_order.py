@@ -58,10 +58,7 @@ class TestResolution:
         """Artifact order ``[ds0, ds1, ds2, merger]`` maps to semantic order."""
         monkeypatch.delenv(VISION_OUTPUT_ORDER_ENV, raising=False)
         m = _model(vision_output_order=[3, 0, 1, 2])
-        encoder_outputs = [
-            np.full((1, 2, 4), fill_value, dtype=np.float32)
-            for fill_value in (10.0, 20.0, 30.0, 40.0)
-        ]
+        encoder_outputs = [np.full((1, 2, 4), fill_value, dtype=np.float32) for fill_value in (10.0, 20.0, 30.0, 40.0)]
 
         image_embeds, deepstack_embeds = m._reorder_encoder_outputs(
             encoder_outputs,
@@ -80,15 +77,15 @@ class TestConfigLoudFailure:
     @pytest.mark.parametrize(
         "bad",
         [
-            [0, 1, 2],          # too short
-            [0, 1, 2, 3, 4],    # too long
-            [0, 1, 2, 2],       # not a permutation
-            [1, 2, 3, 4],       # wrong domain
+            [0, 1, 2],  # too short
+            [0, 1, 2, 3, 4],  # too long
+            [0, 1, 2, 2],  # not a permutation
+            [1, 2, 3, 4],  # wrong domain
             ["a", "b", "c", "d"],  # non-integer
-            3,                  # scalar (would raise TypeError from ``list(3)``)
-            False,              # scalar (bool is int but ``list(False)`` raises)
+            3,  # scalar (would raise TypeError from ``list(3)``)
+            False,  # scalar (bool is int but ``list(False)`` raises)
             {"0": 3, "1": 0, "2": 1, "3": 2},  # dict: ``list(...)`` would give keys
-            {0, 1, 2, 3},       # set: ``list(...)`` order is undefined
+            {0, 1, 2, 3},  # set: ``list(...)`` order is undefined
         ],
     )
     def test_bad_config_value_raises(self, monkeypatch, bad):

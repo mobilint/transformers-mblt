@@ -158,9 +158,9 @@ def test_default_call_on_oversized_image_stays_within_token_budget() -> None:
     per_image_tokens = grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]
 
     assert bool((per_image_tokens > 0).all())
-    assert bool((per_image_tokens <= proc.max_vision_tokens).all()), (
-        f"per-image grid exceeded budget: {per_image_tokens.tolist()} > {proc.max_vision_tokens}"
-    )
+    assert bool(
+        (per_image_tokens <= proc.max_vision_tokens).all()
+    ), f"per-image grid exceeded budget: {per_image_tokens.tolist()} > {proc.max_vision_tokens}"
 
 
 def test_default_call_through_processor_stays_within_token_budget(
@@ -199,6 +199,6 @@ def test_default_call_through_processor_stays_within_token_budget(
     assert seen["longest_edge"] == limit
     grid_thw = seen["grid_thw"]
     per_image_tokens = grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]
-    assert bool((per_image_tokens <= proc.max_vision_tokens).all()), (
-        f"per-image grid exceeded budget after storage clamp: {per_image_tokens.tolist()} > {proc.max_vision_tokens}"
-    )
+    assert bool(
+        (per_image_tokens <= proc.max_vision_tokens).all()
+    ), f"per-image grid exceeded budget after storage clamp: {per_image_tokens.tolist()} > {proc.max_vision_tokens}"

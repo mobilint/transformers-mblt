@@ -113,25 +113,20 @@ def test_get_num_mxq_inputs_reads_variant_handle(shapes: list[tuple[int, ...]], 
     [
         # Bundled non-batch
         (2, 1, (False, False)),  # static
-        (3, 1, (False, True)),   # dynamic
+        (3, 1, (False, True)),  # dynamic
         # Bundled batched
         (3, 16, (False, True)),
         # Split non-batch and Batch16
-        (4, 1, (True, False)),   # split/static
-        (5, 1, (True, True)),    # split/dynamic
-        (5, 16, (True, True)),   # split/dynamic Batch16
+        (4, 1, (True, False)),  # split/static
+        (5, 1, (True, True)),  # split/dynamic
+        (5, 16, (True, True)),  # split/dynamic Batch16
     ],
 )
 def test_classify_mxq_signature_supported(
     num_mxq_inputs: int, max_batch_size: int, expected: tuple[bool, bool]
 ) -> None:
     """Known MXQ input counts round-trip to the correct dispatch flags."""
-    assert (
-        MobilintQwen3VLTextModel._classify_mxq_signature(
-            num_mxq_inputs, max_batch_size=max_batch_size
-        )
-        == expected
-    )
+    assert MobilintQwen3VLTextModel._classify_mxq_signature(num_mxq_inputs, max_batch_size=max_batch_size) == expected
 
 
 @pytest.mark.parametrize("num_mxq_inputs", [0, 1, 6, 7])
@@ -359,8 +354,7 @@ def test_single_batch_split_preserves_deepstack_layer_order() -> None:
     inputs_embeds = torch.zeros((1, seq_len, hidden_size), dtype=torch.float32)
     visual_pos_masks = torch.tensor([[True, False, True]])
     deepstack_visual_embeds = [
-        torch.full((2, hidden_size), fill_value, dtype=torch.float32)
-        for fill_value in (10.0, 20.0, 30.0)
+        torch.full((2, hidden_size), fill_value, dtype=torch.float32) for fill_value in (10.0, 20.0, 30.0)
     ]
 
     model.llm_forward(

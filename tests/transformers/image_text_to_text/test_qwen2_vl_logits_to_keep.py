@@ -30,9 +30,9 @@ class _RecordingModel:
 
     def __call__(self, **kwargs):
         self.received = kwargs
-        last_hidden_state = torch.arange(
-            self.kept_len * self.vocab_size, dtype=torch.float32
-        ).reshape(1, self.kept_len, self.vocab_size)
+        last_hidden_state = torch.arange(self.kept_len * self.vocab_size, dtype=torch.float32).reshape(
+            1, self.kept_len, self.vocab_size
+        )
         return SimpleNamespace(
             last_hidden_state=last_hidden_state,
             past_key_values=None,
@@ -43,9 +43,7 @@ class _RecordingModel:
 
 
 def _make_wrapper(kept_len: int = 3, vocab_size: int = 5):
-    wrapper = MobilintQwen2VLForConditionalGeneration.__new__(
-        MobilintQwen2VLForConditionalGeneration
-    )
+    wrapper = MobilintQwen2VLForConditionalGeneration.__new__(MobilintQwen2VLForConditionalGeneration)
     torch.nn.Module.__init__(wrapper)
     wrapper.config = SimpleNamespace(
         text_config=SimpleNamespace(vocab_size=vocab_size),

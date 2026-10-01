@@ -148,10 +148,7 @@ def _common_model_keys_without_owner(metrics_by_folder: list[Mapping[str, Any]])
 
     if not metrics_by_folder:
         return []
-    model_sets = [
-        {_model_key_without_owner(model_key) for model_key in metrics}
-        for metrics in metrics_by_folder
-    ]
+    model_sets = [{_model_key_without_owner(model_key) for model_key in metrics} for metrics in metrics_by_folder]
     if not model_sets:
         return []
     return sorted(set.intersection(*model_sets))
@@ -192,10 +189,7 @@ def main() -> int:
         "--task",
         choices=sorted(TASK_REGISTRY.keys()),
         default=None,
-        help=(
-            "which benchmark payload to compare "
-            "(default: auto-detect from task, fallback: text-generation)"
-        ),
+        help=("which benchmark payload to compare (default: auto-detect from task, fallback: text-generation)"),
     )
     parser.add_argument(
         "--benchmark-type",

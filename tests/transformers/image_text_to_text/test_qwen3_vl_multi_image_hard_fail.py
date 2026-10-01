@@ -300,9 +300,7 @@ def test_processor_chat_message_batch_hard_fails_on_per_prompt_multi_image(
     monkeypatch.setattr(
         Qwen3VLProcessor,
         "__call__",
-        lambda *_a, **_k: (_ for _ in ()).throw(
-            AssertionError("super().__call__ must not run for chat multi-image")
-        ),
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("super().__call__ must not run for chat multi-image")),
     )
     proc = _make_processor(dynamic_vision=False)
     chat_batch = [

@@ -114,9 +114,7 @@ def load_streaming_audio_text_samples(
             elif isinstance(path, str) and path:
                 audio_array, sampling_rate = sf.read(path, dtype="float32")
             else:
-                raise ValueError(
-                    "Dataset audio row does not contain readable decoded array, path, or bytes payload."
-                )
+                raise ValueError("Dataset audio row does not contain readable decoded array, path, or bytes payload.")
 
         if getattr(audio_array, "ndim", 1) > 1:
             audio_array = np.mean(audio_array, axis=1)

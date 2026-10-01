@@ -223,14 +223,10 @@ def _print_summary(module_reports: dict[str, dict[str, Any]]) -> None:
             shape_str = _format_shape(slot["shape"]).ljust(max_shape_len)
             identical = f"{slot['n_bitwise_identical']}/{slot['n_runs']}"
             max_abs = float(slot["max_abs_diff"])
-            print(
-                f"  {name} {shape_str}   identical: {identical}    max_abs_diff: {max_abs:.6g}{tag}"
-            )
+            print(f"  {name} {shape_str}   identical: {identical}    max_abs_diff: {max_abs:.6g}{tag}")
 
 
-def _run_consecutive(
-    module_name: str, storages: dict[str, dict[str, Any]], n_runs: int
-) -> list[list[np.ndarray]]:
+def _run_consecutive(module_name: str, storages: dict[str, dict[str, Any]], n_runs: int) -> list[list[np.ndarray]]:
     storage = storages[module_name]
     if "args" not in storage:
         return []

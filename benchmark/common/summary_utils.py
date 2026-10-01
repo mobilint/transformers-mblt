@@ -568,9 +568,7 @@ def _append_host_info_table(
     _append_field_value_table(lines, rows)
 
 
-def _append_npu_info_markdown(
-    lines: list[str], rows: Sequence[tuple[str, str]], *, heading_level: int = 3
-) -> None:
+def _append_npu_info_markdown(lines: list[str], rows: Sequence[tuple[str, str]], *, heading_level: int = 3) -> None:
     """Append NPU host info with ``npus`` array entries grouped by index."""
     common_rows: list[tuple[str, str]] = []
     indexed_rows: dict[int, list[tuple[str, str]]] = {}

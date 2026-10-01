@@ -190,9 +190,7 @@ def test_rotary_embedding_forward_builds_lazy_on_first_call() -> None:
     # ``rope_parameters`` during ``__post_init__`` and drops the flat attribute.
     emb.inv_freq = torch.empty_like(emb.inv_freq, device="cpu")
     dim = config.head_dim
-    emb.inv_freq.copy_(
-        1.0 / (emb.rope_theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-    )
+    emb.inv_freq.copy_(1.0 / (emb.rope_theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim)))
 
     position_ids = torch.arange(8, dtype=torch.long)[None, None, :].expand(3, 1, -1)
     result = emb(None, position_ids)

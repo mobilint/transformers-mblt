@@ -523,6 +523,4 @@ def validate_batch_core_mode(
         if raw_core_mode in {None, "", "all", "single", "auto"}:
             continue
         flag = f"{opt_prefix}core-mode"
-        raise pytest.UsageError(
-            f"{suite_name} only supports {flag} single or auto. Received {flag}={raw_core_mode!r}."
-        )
+        raise pytest.UsageError(f"{suite_name} only supports {flag} single or auto. Received {flag}={raw_core_mode!r}.")

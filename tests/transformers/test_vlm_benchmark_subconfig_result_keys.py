@@ -149,9 +149,7 @@ def _mode_bases_for(
     monkeypatch.setattr(
         vlm_bench,
         "_iter_targets",
-        lambda model_ids, revision, all_revisions: [
-            (text_target.model_id, None, text_target.label, text_target.base)
-        ],
+        lambda model_ids, revision, all_revisions: [(text_target.model_id, None, text_target.label, text_target.base)],
     )
     monkeypatch.setattr(
         vlm_bench,
@@ -187,12 +185,8 @@ def test_collect_vlm_run_targets_distinguishes_subconfig_variants(monkeypatch, t
     monkeypatch.chdir(tmp_path)
 
     default_base = _mode_bases_for(monkeypatch, core_mode="single")[0]
-    vision_base = _mode_bases_for(
-        monkeypatch, core_mode="single", vision_core_mode="global8"
-    )[0]
-    text_base = _mode_bases_for(
-        monkeypatch, core_mode="single", text_core_mode="global4"
-    )[0]
+    vision_base = _mode_bases_for(monkeypatch, core_mode="single", vision_core_mode="global8")[0]
+    text_base = _mode_bases_for(monkeypatch, core_mode="single", text_core_mode="global4")[0]
     both_base = _mode_bases_for(
         monkeypatch,
         core_mode="single",

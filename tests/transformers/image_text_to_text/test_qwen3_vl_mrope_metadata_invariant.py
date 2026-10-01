@@ -93,8 +93,7 @@ def test_call_forces_return_mm_token_type_ids_true_over_caller_false(
     assert isinstance(forwarded_text_kwargs, dict)
     assert forwarded_text_kwargs["return_mm_token_type_ids"] is True
     assert any(
-        "return_mm_token_type_ids" in rec.message and "-> True" in rec.message
-        for rec in caplog.records
+        "return_mm_token_type_ids" in rec.message and "-> True" in rec.message for rec in caplog.records
     ), f"expected an overwrite debug log, got: {[rec.message for rec in caplog.records]}"
 
 
@@ -125,10 +124,7 @@ def test_call_forces_return_mm_token_type_ids_true_over_caller_false_video(
     assert result == "sentinel"
     forwarded_text_kwargs = captured["text_kwargs"]
     assert forwarded_text_kwargs["return_mm_token_type_ids"] is True
-    assert any(
-        "return_mm_token_type_ids" in rec.message and "-> True" in rec.message
-        for rec in caplog.records
-    )
+    assert any("return_mm_token_type_ids" in rec.message and "-> True" in rec.message for rec in caplog.records)
 
 
 def test_call_no_overwrite_log_when_caller_omits_return_mm_token_type_ids(
@@ -187,9 +183,7 @@ def test_call_no_overwrite_log_when_caller_supplies_true(
 
     assert result == "sentinel"
     assert captured["text_kwargs"]["return_mm_token_type_ids"] is True
-    assert not any(
-        "overwriting caller-supplied" in rec.message for rec in caplog.records
-    )
+    assert not any("overwriting caller-supplied" in rec.message for rec in caplog.records)
 
 
 def test_call_text_only_leaves_return_mm_token_type_ids_untouched(

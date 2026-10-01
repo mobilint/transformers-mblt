@@ -274,9 +274,7 @@ def _build_pipeline(
     model_kwargs: dict[str, Any] = {}
     vision_core_mode, text_core_mode = _resolve_vlm_subconfig_core_modes(args)
     implicit_batch = (
-        batch_mode == "batch"
-        and _vlm_npu_options_enabled(args)
-        and not getattr(args, "_core_mode_explicit", False)
+        batch_mode == "batch" and _vlm_npu_options_enabled(args) and not getattr(args, "_core_mode_explicit", False)
     )
     if implicit_batch and text_core_mode is None:
         text_core_mode = config_text_core_mode or "auto"
@@ -1553,7 +1551,9 @@ def _resolve_runtime_defaults(args: argparse.Namespace, raw_argv: list[str]) -> 
         effective_text_core_mode = (
             args.text_core_mode
             if _flag_present(raw_argv, "--text-core-mode")
-            else args.core_mode if core_mode_explicit else "auto"
+            else args.core_mode
+            if core_mode_explicit
+            else "auto"
         )
         if effective_text_core_mode not in {"single", "auto"}:
             raise SystemExit("batch benchmark only supports --core-mode single or auto")

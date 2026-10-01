@@ -712,7 +712,7 @@ def test_cache_utils_imports_when_cache_layer_mixin_is_missing() -> None:
         text=True,
         check=False,
     )
-    assert result.returncode == 0, (
-        f"subprocess exited {result.returncode}\nstdout={result.stdout}\nstderr={result.stderr}"
-    )
+    assert (
+        result.returncode == 0
+    ), f"subprocess exited {result.returncode}\nstdout={result.stdout}\nstderr={result.stderr}"
     assert "OK" in result.stdout, f"unexpected stdout: {result.stdout!r}"
