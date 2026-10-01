@@ -696,6 +696,12 @@ class MobilintQwen3ASRForConditionalGeneration(
         feature_attention_mask: Optional[torch.LongTensor] = None,
         audio_feature_lengths: Optional[torch.LongTensor] = None,
     ):
+        # Same signature as upstream's thinker, passed through as-is. Upstream
+        # recomputes audio_feature_lengths from feature_attention_mask and needs
+        # the mask, so callers must pass it.
+        # upstream thinker 와 같은 시그니처로 그대로 위임한다. upstream 은
+        # audio_feature_lengths 를 feature_attention_mask 로 다시 계산하고 mask 가
+        # 필수이므로 호출자는 mask 를 넘겨야 한다.
         return self.thinker.get_audio_features(
             input_features=input_features,
             feature_attention_mask=feature_attention_mask,

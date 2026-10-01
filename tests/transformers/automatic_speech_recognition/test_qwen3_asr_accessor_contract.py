@@ -97,12 +97,20 @@ def test_composite_get_audio_features_forwards_to_the_thinker() -> None:
     assert audio_features.shape == (2, 4)
 
 
-def test_composite_get_audio_features_passes_audio_feature_lengths_through() -> None:
-    model = _composite()
-    lengths = torch.tensor([6])
+def test_composite_get_audio_features_matches_the_upstream_thinker_signature() -> None:
+    """The wrapper delegates verbatim, so its signature must match upstream's.
 
-    model.get_audio_features(torch.zeros(1, 128, 6), audio_feature_lengths=lengths)
+    Upstream overwrites ``audio_feature_lengths`` from ``feature_attention_mask``
+    and needs the mask, so lengths alone are not a supported call. The stub
+    above cannot show that; this test pins parity with the real thinker instead.
+    """
+    import inspect
 
-    ((_, seen_mask, seen_lengths),) = model.thinker.audio_calls
-    assert seen_mask is None
-    assert seen_lengths is lengths
+    from qwen_asr.core.transformers_backend.modeling_qwen3_asr import (
+        Qwen3ASRThinkerForConditionalGeneration,
+    )
+
+    ours = inspect.signature(MobilintQwen3ASRForConditionalGeneration.get_audio_features)
+    upstream = inspect.signature(Qwen3ASRThinkerForConditionalGeneration.get_audio_features)
+    assert list(ours.parameters) == list(upstream.parameters)
+    assert [p.default for p in ours.parameters.values()] == [p.default for p in upstream.parameters.values()]
