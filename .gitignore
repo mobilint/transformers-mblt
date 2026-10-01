@@ -41,3 +41,16 @@ compile_commands.json
 *.swo
 .DS_Store
 Thumbs.db
+
+# Archives, model artifacts, and benchmark output
+*.zip
+*.tar
+*.tar.gz
+runs/
+*.mxq
+*.mblt
+*.onnx
+benchmark/**/results/
+tps*.json
+tps*.csv
+tps*.png

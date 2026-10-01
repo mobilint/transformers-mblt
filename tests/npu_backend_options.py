@@ -1,0 +1,526 @@
+"""Shared NPU backend option helpers for pytest suites."""
+
+from __future__ import annotations
+
+import json
+import warnings
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, TypedDict, cast
+
+import pytest
+
+from transformers_mblt.utils.core_mode import (
+    CoreMode,
+    normalize_core_mode,
+    resolve_config_core_mode,
+)
+from transformers_mblt.utils.core_mode import (
+    validate_batch_core_mode as validate_resolved_batch_core_mode,
+)
+
+WARNED_UNUSED_PREFIXES: set[str] = set()
+CORE_MODE_SWEEP_VALUES = ("single", "global4", "global8")
+ALL_PREFIXES = ("base", "draft", "fc", "encoder", "decoder", "vision", "text")
+
+
+class VisionEngineKwargs(TypedDict, total=False):
+    """Typed kwargs for constructing a vision ``MBLT_Engine`` in tests."""
+
+    model_cls: str
+    model_type: str
+    mxq_path: str
+    dev_no: int
+    core_mode: CoreMode
+    target_cores: list[str]
+    target_clusters: list[int]
+
+
+def parse_target_cores(value: str | None) -> list[str] | None:
+    """Parse a semicolon-delimited target core option."""
+    if value is None:
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    return [item.strip() for item in text.split(";") if item.strip()]
+
+
+def parse_target_clusters(value: str | None) -> list[int] | None:
+    """Parse a semicolon-delimited target cluster option."""
+    if value is None:
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    clusters: list[int] = []
+    for item in text.split(";"):
+        item = item.strip()
+        if not item:
+            continue
+        clusters.append(int(item))
+    return clusters
+
+
+def expand_core_modes(value: str | None) -> list[str | None]:
+    """Expand a core mode option into the values used for parametrization."""
+    if value is None:
+        return [None]
+    text = value.strip()
+    if not text:
+        return [None]
+    if text == "all":
+        return list(CORE_MODE_SWEEP_VALUES)
+    return [text]
+
+
+def default_target_kwargs(core_mode: str | None, *, prefix: str) -> dict[str, Any]:
+    """Return default target core or cluster options implied by a core mode."""
+    if core_mode == "single":
+        return {f"{prefix + '_' if prefix else ''}target_cores": ["0:0"]}
+    if core_mode == "global4":
+        return {f"{prefix + '_' if prefix else ''}target_clusters": [0]}
+    if core_mode == "global8":
+        return {f"{prefix + '_' if prefix else ''}target_clusters": [0, 1]}
+    return {}
+
+
+def collect_npu_kwargs(
+    config: pytest.Config,
+    prefix: str,
+    *,
+    core_mode_override: str | None = None,
+) -> tuple[dict[str, Any], bool]:
+    """Collect backend kwargs for the requested prefix from pytest options."""
+    opt_prefix = f"--{prefix}-" if prefix else "--"
+    mxq_path = config.getoption(f"{opt_prefix}mxq-path")
+    dev_no = config.getoption(f"{opt_prefix}dev-no")
+    raw_core_mode = config.getoption(f"{opt_prefix}core-mode")
+    core_mode = core_mode_override if core_mode_override is not None else raw_core_mode
+    target_cores = parse_target_cores(config.getoption(f"{opt_prefix}target-cores"))
+    target_clusters = parse_target_clusters(config.getoption(f"{opt_prefix}target-clusters"))
+
+    kwargs: dict[str, Any] = {}
+    provided = False
+
+    if mxq_path:
+        kwargs[f"{prefix + '_' if prefix else ''}mxq_path"] = mxq_path
+        provided = True
+    if dev_no is not None:
+        kwargs[f"{prefix + '_' if prefix else ''}dev_no"] = dev_no
+        provided = True
+    if core_mode:
+        kwargs[f"{prefix + '_' if prefix else ''}core_mode"] = core_mode
+        provided = True
+    if target_cores is not None:
+        kwargs[f"{prefix + '_' if prefix else ''}target_cores"] = target_cores
+        provided = True
+    if target_clusters is not None:
+        kwargs[f"{prefix + '_' if prefix else ''}target_clusters"] = target_clusters
+        provided = True
+
+    if core_mode == "single" and target_cores is None:
+        kwargs.update(default_target_kwargs(core_mode, prefix=prefix))
+    elif core_mode in {"global4", "global8"} and target_clusters is None:
+        kwargs.update(default_target_kwargs(core_mode, prefix=prefix))
+
+    return kwargs, provided
+
+
+@dataclass(frozen=True)
+class BaseNpuParams:
+    """NPU backend kwargs for single-backend models."""
+
+    base: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class EncoderDecoderNpuParams:
+    """NPU backend kwargs for encoder-decoder models."""
+
+    encoder: dict[str, Any]
+    decoder: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class VisionTextNpuParams:
+    """NPU backend kwargs for vision-text models."""
+
+    vision: dict[str, Any]
+    text: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class Eagle3NpuParams:
+    """NPU backend kwargs for EAGLE-3 models."""
+
+    model: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class BaseNpuSweepSpec:
+    """Parametrized core mode for base-only models."""
+
+    base_core_mode: str | None
+
+    def id(self) -> str:
+        """Return the pytest id fragment for this sweep spec."""
+        return f"base={self.base_core_mode}" if self.base_core_mode is not None else "default"
+
+
+@dataclass(frozen=True)
+class EncoderDecoderNpuSweepSpec:
+    """Parametrized core modes for encoder-decoder models."""
+
+    encoder_core_mode: str | None
+    decoder_core_mode: str | None
+
+    def id(self) -> str:
+        """Return the pytest id fragment for this sweep spec."""
+        parts = []
+        if self.encoder_core_mode is not None:
+            parts.append(f"encoder={self.encoder_core_mode}")
+        if self.decoder_core_mode is not None:
+            parts.append(f"decoder={self.decoder_core_mode}")
+        return ",".join(parts) if parts else "default"
+
+
+@dataclass(frozen=True)
+class VisionTextNpuSweepSpec:
+    """Parametrized core modes for vision-text models."""
+
+    vision_core_mode: str | None
+    text_core_mode: str | None
+
+    def id(self) -> str:
+        """Return the pytest id fragment for this sweep spec."""
+        parts = []
+        if self.vision_core_mode is not None:
+            parts.append(f"vision={self.vision_core_mode}")
+        if self.text_core_mode is not None:
+            parts.append(f"text={self.text_core_mode}")
+        return ",".join(parts) if parts else "default"
+
+
+@dataclass(frozen=True)
+class Eagle3NpuSweepSpec:
+    """Parametrized core mode shared across EAGLE-3 backends."""
+
+    core_mode: str | None
+
+    def id(self) -> str:
+        """Return the pytest id fragment for this sweep spec."""
+        return f"eagle3={self.core_mode}" if self.core_mode is not None else "default"
+
+
+def option_flag(prefix: str, option_name: str) -> str:
+    """Return the CLI flag name for a backend option."""
+    if prefix:
+        return f"--{prefix}-{option_name.replace('_', '-')}"
+    return f"--{option_name.replace('_', '-')}"
+
+
+def option_value_was_provided(config: pytest.Config, prefix: str, option_name: str) -> bool:
+    """Return whether the user explicitly set a CLI option."""
+    args = config.invocation_params.args
+    flag = option_flag(prefix, option_name)
+    return any(arg == flag or arg.startswith(f"{flag}=") for arg in args)
+
+
+def full_matrix_enabled(config: pytest.Config) -> bool:
+    """Return whether the caller requested the full test matrix."""
+    return bool(config.getoption("--full-matrix"))
+
+
+def should_expand_core_matrix(config: pytest.Config, *, prefixes: tuple[str, ...] = ()) -> bool:
+    """Return whether core sweeps should expand beyond the quick single-core default."""
+    if full_matrix_enabled(config):
+        return True
+    if option_value_was_provided(config, "", "core_mode"):
+        return True
+    return any(option_value_was_provided(config, prefix, "core_mode") for prefix in prefixes)
+
+
+def collect_provided_prefixes(config: pytest.Config, embedding_weight: str | None) -> set[str]:
+    """Collect prefixes that have explicit backend options in the current test run."""
+    provided: set[str] = set()
+
+    if embedding_weight:
+        provided.add("base")
+
+    for prefix in ALL_PREFIXES:
+        option_prefix = "" if prefix == "base" else prefix
+        if any(
+            (
+                option_value_was_provided(config, option_prefix, "mxq_path"),
+                option_value_was_provided(config, option_prefix, "dev_no"),
+                option_value_was_provided(config, option_prefix, "core_mode"),
+                option_value_was_provided(config, option_prefix, "target_cores"),
+                option_value_was_provided(config, option_prefix, "target_clusters"),
+            )
+        ):
+            provided.add(prefix)
+
+    return provided
+
+
+def warn_unused_prefixes(provided_prefixes: set[str], used_prefixes: set[str]) -> None:
+    """Warn once for explicit backend prefixes that the active test fixture does not consume."""
+    for prefix in sorted(provided_prefixes - used_prefixes):
+        if prefix not in WARNED_UNUSED_PREFIXES:
+            WARNED_UNUSED_PREFIXES.add(prefix)
+            warnings.warn(
+                f"Provided {prefix} NPU backend options will be ignored for this model.",
+                UserWarning,
+            )
+
+
+def build_base_specs(config: pytest.Config) -> list[BaseNpuSweepSpec]:
+    """Build sweep specs for base-only models."""
+    if not should_expand_core_matrix(config):
+        return [BaseNpuSweepSpec(base_core_mode="single")]
+    return [BaseNpuSweepSpec(base_core_mode=mode) for mode in expand_core_modes(config.getoption("--core-mode"))]
+
+
+def build_eagle3_specs(config: pytest.Config) -> list[Eagle3NpuSweepSpec]:
+    """Build synchronized sweep specs for EAGLE-3 backends."""
+    if not should_expand_core_matrix(config, prefixes=("base", "draft", "fc")):
+        return [Eagle3NpuSweepSpec(core_mode="global4")]
+
+    shared_raw = config.getoption("--core-mode")
+    base_explicit = option_value_was_provided(config, "base", "core_mode")
+    draft_explicit = option_value_was_provided(config, "draft", "core_mode")
+    fc_explicit = option_value_was_provided(config, "fc", "core_mode")
+    shared_explicit = option_value_was_provided(config, "", "core_mode")
+    use_shared_defaults = shared_explicit or full_matrix_enabled(config)
+
+    if use_shared_defaults and not base_explicit and not draft_explicit and not fc_explicit:
+        return [Eagle3NpuSweepSpec(core_mode=mode) for mode in expand_core_modes(shared_raw)]
+
+    # If any EAGLE-3 backend is explicitly configured, preserve the existing direct kwarg path.
+    return [Eagle3NpuSweepSpec(core_mode=None)]
+
+
+def build_encoder_decoder_specs(config: pytest.Config) -> list[EncoderDecoderNpuSweepSpec]:
+    """Build synchronized sweep specs for encoder-decoder models."""
+    if not should_expand_core_matrix(config, prefixes=("encoder", "decoder")):
+        return [
+            EncoderDecoderNpuSweepSpec(
+                encoder_core_mode="single",
+                decoder_core_mode="single",
+            )
+        ]
+
+    encoder_raw = config.getoption("--encoder-core-mode")
+    decoder_raw = config.getoption("--decoder-core-mode")
+    shared_raw = config.getoption("--core-mode")
+    encoder_explicit = option_value_was_provided(config, "encoder", "core_mode")
+    decoder_explicit = option_value_was_provided(config, "decoder", "core_mode")
+    shared_explicit = option_value_was_provided(config, "", "core_mode")
+    use_shared_defaults = shared_explicit or full_matrix_enabled(config)
+
+    if use_shared_defaults and not encoder_explicit and not decoder_explicit:
+        return [
+            EncoderDecoderNpuSweepSpec(
+                encoder_core_mode=mode,
+                decoder_core_mode=mode,
+            )
+            for mode in expand_core_modes(shared_raw)
+        ]
+
+    encoder_modes = expand_core_modes(encoder_raw if encoder_explicit else shared_raw if use_shared_defaults else None)
+    decoder_modes = expand_core_modes(decoder_raw if decoder_explicit else shared_raw if use_shared_defaults else None)
+    return [
+        EncoderDecoderNpuSweepSpec(
+            encoder_core_mode=encoder_mode,
+            decoder_core_mode=decoder_mode,
+        )
+        for encoder_mode in encoder_modes
+        for decoder_mode in decoder_modes
+    ]
+
+
+def build_vision_text_specs(config: pytest.Config) -> list[VisionTextNpuSweepSpec]:
+    """Build synchronized sweep specs for vision-text models."""
+    if not should_expand_core_matrix(config, prefixes=("vision", "text")):
+        return [
+            VisionTextNpuSweepSpec(
+                vision_core_mode="single",
+                text_core_mode="single",
+            )
+        ]
+
+    vision_raw = config.getoption("--vision-core-mode")
+    text_raw = config.getoption("--text-core-mode")
+    shared_raw = config.getoption("--core-mode")
+    vision_explicit = option_value_was_provided(config, "vision", "core_mode")
+    text_explicit = option_value_was_provided(config, "text", "core_mode")
+    shared_explicit = option_value_was_provided(config, "", "core_mode")
+    use_shared_defaults = shared_explicit or full_matrix_enabled(config)
+
+    if use_shared_defaults and not vision_explicit and not text_explicit:
+        return [
+            VisionTextNpuSweepSpec(
+                vision_core_mode=mode,
+                text_core_mode=mode,
+            )
+            for mode in expand_core_modes(shared_raw)
+        ]
+
+    vision_modes = expand_core_modes(vision_raw if vision_explicit else shared_raw if use_shared_defaults else None)
+    text_modes = expand_core_modes(text_raw if text_explicit else shared_raw if use_shared_defaults else None)
+    return [
+        VisionTextNpuSweepSpec(
+            vision_core_mode=vision_mode,
+            text_core_mode=text_mode,
+        )
+        for vision_mode in vision_modes
+        for text_mode in text_modes
+    ]
+
+
+def build_base_npu_params(
+    config: pytest.Config,
+    embedding_weight: str | None,
+    *,
+    core_mode_override: str | None = None,
+) -> BaseNpuParams:
+    """Build base backend kwargs for tests that use a single backend config."""
+    provided_prefixes = collect_provided_prefixes(config, embedding_weight)
+    warn_unused_prefixes(provided_prefixes, {"base"})
+
+    base_kwargs, _ = collect_npu_kwargs(config, "", core_mode_override=core_mode_override)
+    if embedding_weight:
+        base_kwargs["embedding_weight"] = embedding_weight
+
+    return BaseNpuParams(base=base_kwargs)
+
+
+def resolve_batch_core_mode(model_id: str, revision: str | None, *, text_config: bool = False) -> str:
+    """Resolve a batch LLM core mode from config, falling back to ``auto``.
+
+    Raw JSON is used intentionally: ``AutoConfig`` may materialize a library default for a
+    missing field, which would hide the required batch fallback.
+    """
+    local_path = Path(model_id).expanduser()
+    config_path = local_path / "config.json" if local_path.is_dir() else None
+    try:
+        if config_path is not None and config_path.is_file():
+            payload = json.loads(config_path.read_text(encoding="utf-8"))
+        else:
+            from huggingface_hub import hf_hub_download
+
+            downloaded = hf_hub_download(repo_id=model_id, filename="config.json", revision=revision)
+            payload = json.loads(Path(downloaded).read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        return "auto"
+    if not isinstance(payload, dict):
+        return "auto"
+
+    resolved = resolve_config_core_mode(payload, role="text" if text_config else "shared")
+    try:
+        return validate_resolved_batch_core_mode(resolved)
+    except ValueError as exc:
+        raise pytest.UsageError(str(exc)) from exc
+
+
+def build_vision_engine_kwargs(
+    base_kwargs: dict[str, Any],
+    *,
+    model_cls: str,
+    model_type: str = "DEFAULT",
+    mxq_path: str = "",
+    core_mode: CoreMode = "global8",
+) -> VisionEngineKwargs:
+    """Build typed kwargs for vision tests that construct ``MBLT_Engine``.
+
+    Args:
+        base_kwargs: Shared backend kwargs from the pytest NPU fixtures.
+        model_cls: Model name to load.
+        model_type: Model variant key from the YAML config.
+        mxq_path: Optional explicit MXQ path override.
+        core_mode: Default core mode used when the fixture does not override it.
+
+    Returns:
+        A typed kwargs dictionary suitable for ``MBLT_Engine(**kwargs)``.
+    """
+    model_kwargs: VisionEngineKwargs = {
+        "model_cls": model_cls,
+        "mxq_path": mxq_path,
+        "model_type": model_type,
+        "core_mode": core_mode,
+    }
+
+    if "mxq_path" in base_kwargs:
+        model_kwargs["mxq_path"] = cast(str, base_kwargs["mxq_path"])
+    if "dev_no" in base_kwargs:
+        model_kwargs["dev_no"] = cast(int, base_kwargs["dev_no"])
+    if "core_mode" in base_kwargs:
+        model_kwargs["core_mode"] = normalize_core_mode(cast(str, base_kwargs["core_mode"]))
+    if "target_cores" in base_kwargs:
+        model_kwargs["target_cores"] = cast(list[str], base_kwargs["target_cores"])
+    if "target_clusters" in base_kwargs:
+        model_kwargs["target_clusters"] = cast(list[int], base_kwargs["target_clusters"])
+
+    return model_kwargs
+
+
+def build_eagle3_npu_params(
+    config: pytest.Config,
+    base_embedding_path: str | None,
+    draft_embedding_path: str | None,
+    *,
+    core_mode_override: str | None = None,
+) -> Eagle3NpuParams:
+    """Build backend kwargs for EAGLE-3 models."""
+    provided_prefixes = collect_provided_prefixes(config, None)
+    warn_unused_prefixes(provided_prefixes, {"base", "draft", "fc"})
+
+    shared_kwargs, _ = collect_npu_kwargs(config, "", core_mode_override=core_mode_override)
+
+    model_kwargs: dict[str, Any] = {}
+    for prefix in ("base", "draft", "fc"):
+        merged_kwargs = {
+            f"{prefix}_mxq_path": shared_kwargs.get("mxq_path"),
+            f"{prefix}_dev_no": shared_kwargs.get("dev_no"),
+            f"{prefix}_core_mode": shared_kwargs.get("core_mode"),
+            f"{prefix}_target_cores": shared_kwargs.get("target_cores"),
+            f"{prefix}_target_clusters": shared_kwargs.get("target_clusters"),
+        }
+        merged_kwargs = {key: value for key, value in merged_kwargs.items() if value is not None}
+        prefix_kwargs, _ = collect_npu_kwargs(config, prefix)
+        merged_kwargs.update(prefix_kwargs)
+        model_kwargs.update(merged_kwargs)
+
+    if base_embedding_path:
+        model_kwargs["base_embedding_weight"] = base_embedding_path
+    if draft_embedding_path:
+        model_kwargs["draft_embedding_weight"] = draft_embedding_path
+
+    return Eagle3NpuParams(model=model_kwargs)
+
+
+def validate_batch_core_mode(
+    config: pytest.Config,
+    *,
+    suite_name: str,
+    prefixes: tuple[str, ...] = (),
+) -> None:
+    """Reject unsupported modes after resolving the batched LLM backend's effective mode.
+
+    VLM suites may use a fixed shared mode for the vision backend while overriding the
+    batched text backend with ``--text-core-mode auto``. In that case only the effective
+    text mode participates in batch validation.
+    """
+    text_prefix_explicit = "text" in prefixes and option_value_was_provided(config, "text", "core_mode")
+    if text_prefix_explicit:
+        options = ("text", *(prefix for prefix in prefixes if prefix != "text"))
+    else:
+        options = ("", *prefixes)
+    for prefix in options:
+        opt_prefix = f"--{prefix}-" if prefix else "--"
+        raw_core_mode = config.getoption(f"{opt_prefix}core-mode")
+        if raw_core_mode in {None, "", "all", "single", "auto"}:
+            continue
+        flag = f"{opt_prefix}core-mode"
+        raise pytest.UsageError(f"{suite_name} only supports {flag} single or auto. Received {flag}={raw_core_mode!r}.")
