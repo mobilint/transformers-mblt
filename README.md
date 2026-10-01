@@ -24,6 +24,10 @@ Version `0.0.0` is the first standalone release. It was extracted from `mblt-mod
 
 ## Installation
 
+[![PyPI - Version](https://img.shields.io/pypi/v/transformers-mblt?logo=pypi&logoColor=white)](https://pypi.org/project/transformers-mblt/)
+[![PyPI Downloads](https://static.pepy.tech/badge/transformers-mblt?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads)](https://clickpy.clickhouse.com/dashboard/transformers-mblt)
+[![PyPI - Python Version](https://img.shields.io/pypi/pyversions/transformers-mblt?logo=python&logoColor=gold)](https://pypi.org/project/transformers-mblt/)
+
 ```bash
 pip install transformers-mblt
 ```
