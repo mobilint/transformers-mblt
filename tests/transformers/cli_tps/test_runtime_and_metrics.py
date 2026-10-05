@@ -3338,3 +3338,92 @@ def test_tps_measurer_batch_sampling_forwards_temperature_generate_kwarg():
     assert model.generate_kwargs is not None
     assert model.generate_kwargs.get("do_sample") is True
     assert model.generate_kwargs.get("temperature") == pytest.approx(0.3)
+
+
+def _disable_config_use_cache(model) -> None:
+    """Mirror a package whose ``config.json`` ships ``use_cache: false`` (e.g. HyperCLOVAX-SEED)."""
+    model.config.use_cache = False
+    model.generation_config.use_cache = False
+
+
+@pytest.mark.parametrize(
+    ("model_cls", "run"),
+    [
+        pytest.param(
+            _DummyGenerateNPUModel,
+            lambda measurer: measurer.measure(num_prefill=8, num_decode=2),
+            id="measure",
+        ),
+        pytest.param(
+            _DummyBatchedGenerateNPUModel,
+            lambda measurer: measurer.measure(num_prefill=8, num_decode=2, batch_size=2),
+            id="measure-batch",
+        ),
+        pytest.param(
+            _DummyGenerateNPUModel,
+            lambda measurer: measurer.measure_decode_with_fake_prefill(cache_len=8, num_decode=2),
+            id="fake-prefill",
+        ),
+        pytest.param(
+            _DummyBatchedGenerateNPUModel,
+            lambda measurer: measurer.measure_decode_with_fake_prefill(cache_len=8, num_decode=2, batch_size=2),
+            id="fake-prefill-batch",
+        ),
+    ],
+)
+def test_tps_measurer_forces_use_cache_over_config(model_cls, run):
+    """Every ``TPSMeasurer`` generate path must pass ``use_cache=True`` even when the config disables it.
+
+    With ``use_cache: false`` HF re-feeds the whole sequence each decode step, which overflows the
+    NPU KV cache (``Model_CacheOverflow``). The model's config itself must stay untouched.
+    """
+    model = model_cls()
+    _disable_config_use_cache(model)
+    measurer = TPSMeasurer(_DummyTextPipeline(model))
+
+    run(measurer)
+
+    assert model.generate_kwargs is not None
+    assert model.generate_kwargs.get("use_cache") is True
+    assert model.config.use_cache is False
+    assert model.generation_config.use_cache is False
+
+
+class _RecordingVLMModel(_DummyBatchedVLMModel):
+    """VLM model double that records generate kwargs and feeds an optional streamer."""
+
+    def __init__(self, language_model: _DummyVLMLanguageModel, generated_tokens: int) -> None:
+        super().__init__(language_model, generated_tokens)
+        self.generation_config = GenerationConfig()
+        self.generate_kwargs = None
+
+    def generate(self, **kwargs) -> torch.Tensor:
+        """Record kwargs, then emit generated-only ids through the streamer when one is given."""
+        self.generate_kwargs = kwargs
+        streamer = kwargs.get("streamer")
+        if streamer is None:
+            return super().generate(**kwargs)
+        batch_size = int(kwargs["inputs_embeds"].shape[0])
+        streamer.put(torch.zeros((batch_size, 0), dtype=torch.long))
+        for _ in range(int(self.generated_tokens)):
+            streamer.put(torch.zeros((batch_size, 1), dtype=torch.long))
+        streamer.end()
+        return torch.zeros((batch_size, int(self.generated_tokens)), dtype=torch.long)
+
+
+@pytest.mark.parametrize("batch_size", [1, 2], ids=["streamer", "batch"])
+def test_vlm_measure_llm_forces_use_cache_over_config(batch_size):
+    """``VLMTPSMeasurer._measure_llm_once`` must pass ``use_cache=True`` regardless of the model config."""
+    language_model = _DummyVLMLanguageModel()
+    num_decode = 4
+    measurer = _DummyBatchedVLMTPSMeasurer(language_model, generated_tokens=num_decode + 1)
+    measurer.model = _RecordingVLMModel(language_model, generated_tokens=num_decode + 1)
+    _disable_config_use_cache(measurer.model)
+    inputs_embeds = torch.zeros((batch_size, 8, 4), dtype=torch.float32)
+
+    measurer._measure_llm_once(inputs_embeds, num_decode=num_decode)
+
+    assert measurer.model.generate_kwargs is not None
+    assert measurer.model.generate_kwargs.get("use_cache") is True
+    assert measurer.model.config.use_cache is False
+    assert measurer.model.generation_config.use_cache is False

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.1
+
+### Fixed
+
+- `tps measure|sweep` and the benchmark scripts pass `use_cache=True` to every `generate()` call (prefill, decode with
+  fake prefill, batched generation, and the VLM LLM path). A package whose `config.json` sets `use_cache: false`
+  (HyperCLOVAX-SEED) made HF re-feed the full sequence each decode step and overflow the NPU KV cache
+  (`Model_CacheOverflow`). The model's `config` is not modified.
+
 ## 0.1.0
 
 ### Fixed

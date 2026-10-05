@@ -1008,6 +1008,14 @@ class BenchmarkResult:
         _write_avg_table("decode avg npu token latency (%)", avg_npu_pct_map, "decode", decode_tokens)
 
 class TPSMeasurer:
+    """Measure text-generation prefill/decode throughput through ``model.generate()``.
+
+    Every ``generate()`` call passes ``use_cache=True`` explicitly. A package whose
+    ``config.json`` says ``use_cache: false`` would otherwise make HF re-feed the whole
+    sequence on every step, which is not the decode path being measured and overflows the
+    NPU KV cache (``Model_CacheOverflow``). The model's own config is left untouched.
+    """
+
     def __init__(self, pipeline):
         self.model = pipeline.model
         self.tokenizer = pipeline.tokenizer
@@ -1069,6 +1077,7 @@ class TPSMeasurer:
             max_new_tokens=num_decode if fake_prefill else num_decode + 1,
             eos_token_id=None,
             pad_token_id=self.tokenizer.eos_token_id,
+            use_cache=True,
         )
         if temperature > 0.0:
             gen_kwargs["do_sample"] = True
@@ -1283,6 +1292,7 @@ class TPSMeasurer:
                 max_new_tokens=num_decode + 1,
                 eos_token_id=None,
                 pad_token_id=self.tokenizer.eos_token_id,
+                use_cache=True,
             )
             if temperature > 0.0:
                 gen_kwargs["do_sample"] = True
@@ -1496,6 +1506,7 @@ class TPSMeasurer:
                 do_sample=False,
                 eos_token_id=None,
                 pad_token_id=self.tokenizer.eos_token_id,
+                use_cache=True,
             )
             if self._supports_npu_timing():
                 gen_kwargs["count_npu_time"] = True
@@ -1800,6 +1811,11 @@ class VLMSingleMeasurement:
 
 
 class VLMTPSMeasurer:
+    """Measure vision-language throughput; LLM ``generate()`` calls force ``use_cache=True``.
+
+    See ``TPSMeasurer`` for why the KV cache is forced regardless of the model config.
+    """
+
     def __init__(self, pipeline):
         self.pipeline = pipeline
         self.model = pipeline.model
@@ -1985,6 +2001,7 @@ class VLMTPSMeasurer:
                 max_new_tokens=num_decode + 1,
                 eos_token_id=None,
                 pad_token_id=self.tokenizer.eos_token_id,
+                use_cache=True,
             )
             if temperature > 0.0:
                 gen_kwargs["do_sample"] = True
@@ -2111,6 +2128,7 @@ class VLMTPSMeasurer:
             max_new_tokens=num_decode + 1,
             eos_token_id=None,
             pad_token_id=self.tokenizer.eos_token_id,
+            use_cache=True,
         )
         if temperature > 0.0:
             gen_kwargs["do_sample"] = True
