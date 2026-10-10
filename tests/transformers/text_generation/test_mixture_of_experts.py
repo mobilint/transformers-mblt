@@ -343,6 +343,22 @@ def test_moe_forward_decode_step_records_decode_timing() -> None:
     assert model.npu_time is not None
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_moe_forward_returns_logits_in_the_input_dtype(dtype: torch.dtype) -> None:
+    config = _small_config()
+    backend = _FakeMoEBackend(
+        config.num_hidden_layers, config.hidden_size, config.num_experts, config.vocab_size, False
+    )
+    model = _harness(config, backend)
+    embeds = torch.zeros((1, 3, config.hidden_size), dtype=dtype)
+
+    assert model.moe_forward(embeds, None, torch.arange(3), logits_to_keep=0).dtype == dtype
+    assert (
+        model.moe_forward(embeds, None, torch.arange(3), logits_to_keep=torch.tensor([], dtype=torch.long)).dtype
+        == dtype
+    )
+
+
 def test_moe_forward_rejects_batched_inputs() -> None:
     config = _small_config()
     backend = _FakeMoEBackend(

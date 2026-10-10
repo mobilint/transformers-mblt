@@ -1947,4 +1947,5 @@ class MobilintMixtureOfExpertsModelMixin(MobilintModelMixin):
         if not output_positions:
             return self._empty_kept_logits(1, inputs_embeds.dtype, inputs_embeds.device)
         stacked = np.stack([logits_by_position[position] for position in output_positions])
-        return torch.from_numpy(stacked).unsqueeze(0).to(device=inputs_embeds.device)
+        # Match the input dtype like MobilintModelMixin.llm_forward (the backend always computes in float32).
+        return torch.from_numpy(stacked).unsqueeze(0).to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
