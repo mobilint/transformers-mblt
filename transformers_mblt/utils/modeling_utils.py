@@ -1855,19 +1855,25 @@ class MobilintMixtureOfExpertsModelMixin(MobilintModelMixin):
                 )
             residual, gate, expert_in = backend.shared_forward_chunk(layer_idx, hidden, cache_size)
             experts, weights = self._moe_route(gate[0])
-            routed: dict[int, list[tuple[int, float]]] = {}
-            for token_idx in range(experts.shape[0]):
-                for slot in range(experts.shape[1]):
-                    routed.setdefault(int(experts[token_idx, slot]), []).append(
-                        (token_idx, float(weights[token_idx, slot]))
-                    )
+            n_tokens, top_k = experts.shape
+            # Group the (token, slot) pairs by expert: ``order`` lists the flattened pair indices sorted by expert, so
+            # each expert's rows are one contiguous slice of a single gather.
+            pairs = experts.reshape(-1)
+            order = np.argsort(pairs, kind="stable")
+            counts = np.bincount(pairs, minlength=gate.shape[-1])
+            bounds = np.concatenate(([0], np.cumsum(counts)))
+            gathered = expert_in[0, order // top_k, :]
             expert_inputs = {
-                expert_idx: expert_in[0, [token_idx for token_idx, _ in tokens], :]
-                for expert_idx, tokens in routed.items()
+                int(expert_idx): gathered[bounds[expert_idx] : bounds[expert_idx + 1]]
+                for expert_idx in np.flatnonzero(counts)
             }
+            # Scatter every expert's rows back to pair order, then take each token's weighted sum in one pass.
+            pair_outputs = np.empty((n_tokens * top_k, residual.shape[-1]), dtype=np.float32)
             for expert_idx, outputs in backend.experts_forward_chunk(layer_idx, expert_inputs):
-                for row, (token_idx, weight) in enumerate(routed[expert_idx]):
-                    residual[0, token_idx, :] += weight * outputs[row]
+                pair_outputs[order[bounds[expert_idx] : bounds[expert_idx + 1]]] = outputs
+            residual[0] += np.einsum(
+                "tkh,tk->th", pair_outputs.reshape(n_tokens, top_k, -1), weights.astype(np.float32, copy=False)
+            )
             hidden = residual
 
         logits: dict[int, np.ndarray] = {}
@@ -1920,7 +1926,9 @@ class MobilintMixtureOfExpertsModelMixin(MobilintModelMixin):
             end = min(start + chunk_size, seq_len)
             local_kept = sorted(position - start for position in kept if start <= position < end)
             n_tokens = end - start
-            if n_tokens == chunk_size and n_tokens > 1 and not (
+            # A tail shorter than ``chunk_size`` also takes the batched path: the shared and expert MXQs have a dynamic
+            # token axis, and running it token by token would cost one full decode step per tail token.
+            if n_tokens > 1 and not (
                 last_only and any(position != n_tokens - 1 for position in local_kept)
             ):
                 chunk_logits = self._moe_forward_chunk(embeds[:, start:end, :], past_seen + start, local_kept)

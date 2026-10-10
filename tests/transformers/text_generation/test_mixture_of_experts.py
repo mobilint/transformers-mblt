@@ -276,10 +276,13 @@ def _reference_logits(config: MobilintQwen3MoEConfig, backend: _FakeMoEBackend, 
     return np.stack(rows)
 
 
+@pytest.mark.parametrize("chunk_size", [2, 3])  # 5 tokens: 2 + 2 + a 1-token tail, or 3 + a 2-token tail chunk
 @pytest.mark.parametrize("last_only", [False, True])
 @pytest.mark.parametrize("logits_to_keep", [1, 0, 3, torch.tensor([4, 0, 4])])
-def test_moe_forward_matches_reference_for_every_dispatch(last_only: bool, logits_to_keep: Any) -> None:
-    config = _small_config(npu_prefill_chunk_size={"single": 2})
+def test_moe_forward_matches_reference_for_every_dispatch(
+    chunk_size: int, last_only: bool, logits_to_keep: Any
+) -> None:
+    config = _small_config(npu_prefill_chunk_size={"single": chunk_size})
     backend = _FakeMoEBackend(
         config.num_hidden_layers, config.hidden_size, config.num_experts, config.vocab_size, last_only
     )
@@ -307,7 +310,7 @@ def test_moe_forward_matches_reference_for_every_dispatch(last_only: bool, logit
     )
 
 
-def test_moe_forward_chunks_full_windows_and_runs_the_tail_token_by_token() -> None:
+def test_moe_forward_runs_a_short_tail_as_one_chunk() -> None:
     config = _small_config(npu_prefill_chunk_size={"single": 2})
     backend = _FakeMoEBackend(
         config.num_hidden_layers, config.hidden_size, config.num_experts, config.vocab_size, False
@@ -319,7 +322,14 @@ def test_moe_forward_chunks_full_windows_and_runs_the_tail_token_by_token() -> N
     assert [(kind, cache_size, n) for kind, layer, cache_size, n in backend.calls if layer == 0] == [
         ("chunk", 0, 2),
         ("chunk", 2, 2),
-        ("token", 4, 1),
+        ("token", 4, 1),  # a 1-token tail is a decode step
+    ]
+
+    backend.calls.clear()
+    model.moe_forward(embeds, None, torch.arange(5), logits_to_keep=1, npu_prefill_chunk_size=3)
+    assert [(kind, cache_size, n) for kind, layer, cache_size, n in backend.calls if layer == 0] == [
+        ("chunk", 0, 3),
+        ("chunk", 3, 2),
     ]
 
     backend.calls.clear()
