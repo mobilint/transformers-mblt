@@ -62,6 +62,10 @@
   fake prefill, batched generation, and the VLM LLM path). A package whose `config.json` sets `use_cache: false`
   (HyperCLOVAX-SEED) made HF re-feed the full sequence each decode step and overflow the NPU KV cache
   (`Model_CacheOverflow`). The model's `config` is not modified.
+- The `tps` core-mode guard and pre-launch resolver tests no longer read the real release `config.json` from the
+  Hub. The resolver reads the raw `config.json` before `AutoConfig`, so the stubbed config was bypassed and the
+  published `mobilint/Llama-3.2-1B-Instruct-Batch16` `core_mode: "auto"` failed two tests whenever the Hub was
+  reachable.
 
 ## 0.1.0
 
