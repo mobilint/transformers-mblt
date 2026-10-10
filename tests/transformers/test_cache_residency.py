@@ -654,3 +654,14 @@ def test_offload_of_a_cache_restored_before_any_forward(tmp_path) -> None:
     assert not restored.is_resident and restored.host_nbytes == len(b"saved")
     _run(restored, backend, 0, "!")
     assert _slot(backend) == "saved!"
+
+
+def test_cache_restored_before_any_forward_moves_to_another_instance(tmp_path) -> None:
+    source, target = _Backend(), _Backend()
+    restored = MobilintCache(source.mxq_models)
+    _restore_from_file(restored, source, "saved", tmp_path)
+
+    _run(restored, target, 0, "!")  # never bound on `source`: its pending claim is saved before the move
+
+    assert _slot(target) == "saved!"
+    assert source.mxq_models[0].calls == [("dump", 0)]

@@ -709,3 +709,18 @@ def test_moe_cache_restored_from_files_before_any_forward_continues(tmp_path) ->
 
     assert [model.kv for model in fresh.get_shared_mxq_models()] == ["prompt!", "prompt!"]
     assert all(model.calls == [] for model in fresh.get_shared_mxq_models())
+
+
+def test_moved_moe_cache_does_not_keep_its_source_backend_alive() -> None:
+    source, target = _Generator(), _Generator()
+    cache = MobilintMixtureOfExpertsCache(source.get_shared_mxq_models(), owner=source.npu_backend)
+    source.run(cache, "hello")
+    target.run(cache, "!")
+    backend_ref = weakref.ref(source.npu_backend)
+
+    del source
+    gc.collect()
+
+    assert backend_ref() is None
+    assert cache.owner is None
+    assert [model.kv for model in target.get_shared_mxq_models()] == ["hello!", "hello!"]

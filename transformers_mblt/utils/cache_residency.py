@@ -248,10 +248,13 @@ class MobilintKVResidency:
                 layer._load_into_slot()
             return
 
-        # Resident somewhere else (another slot here, or another backend): save it there first.
+        # Resident somewhere else (another slot here, or another backend): save it there first. That includes a
+        # pending claim from a direct load that no owner table has adopted yet.
         previous = layer._resident_at() if layer._resident_at is not None else None
         if previous is not None:
             previous.evict_layer(layer)
+        if not same_slot and pending_owner(layer.mxq_model, layer.cache_id) is layer:
+            save_pending_owner(layer.mxq_model, layer.cache_id)
 
         if not same_slot:
             layer._retarget(mxq_model, cache_id)

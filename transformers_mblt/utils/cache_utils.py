@@ -1328,7 +1328,8 @@ class MobilintMixtureOfExpertsCache(Cache):
     The shared MXQs hold one sequence at a time. Like :class:`MobilintCache`, the cache is portable: before every
     forward the model binds all shared layers (see :mod:`transformers_mblt.utils.cache_residency`), so a cache that
     another sequence displaced is saved and restored instead of reset, and a cache can move to another instance of
-    the same release. ``owner`` is accepted for compatibility and unused.
+    the same release. ``owner`` is accepted for compatibility, unused, and held weakly so a cache that moved away
+    never keeps its source backend alive.
     """
 
     def __init__(self, shared_mxq_models: Sequence[qbruntime.Model], owner: Any = None) -> None:
@@ -1350,6 +1351,17 @@ class MobilintMixtureOfExpertsCache(Cache):
     @property
     def max_batch_size(self) -> int:
         return 1
+
+    @property
+    def owner(self) -> Any:
+        return self._owner_ref() if self._owner_ref is not None else None
+
+    @owner.setter
+    def owner(self, value: Any) -> None:
+        try:
+            self._owner_ref = weakref.ref(value) if value is not None else None
+        except TypeError:  # objects without __weakref__ are dropped rather than kept alive
+            self._owner_ref = None
 
     def _tag_layers(self) -> None:
         # Lets the backend's ``kv_owner`` map a slot's owner layer back to its cache.
