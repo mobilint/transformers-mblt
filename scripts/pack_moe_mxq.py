@@ -195,6 +195,11 @@ def main() -> int:
     args = parser.parse_args()
     if args.skip_pack and not args.config:
         parser.error("--skip-pack only makes sense with --config")
+    try:
+        # Reject what the loader would reject before writing any pack.
+        MobilintMixtureOfExpertsPackIndex.check_layout(args.pack_template, args.alignment)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     started = time.perf_counter()
     member_paths = [

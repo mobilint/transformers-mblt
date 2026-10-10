@@ -99,3 +99,47 @@ def test_index_rejects_wrong_shape_and_format(packed_release, tmp_path: Path) ->
     bad.write_text('{"format": "other", "version": 1, "alignment": 4096, "pack": "x", "sizes": []}')
     with pytest.raises(ValueError, match="mobilint-moe-mxqpack"):
         MobilintMixtureOfExpertsPackIndex.load(str(bad))
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "message"),
+    [
+        (["--alignment", "3"], "power of two"),
+        (["--alignment", "0"], "power of two"),
+        (["--pack-template", "block_{layer}.pack"], ".mxqpack"),
+        (["--pack-template", "block.mxqpack"], "{layer}"),
+    ],
+)
+def test_pack_script_rejects_layouts_the_loader_cannot_read(
+    tmp_path: Path, extra_args: list[str], message: str
+) -> None:
+    src, out = tmp_path / "src", tmp_path / "mxq"
+    src.mkdir()
+    _write_release(src)
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "scripts" / "pack_moe_mxq.py"),
+            str(src),
+            str(out),
+            "--num-layers",
+            str(NUM_LAYERS),
+            "--num-experts",
+            str(NUM_EXPERTS),
+            *extra_args,
+        ],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [str(REPO_ROOT), os.environ.get("PYTHONPATH")]))},
+    )
+    assert result.returncode != 0 and message in result.stderr
+    assert not out.exists()  # nothing was written
+
+
+def test_index_rejects_a_pack_name_hub_downloads_would_skip(tmp_path: Path) -> None:
+    bad = tmp_path / "index.json"
+    bad.write_text(
+        '{"format": "mobilint-moe-mxqpack", "version": 1, "alignment": 4096, "pack": "block_{layer}.pack", "sizes": []}'
+    )
+    with pytest.raises(ValueError, match=".mxqpack"):
+        MobilintMixtureOfExpertsPackIndex.load(str(bad))

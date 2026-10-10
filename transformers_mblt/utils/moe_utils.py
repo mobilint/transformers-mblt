@@ -65,6 +65,8 @@ _MXQ_TOKEN_AXIS_INDEX = -2
 
 MXQ_PACK_FORMAT = "mobilint-moe-mxqpack"
 MXQ_PACK_VERSION = 1
+# Hub downloads fetch packs by this suffix, so every pack name must end with it.
+MXQ_PACK_SUFFIX = ".mxqpack"
 
 
 @dataclass(frozen=True)
@@ -90,14 +92,28 @@ class MobilintMixtureOfExpertsPackIndex:
                 f"{path} is not a {MXQ_PACK_FORMAT} v{MXQ_PACK_VERSION} index "
                 f"(format={data.get('format')!r}, version={data.get('version')!r})."
             )
-        alignment = int(data["alignment"])
-        if alignment < 1 or alignment & (alignment - 1):
-            raise ValueError(f"{path}: alignment must be a power of two, got {alignment}.")
+        pack, alignment = str(data["pack"]), int(data["alignment"])
+        try:
+            cls.check_layout(pack, alignment)
+        except ValueError as exc:
+            raise ValueError(f"{path}: {exc}") from exc
         return cls(
-            pack=str(data["pack"]),
+            pack=pack,
             alignment=alignment,
             sizes=tuple(tuple(int(size) for size in row) for row in data["sizes"]),
         )
+
+    @staticmethod
+    def check_layout(pack: str, alignment: int) -> None:
+        """Validate a pack-name template and member alignment; ``scripts/pack_moe_mxq.py`` checks them before writing.
+
+        The template must contain ``{layer}`` and end with :data:`MXQ_PACK_SUFFIX`, the suffix Hub downloads select
+        packs by, and the alignment must be a positive power of two.
+        """
+        if "{layer}" not in pack or not pack.endswith(MXQ_PACK_SUFFIX):
+            raise ValueError(f"pack template must contain '{{layer}}' and end with {MXQ_PACK_SUFFIX!r}, got {pack!r}.")
+        if alignment < 1 or alignment & (alignment - 1):
+            raise ValueError(f"alignment must be a positive power of two, got {alignment}.")
 
     def to_json(self) -> str:
         """Serialize with one line per layer so the index stays readable (``num_layers + 6`` lines)."""
@@ -628,7 +644,7 @@ class MobilintMixtureOfExpertsNPUBackend:
 
         if self.mxq_pack_index:
             pack_dir = os.path.dirname(self.mxq_pack_index)
-            pack_glob = f"{pack_dir}/*.mxqpack" if pack_dir else "*.mxqpack"
+            pack_glob = f"{pack_dir}/*{MXQ_PACK_SUFFIX}" if pack_dir else f"*{MXQ_PACK_SUFFIX}"
             allow_patterns = sorted({self.lm_head_mxq_path(), self.mxq_pack_index, pack_glob})
         else:
             allow_patterns = sorted(
