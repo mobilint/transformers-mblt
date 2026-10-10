@@ -749,13 +749,20 @@ class MobilintMixtureOfExpertsNPUBackend:
         plan.append(("lm_head", -1, -1, self.lm_head_device, self.lm_head_mxq_path()))
 
         devices = sorted({item[3] for item in plan})
-        self.accs = {dev: Accelerator(self.target_device, dev) for dev in devices}
-        configs = {
-            (role, dev): self._make_model_config(role, dev)
-            for role in self.role_backends
-            for dev in devices
-            if dev in self._role_cores_by_device(role)
-        }
+        try:
+            self.accs = {dev: Accelerator(self.target_device, dev) for dev in devices}
+            configs = {
+                (role, dev): self._make_model_config(role, dev)
+                for role in self.role_backends
+                for dev in devices
+                if dev in self._role_cores_by_device(role)
+            }
+        except BaseException:
+            # Nothing is loaded yet, but the accelerators already hold their devices.
+            self._rollback([])
+            if reader is not None:
+                reader.close()
+            raise
 
         shared: list[Optional[Model]] = [None] * self.num_layers
         experts: list[list[Optional[Model]]] = [[None] * self.num_experts for _ in range(self.num_layers)]
@@ -944,19 +951,23 @@ class MobilintMixtureOfExpertsNPUBackend:
     # ---- Layer setup --------------------------------------------------------------------------------------------
 
     def _detect_expert_in_index(self, shared: Model, expert: Model, gate_idx: int) -> Optional[int]:
-        """Return the shared output whose scale is the reciprocal of the expert input scale, if unambiguous."""
+        """Return the shared output whose scale is the reciprocal of the expert input scale, if exactly one is.
+
+        ``None`` when no output matches or when several do (e.g. the residual happens to share the scale): picking
+        one of several candidates would silently mislabel the residual as the expert input.
+        """
         output_scales = shared.get_output_scale()
         expert_in_scale = expert.get_input_scale()[0]
-        errors: dict[int, float] = {}
-        for idx, scale in enumerate(output_scales):
-            if idx == gate_idx:
-                continue
-            if scale.is_uniform and expert_in_scale.is_uniform:
-                errors[idx] = abs(float(scale.scale) * float(expert_in_scale.scale) - 1.0)
-        if not errors:
+        if not expert_in_scale.is_uniform:
             return None
-        best = min(errors, key=errors.__getitem__)
-        return best if errors[best] <= _EXPERT_IN_SCALE_TOLERANCE else None
+        candidates = [
+            idx
+            for idx, scale in enumerate(output_scales)
+            if idx != gate_idx
+            and scale.is_uniform
+            and abs(float(scale.scale) * float(expert_in_scale.scale) - 1.0) <= _EXPERT_IN_SCALE_TOLERANCE
+        ]
+        return candidates[0] if len(candidates) == 1 else None
 
     def _resolve_output_indices(self, layer_idx: int, shared: Model, expert: Model) -> tuple[int, int, int]:
         """Resolve ``(residual, expert_in, gate)`` for one layer.
@@ -983,7 +994,7 @@ class MobilintMixtureOfExpertsNPUBackend:
             if detected is None:
                 raise ValueError(
                     f"Cannot identify the expert input output of shared[{layer_idx}] from its quantization "
-                    "scales; set moe_shared_output_order in config.json."
+                    "scales (no output, or more than one, matches); set moe_shared_output_order in config.json."
                 )
             expert_in_idx = detected
             residual_idx = ({0, 1, 2} - {gate_idx, expert_in_idx}).pop()

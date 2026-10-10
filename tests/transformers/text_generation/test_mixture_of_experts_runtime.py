@@ -231,6 +231,43 @@ def test_non_runtime_load_error_rolls_back(fake_runtime, tmp_path: Path, monkeyp
     assert all(model.disposed for model in fake_runtime.created)
 
 
+def test_failed_model_config_setup_releases_the_accelerators(
+    fake_runtime, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    created: "weakref.WeakSet[FakeAccelerator]" = weakref.WeakSet()
+
+    class TrackedAccelerator(FakeAccelerator):
+        def __init__(self, *args: Any) -> None:
+            super().__init__(*args)
+            created.add(self)
+
+    monkeypatch.setattr(moe_utils, "Accelerator", TrackedAccelerator)
+    backend = _backend(_release_dir(tmp_path))
+    monkeypatch.setattr(backend, "_make_model_config", lambda role, dev: (_ for _ in ()).throw(ValueError("bad cores")))
+
+    with pytest.raises(ValueError, match="bad cores"):
+        backend.launch()
+    gc.collect()
+    assert backend.accs == {}
+    assert len(created) == 0  # the failed launch keeps no accelerator alive
+
+
+def test_ambiguous_expert_input_scales_are_rejected_without_a_configured_order(
+    fake_runtime, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Residual and expert input share the reciprocal scale, so the scales cannot tell them apart.
+    monkeypatch.setattr(
+        FakeModel,
+        "get_output_scale",
+        lambda self: [_Scale(0.25), _Scale(0.25), _Scale(0.1)] if self.is_shared else [_Scale(1.0)],
+    )
+    backend = _backend(_release_dir(tmp_path))
+
+    with pytest.raises(ValueError, match="more than one"):
+        backend.launch()
+    assert all(model.disposed for model in fake_runtime.created)
+
+
 # ---- Bounded chunk buffers ------------------------------------------------------------------------------------
 
 
@@ -449,3 +486,26 @@ def test_output_order_is_derived_from_mxqs_and_cross_checked(tmp_path: Path, mon
     with pytest.raises(ValueError, match="manifest"):
         script.derive_shared_output_order(shared, experts, NUM_EXPERTS, manifest=_manifest(tmp_path, 1))
     assert all(model.disposed for model in FakeModel.created)
+
+
+def test_ambiguous_scales_need_the_manifest_to_derive_the_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    script = _pack_script()
+    monkeypatch.setattr(qbruntime, "Model", FakeModel)
+    monkeypatch.setattr(qbruntime, "ModelConfig", _FakeModelConfig)
+    monkeypatch.setattr(
+        FakeModel,
+        "get_output_scale",
+        lambda self: [_Scale(0.25), _Scale(0.25), _Scale(0.1)] if self.is_shared else [_Scale(1.0)],
+    )
+    release = _release_dir(tmp_path)
+    shared = [str(release / f"mxq/block_{layer}_shared.mxq") for layer in range(NUM_LAYERS)]
+    experts = [str(release / f"mxq/block_{layer}_expert_0.mxq") for layer in range(NUM_LAYERS)]
+
+    with pytest.raises(ValueError, match="ambiguous"):
+        script.derive_shared_output_order(shared, experts, NUM_EXPERTS)
+    # The manifest names the residual, which settles the tie.
+    orders = script.derive_shared_output_order(shared, experts, NUM_EXPERTS, manifest=_manifest(tmp_path, 1))
+    assert orders[-1] == ["expert_in", "residual", "gate"]
+    assert orders[0] == ["residual", "expert_in", "gate"]

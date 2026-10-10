@@ -121,22 +121,37 @@ def derive_shared_output_order(
         gates = [idx for idx, shape in enumerate(shapes) if int(shape[-1]) == num_experts]
         if len(shapes) != 3 or len(gates) != 1:
             raise ValueError(f"layer {layer_idx}: cannot identify the router gate among output shapes {shapes}.")
-        errors = {
-            idx: abs(float(scale.scale) * float(in_scale.scale) - 1.0)
+        gate = gates[0]
+        candidates = [
+            idx
             for idx, scale in enumerate(out_scales)
-            if idx != gates[0] and scale.is_uniform and in_scale.is_uniform
-        }
-        expert_in = min(errors, key=errors.__getitem__) if errors else None
-        if expert_in is None or errors[expert_in] > _EXPERT_IN_SCALE_TOLERANCE:
-            raise ValueError(f"layer {layer_idx}: no shared output scale is the reciprocal of the expert input scale.")
-        residual = ({0, 1, 2} - {gates[0], expert_in}).pop()
-        if residual_from_manifest is not None and residual_from_manifest[layer_idx] != residual:
+            if idx != gate
+            and scale.is_uniform
+            and in_scale.is_uniform
+            and abs(float(scale.scale) * float(in_scale.scale) - 1.0) <= _EXPERT_IN_SCALE_TOLERANCE
+        ]
+        if residual_from_manifest is not None:
+            # The manifest names the residual; the scales must agree that the remaining output is the expert input.
+            residual = residual_from_manifest[layer_idx]
+            if residual == gate:
+                raise ValueError(f"layer {layer_idx}: {manifest} puts the residual on the router gate output {gate}.")
+            expert_in = ({0, 1, 2} - {gate, residual}).pop()
+            if expert_in not in candidates:
+                raise ValueError(
+                    f"layer {layer_idx}: {manifest} puts the residual at output {residual}, but the MXQ scales do not "
+                    f"make output {expert_in} the expert input (scale matches: {candidates})."
+                )
+        elif len(candidates) == 1:
+            expert_in = candidates[0]
+            residual = ({0, 1, 2} - {gate, expert_in}).pop()
+        else:
+            found = "no shared output scale" if not candidates else f"outputs {candidates} all"
             raise ValueError(
-                f"layer {layer_idx}: the MXQ scales put the residual at output {residual}, "
-                f"but {manifest} puts it at output {residual_from_manifest[layer_idx]}."
+                f"layer {layer_idx}: {found} match the reciprocal of the expert input scale, so the expert input is "
+                "ambiguous; pass --manifest to take the residual from the compiler manifest."
             )
         roles = [""] * 3
-        roles[residual], roles[expert_in], roles[gates[0]] = ROLES
+        roles[residual], roles[expert_in], roles[gate] = ROLES
         orders.append(roles)
     return orders
 
