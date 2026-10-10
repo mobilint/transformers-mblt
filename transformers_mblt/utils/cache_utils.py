@@ -388,6 +388,7 @@ class MobilintCache(Cache):
                     )
             self._batch_size = len(row_slots)
         self._row_slots: List[Tuple[int, int]] = row_slots
+        self._explicit_slots = slots is not None
 
         self.layers: list[MobilintLayer] = [
             MobilintLayer(self.mxq_models[model_idx], cache_id) for model_idx, cache_id in row_slots
@@ -565,8 +566,7 @@ class MobilintCache(Cache):
         batch_size = max(1, int(batch_size))
         if batch_size <= self.batch_size:
             return
-        default_layout = [divmod(row, self.k_per_model) for row in range(len(self._row_slots))]
-        if self._row_slots != default_layout:
+        if self._explicit_slots:
             raise ValueError(
                 f"cannot grow a MobilintCache whose rows sit on chosen slots {self._row_slots}; "
                 "build it with every slot it needs"
@@ -587,6 +587,7 @@ class MobilintCache(Cache):
         """Return an independent snapshot; resident rows save their KV first (see :meth:`MobilintLayer.copy`)."""
         copied = MobilintCache(list(self.mxq_models), per_model_batch=self.k_per_model)
         copied._row_slots = list(self._row_slots)
+        copied._explicit_slots = self._explicit_slots
         copied._batch_size = self._batch_size
         copied.layers = [layer.copy() for layer in self.layers]
         return copied
@@ -1163,6 +1164,7 @@ class MobilintDeepStackCache(MobilintCache):
             hidden_size=self.hidden_size,
         )
         copied._row_slots = list(self._row_slots)
+        copied._explicit_slots = self._explicit_slots
         copied._batch_size = self._batch_size
         copied.layers = [layer.copy() for layer in self.layers]
         copied._deepstack_tensor = None if self._deepstack_tensor is None else self._deepstack_tensor.clone()

@@ -568,3 +568,13 @@ def test_snapshots_after_dispose_never_touch_the_dead_model() -> None:
     assert saved.layers[0].buffer == [b"kept"] and copied.get_seq_length() == 4
     with pytest.raises(MobilintCacheStateError):
         lost.dump_cache_memory()  # its KV was never saved
+
+
+def test_cache_with_slots_matching_the_default_layout_still_refuses_to_grow() -> None:
+    backend = _Backend(n=1, k=1)
+    cache = MobilintCache(backend.mxq_models, slots=[(0, 0)])
+
+    with pytest.raises(ValueError, match="chosen slots"):
+        cache.ensure_batch_size(2)
+    with pytest.raises(ValueError, match="chosen slots"):
+        cache.copy().ensure_batch_size(2)
