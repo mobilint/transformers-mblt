@@ -287,3 +287,46 @@ def test_decode_step_feeds_the_draft_the_accepted_tokens_shifted_by_one() -> Non
 
     assert draft.fed == [[5, 6, 0]]  # accepted [4, 5, 6] shifted by one, then the sampled token
     assert torch.equal(cache.accept_tokens, torch.tensor([[4, 5, 6]]))
+
+
+def test_forward_with_explicit_positions_refuses_to_skip_unfed_tokens() -> None:
+    base = _RecordingBase()
+    model = SimpleNamespace(eagle3_base_model=base, config=SimpleNamespace(vocab_size=8))
+
+    class _Cache(MobilintEagle3Cache):
+        pass
+
+    cache = object.__new__(_Cache)
+    cache.unfed_tokens = torch.tensor([[7, 8]])
+    cache.base_layer = SimpleNamespace(update_seen_tokens=lambda n: None)
+
+    with pytest.raises(ValueError, match="2 generated token"):
+        llm_eagle3_forward(
+            model, input_ids=torch.tensor([[9]]), attention_mask=torch.ones((1, 4)), past_key_values=cache
+        )
+
+    assert base.fed == []  # nothing advanced
+    assert torch.equal(cache.unfed_tokens, torch.tensor([[7, 8]]))
+
+
+def test_snapshots_keep_the_unfed_tokens(tmp_path) -> None:
+    class _FileMxq(_SlotMxq):
+        def dump_cache_memory_to(self, cache_dir, cache_id=0):
+            (tmp_path / "kv").write_text(self.kv)
+
+        def load_cache_memory_from(self, cache_dir, cache_id=0):
+            self.kv = (tmp_path / "kv").read_text()
+
+    cache = MobilintEagle3Cache(_FileMxq(), _FileMxq())
+    cache.accept_tokens = torch.tensor([[4, 5]])
+    cache.defer_accept_tokens()
+
+    cache.dump_cache_memory()
+    cache.unfed_tokens = None
+    cache.load_cache_memory()
+    assert torch.equal(cache.unfed_tokens, torch.tensor([[4, 5]]))
+
+    cache.dump_cache_memory_to(str(tmp_path))
+    restored = MobilintEagle3Cache(_FileMxq(), _FileMxq())
+    restored.load_cache_memory_from(str(tmp_path))
+    assert torch.equal(restored.unfed_tokens, torch.tensor([[4, 5]]))

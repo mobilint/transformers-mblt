@@ -75,7 +75,14 @@ def llm_eagle3_forward(
             unfed_embeds = model.eagle3_base_model.embed_tokens(unfed.to(inputs_embeds.device)).to(inputs_embeds.dtype)
             inputs_embeds = torch.cat((unfed_embeds, inputs_embeds), dim=1)
     elif unfed is not None:
-        past_key_values.unfed_tokens = unfed  # explicit positions/masks describe only the new input: leave them
+        # The caller's position_ids / attention_mask were built without these tokens, so they cannot be fed ahead
+        # of the input, and forwarding past them would reverse the conversation order. Refuse instead.
+        past_key_values.unfed_tokens = unfed
+        raise ValueError(
+            f"This EAGLE-3 cache still has {int(unfed.shape[1])} generated token(s) whose KV was not computed "
+            "(generation stopped right after accepting them). Feed them first: call generate() with the cache, or "
+            "forward without explicit position_ids/attention_mask, or pass the full sequence to generate()."
+        )
 
     outputs, logits = model.eagle3_base_model(
         input_ids=input_ids,

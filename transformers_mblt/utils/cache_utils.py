@@ -1288,6 +1288,7 @@ class MobilintEagle3Cache(Cache):
         self.draft_layer.reset()
         self.clear_tree_state()
         self.unfed_tokens = None
+        self._snapshot_unfed_tokens = None
 
     def bind_base(self, base_mxq_model: Any) -> None:
         """Make ``base_mxq_model`` hold this cache's base KV before a base infer (moving it there if needed)."""
@@ -1299,13 +1300,21 @@ class MobilintEagle3Cache(Cache):
         residency.acquire(self.draft_layer, draft_mxq_model, 0)
         self.draft_mxq_model = draft_mxq_model
 
+    # A snapshot is the base/draft KV plus the tokens still to be fed: their KV is not in the snapshot, so restoring
+    # without them would let a delta-only continuation skip tokens the caller already received.
+    _UNFED_TOKENS_FILE = "unfed_tokens.json"
+
     def dump_cache_memory(self) -> None:
         self.base_layer.dump_cache_memory()
         self.draft_layer.dump_cache_memory()
+        unfed = getattr(self, "unfed_tokens", None)
+        self._snapshot_unfed_tokens = None if unfed is None else unfed.clone()
 
     def load_cache_memory(self) -> None:
         self.base_layer.load_cache_memory()
         self.draft_layer.load_cache_memory()
+        snapshot = getattr(self, "_snapshot_unfed_tokens", None)
+        self.unfed_tokens = None if snapshot is None else snapshot.clone()
 
     def dump_cache_memory_to(self, cache_dir: str, index: int = 0) -> None:
         del index
@@ -1315,12 +1324,21 @@ class MobilintEagle3Cache(Cache):
         draft_dir.mkdir(parents=True, exist_ok=True)
         self.base_layer.dump_cache_memory_to(str(base_dir))
         self.draft_layer.dump_cache_memory_to(str(draft_dir))
+        unfed = getattr(self, "unfed_tokens", None)
+        unfed_path = Path(cache_dir) / self._UNFED_TOKENS_FILE
+        if unfed is None:
+            unfed_path.unlink(missing_ok=True)
+        else:
+            unfed_path.write_text(json.dumps(unfed.tolist()), encoding="utf-8")
 
     def load_cache_memory_from(self, cache_dir: str, index: int = 0) -> None:
         del index
         self.reset()
         self.base_layer.load_cache_memory_from(str(Path(cache_dir) / "base"))
         self.draft_layer.load_cache_memory_from(str(Path(cache_dir) / "draft"))
+        unfed_path = Path(cache_dir) / self._UNFED_TOKENS_FILE
+        if unfed_path.exists():
+            self.unfed_tokens = torch.tensor(json.loads(unfed_path.read_text(encoding="utf-8")), dtype=torch.long)
 
     def copy(self) -> "MobilintEagle3Cache":
         """Return a snapshot of the committed KV state and the tokens still to be fed.
@@ -1336,6 +1354,8 @@ class MobilintEagle3Cache(Cache):
         copied.clear_tree_state()
         unfed = getattr(self, "unfed_tokens", None)
         copied.unfed_tokens = None if unfed is None else unfed.clone()
+        snapshot = getattr(self, "_snapshot_unfed_tokens", None)
+        copied._snapshot_unfed_tokens = None if snapshot is None else snapshot.clone()
         return copied
 
 
