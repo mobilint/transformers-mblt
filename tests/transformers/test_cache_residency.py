@@ -578,3 +578,145 @@ def test_cache_with_slots_matching_the_default_layout_still_refuses_to_grow() ->
         cache.ensure_batch_size(2)
     with pytest.raises(ValueError, match="chosen slots"):
         cache.copy().ensure_batch_size(2)
+
+
+def test_explicit_load_on_a_never_bound_cache_saves_the_slot_owner_first() -> None:
+    backend = _Backend()
+    a = MobilintCache(backend.mxq_models)
+    _run(a, backend, 0, "aaa")  # A is resident; the backend's owner table now knows the Model
+
+    restored = MobilintCache(backend.mxq_models)  # never bound, e.g. rebuilt from a saved snapshot
+    restored.layers[0].buffer = [b"ccc"]
+    restored.layers[0].buffer_seq_length = 3
+    restored.load_cache_memory()
+
+    assert _slot(backend) == "ccc"
+    assert restored.is_resident and not a.is_resident
+    _run(a, backend, 0, "!")  # A was saved before the load overwrote the slot
+    assert _slot(backend) == "aaa!"
+
+
+def _restore_from_file(cache: MobilintCache, backend: _Backend, content: str, tmp_path) -> None:
+    """A file restore right after loading the model: the backend has no owner table yet."""
+    mxq = backend.mxq_models[0]
+    mxq.load_cache_memory_from = lambda cache_dir, cache_id=0: mxq.write(cache_id, content)
+    (tmp_path / "seq_length.txt").write_text(f"{len(content)}\n")
+    cache.load_cache_memory_from(str(tmp_path))
+
+
+def test_file_restore_before_any_forward_continues_on_first_use(tmp_path) -> None:
+    backend = _Backend()
+    cache = MobilintCache(backend.mxq_models)
+    _restore_from_file(cache, backend, "saved", tmp_path)
+
+    _run(cache, backend, 0, "!")
+
+    assert _slot(backend) == "saved!"
+    assert backend.mxq_models[0].calls == []  # adopted as the owner: no reload
+
+
+def test_file_restore_before_any_forward_survives_another_cache_running_first(tmp_path) -> None:
+    backend = _Backend()
+    restored = MobilintCache(backend.mxq_models)
+    _restore_from_file(restored, backend, "saved", tmp_path)
+
+    other = MobilintCache(backend.mxq_models)
+    _run(other, backend, 0, "x")  # saves the restored KV before overwriting the slot
+    _run(restored, backend, 0, "!")
+
+    assert _slot(backend) == "saved!"
+
+
+def test_two_file_restores_before_any_forward_keep_both_caches(tmp_path) -> None:
+    backend = _Backend()
+    first, second = MobilintCache(backend.mxq_models), MobilintCache(backend.mxq_models)
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    _restore_from_file(first, backend, "first", tmp_path / "a")
+    _restore_from_file(second, backend, "second", tmp_path / "b")  # saves `first` before overwriting the slot
+
+    assert second.is_resident and not first.is_resident
+    _run(first, backend, 0, "!")
+    assert _slot(backend) == "first!"
+    _run(second, backend, 0, "?")
+    assert _slot(backend) == "second?"
+
+
+def test_offload_of_a_cache_restored_before_any_forward(tmp_path) -> None:
+    backend = _Backend()
+    restored = MobilintCache(backend.mxq_models)
+    _restore_from_file(restored, backend, "saved", tmp_path)
+    assert restored.is_resident
+
+    restored.offload()
+    backend.mxq_models[0].write(0, "scratch")  # e.g. an unrelated load into the slot
+
+    assert not restored.is_resident and restored.host_nbytes == len(b"saved")
+    _run(restored, backend, 0, "!")
+    assert _slot(backend) == "saved!"
+
+
+def test_cache_restored_before_any_forward_moves_to_another_instance(tmp_path) -> None:
+    source, target = _Backend(), _Backend()
+    restored = MobilintCache(source.mxq_models)
+    _restore_from_file(restored, source, "saved", tmp_path)
+
+    _run(restored, target, 0, "!")  # never bound on `source`: its pending claim is saved before the move
+
+    assert _slot(target) == "saved!"
+    assert source.mxq_models[0].calls == [("dump", 0)]
+
+
+def _dispose(backend: _Backend) -> None:
+    """Like qbruntime Model.dispose(): the accelerator is dropped and the KV memory is gone."""
+    for mxq in backend.mxq_models:
+        mxq._acc = None
+        mxq.dump_cache_memory = lambda cache_id=0: (_ for _ in ()).throw(AssertionError("dumped a disposed Model"))
+    backend.mxq_models = []
+
+
+def test_restored_cache_on_a_disposed_backend_uses_its_host_snapshot_or_reports_lost_kv(tmp_path) -> None:
+    source, target = _Backend(), _Backend()
+    for mxq in source.mxq_models:
+        mxq._acc = object()  # launched
+    from_file = MobilintCache(source.mxq_models)
+    _restore_from_file(from_file, source, "lost", tmp_path)  # only on the NPU
+    _dispose(source)
+
+    with pytest.raises(MobilintCacheStateError, match="dump_cache_memory"):
+        _run(from_file, target, 0, "!")
+
+    source = _Backend()
+    for mxq in source.mxq_models:
+        mxq._acc = object()
+    from_snapshot = MobilintCache(source.mxq_models)
+    from_snapshot.layers[0].buffer = [b"kept"]
+    from_snapshot.layers[0].buffer_seq_length = 4
+    from_snapshot.load_cache_memory()  # direct load, and the snapshot stays on the host
+    _dispose(source)
+
+    _run(from_snapshot, target, 0, "!")
+    assert _slot(target) == "kept!"
+
+
+def test_cache_displaced_by_a_second_restore_snapshots_its_own_kv(tmp_path) -> None:
+    backend = _Backend()
+    first, second = MobilintCache(backend.mxq_models), MobilintCache(backend.mxq_models)
+    for name in ("a", "b", "out"):
+        (tmp_path / name).mkdir()
+    _restore_from_file(first, backend, "first", tmp_path / "a")
+    _restore_from_file(second, backend, "second", tmp_path / "b")  # `first` is saved to the host
+
+    first.dump_cache_memory()
+    assert first.layers[0].buffer == [b"first"]
+
+    written: dict[str, object] = {}
+    mxq = backend.mxq_models[0]
+    mxq.dump_cache_memory_to = lambda cache_dir, cache_id=0: written.setdefault(cache_dir, mxq.slots[cache_id])
+    first.dump_cache_memory_to(str(tmp_path / "out"))
+    assert written[str(tmp_path / "out")] == "first"
+
+    _run(second, backend, 0, "?")  # `second` was saved before `first` went back on the slot
+    assert _slot(backend) == "second?"
+    _run(first, backend, 0, "!")
+    assert _slot(backend) == "first!"

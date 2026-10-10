@@ -486,8 +486,8 @@ class MobilintMixtureOfExpertsGenerationMixin(MobilintGenerationMixin):
     """Generation mixin for Mixture-of-Experts releases; pairs with :class:`MobilintMixtureOfExpertsModelMixin`.
 
     The KV cache lives inside every per-layer ``shared`` MXQ, which holds exactly one sequence, so generation always
-    runs on a :class:`MobilintMixtureOfExpertsCache` with ``batch_size == 1``. A caller-supplied cache whose
-    sequence has since been overwritten on the NPU by another cache is reset so it re-prefills from scratch.
+    runs on a :class:`MobilintMixtureOfExpertsCache` with ``batch_size == 1``. A caller-supplied cache continues where
+    it left off even if another cache ran in between: the forward saves and restores the shared MXQs' KV.
     """
 
     def get_cache_mxq_model(self) -> None:
@@ -508,6 +508,25 @@ class MobilintMixtureOfExpertsGenerationMixin(MobilintGenerationMixin):
         return len(cache.shared_mxq_models) == len(shared_models) and all(
             cached is live for cached, live in zip(cache.shared_mxq_models, shared_models)
         )
+
+    def _cache_layout_matches(self, cache: MobilintMixtureOfExpertsCache) -> bool:
+        """Whether ``cache`` can move onto this model's shared MXQs: same layer count and, layer by layer, the same
+        KV layout. A layout that cannot be read counts as a mismatch."""
+        from .cache_residency import MobilintCacheStateError, mxq_kv_signature
+
+        shared_models = cast(Any, self).get_shared_mxq_models()
+        if len(cache.shared_layers) != len(shared_models):
+            return False
+        try:
+            for layer, model in zip(cache.shared_layers, shared_models):
+                if layer.mxq_model is model:
+                    continue
+                source, target = mxq_kv_signature(layer.mxq_model), mxq_kv_signature(model)
+                if source is not None and target is not None and source != target:
+                    return False
+        except MobilintCacheStateError:
+            return False
+        return True
 
     def build_mobilint_cache(self, batch_size: int = 1) -> MobilintMixtureOfExpertsCache:
         """Return a fresh cache for callers that drive generation themselves (the TPS fake-prefill decode sweep)."""
@@ -544,16 +563,21 @@ class MobilintMixtureOfExpertsGenerationMixin(MobilintGenerationMixin):
         current = model_kwargs.get(cache_name)
         if not isinstance(current, MobilintMixtureOfExpertsCache):
             model_kwargs[cache_name] = self._get_cache("mobilint", batch_size, max_cache_length)
-        elif not self._cache_matches_backend(current):
-            # Built for another model instance or an earlier launch: its layers point at other shared MXQs, so KV
-            # dumps and restores through it would miss this model's KV state.
-            logger.warning("Replacing a MobilintMixtureOfExpertsCache built for different shared MXQs.")
+        elif not self._cache_layout_matches(current):
+            # Built for a release with another KV layout: its KV cannot move onto this model's shared MXQs. An empty
+            # cache loses nothing and is replaced; replacing a filled one would silently drop the prefix a
+            # continuation relies on, so that is an error.
+            if current.get_seq_length() > 0:
+                from .cache_residency import MobilintCacheStateError
+
+                raise MobilintCacheStateError(
+                    "This MobilintMixtureOfExpertsCache holds KV from a release with another KV layout (or one whose "
+                    "layout cannot be read) and cannot continue on this model. Pass the full prompt without "
+                    "past_key_values, or a cache built for this model."
+                )
             model_kwargs[cache_name] = self._get_cache("mobilint", batch_size, max_cache_length)
-        elif current is not cast(Any, self).npu_backend.kv_owner and current.get_seq_length() > 0:
-            # Another cache ran on the NPU since this one was filled; its KV prefix is gone.
-            logger.warning("Resetting a MobilintMixtureOfExpertsCache whose NPU KV state was overwritten.")
-            current.reset()
-        cast(Any, self).npu_backend.kv_owner = model_kwargs[cache_name]
+        # Any other cache is used as is: the forward binds it, restoring KV another sequence displaced and moving a
+        # cache built on another instance of the same release.
         return True
 
 

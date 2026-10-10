@@ -1829,6 +1829,19 @@ class MobilintMixtureOfExpertsModelMixin(MobilintModelMixin):
         """MoE releases have no single cache MXQ; KV state lives in every ``shared`` MXQ."""
         return None
 
+    def _bind_moe_cache(self, past_key_values: Optional[MobilintMixtureOfExpertsCache]) -> None:
+        """Make every shared MXQ hold ``past_key_values``' KV (or save and release it for a cacheless forward)."""
+        from .cache_residency import bind_cacheless
+
+        backend = self.npu_backend
+        shared_models = [getattr(layer, "shared", None) for layer in backend.layers]
+        if not shared_models or any(model is None for model in shared_models):
+            return  # a backend double without shared MXQ handles
+        if past_key_values is None:
+            bind_cacheless(backend, [(model, 0) for model in shared_models])
+            return
+        past_key_values.bind_shared(shared_models, backend)
+
     def get_shared_mxq_models(self) -> list[qbruntime.Model]:
         """Return the per-layer ``shared`` MXQ models that hold the KV cache."""
         return [layer.shared for layer in self.npu_backend.layers]
@@ -1941,10 +1954,10 @@ class MobilintMixtureOfExpertsModelMixin(MobilintModelMixin):
         last_only = any(layer.last_only for layer in self.npu_backend.layers)
         past_seen = 0 if past_key_values is None else past_key_values.get_seq_length()
         timing_phase: Literal["prefill", "decode"] = "prefill" if past_seen == 0 else "decode"
-        # Every forward overwrites the shared MXQs' KV state, including one without a cache object. Nobody owns it
-        # while the forward runs; ``past_key_values`` claims it only once every layer has advanced, so a forward that
-        # fails halfway leaves no cache that ``generate()`` would continue on partially overwritten KV.
-        self.npu_backend.kv_owner = None
+        # Every forward writes the shared MXQs' KV, including one without a cache object: make them hold this cache.
+        # Writes start at ``past_seen``, so a forward that fails halfway leaves the cache's KV prefix intact and the
+        # cache keeps the slots.
+        self._bind_moe_cache(past_key_values)
 
         embeds = inputs_embeds.detach().to(device="cpu", dtype=torch.float32).numpy()
         logits_by_position: dict[int, np.ndarray] = {}
@@ -1976,7 +1989,6 @@ class MobilintMixtureOfExpertsModelMixin(MobilintModelMixin):
 
         if past_key_values is not None:
             past_key_values.update_cache_position(cache_position)
-        self.npu_backend.kv_owner = past_key_values
         npu_seconds = self.npu_backend.npu_clock.pop_seconds()
         if count_npu_time:
             self.npu_time = npu_seconds

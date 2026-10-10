@@ -36,6 +36,56 @@ logger = logging.getLogger(__name__)
 
 _RESIDENCY_ATTR = "_mblt_kv_residency"
 _SIGNATURES: "weakref.WeakKeyDictionary[Any, Optional[tuple]]" = weakref.WeakKeyDictionary()
+# Every live Model a residency has seen -> that residency, so an explicit load on a cache that was never bound still
+# goes through the owner table of the backend that runs the Model.
+_MODEL_RESIDENCY: "weakref.WeakKeyDictionary[Any, weakref.ref[MobilintKVResidency]]" = weakref.WeakKeyDictionary()
+# Slots a layer loaded directly before any owner table knew its Model (e.g. a file restore right after loading the
+# model): (id(model), cache_id) -> (weakref(model), weakref(layer)). The first owner table that looks at the slot
+# adopts that layer as the owner, so its KV is neither reloaded nor lost.
+_PENDING_OWNERS: dict[tuple[int, int], tuple[Any, Any]] = {}
+
+
+def _is_disposed(mxq_model: Any) -> bool:
+    """Whether a qbruntime ``Model`` was disposed: ``dispose()`` drops its accelerator (``_acc``)."""
+    return hasattr(mxq_model, "_acc") and getattr(mxq_model, "_acc") is None
+
+
+def pending_owner(mxq_model: Any, cache_id: int) -> Optional["MobilintLayer"]:
+    """The layer that loaded its KV into this slot before any owner table knew the Model, if still alive.
+
+    A claim on a disposed Model is dropped: that KV memory is gone, so the layer can only be restored from a
+    valid host copy.
+    """
+    entry = _PENDING_OWNERS.get((id(mxq_model), int(cache_id)))
+    if entry is None:
+        return None
+    model_ref, layer_ref = entry
+    layer = layer_ref()
+    if model_ref() is not mxq_model or layer is None or layer.mxq_model is not mxq_model or _is_disposed(mxq_model):
+        _PENDING_OWNERS.pop((id(mxq_model), int(cache_id)), None)
+        return None
+    return layer
+
+
+def save_pending_owner(mxq_model: Any, cache_id: int) -> None:
+    """Save a pending owner's KV to its host copy and drop the claim, before something overwrites the slot."""
+    layer = pending_owner(mxq_model, cache_id)
+    if layer is not None:
+        layer._save_from_slot()
+        _PENDING_OWNERS.pop((id(mxq_model), int(cache_id)), None)
+        layer._off_slot = True
+
+
+def note_direct_load(layer: "MobilintLayer") -> None:
+    """Record that ``layer`` loaded its KV into its slot without an owner table.
+
+    Call :func:`save_pending_owner` for the slot before the load, so a previous pending owner is saved first.
+    """
+    layer._off_slot = False
+    try:
+        _PENDING_OWNERS[(id(layer.mxq_model), int(layer.cache_id))] = (weakref.ref(layer.mxq_model), weakref.ref(layer))
+    except TypeError:  # Models without __weakref__ (test doubles)
+        pass
 
 
 class MobilintCacheStateError(RuntimeError):
@@ -94,6 +144,7 @@ class MobilintKVResidency:
     def __init__(self, backend: Any = None) -> None:
         self._owners: dict[tuple[int, int], tuple["weakref.ref[Any]", int, "weakref.ref[MobilintLayer]"]] = {}
         self._backend_ref: Optional[Any] = None
+        self._live_ids: Optional[set[int]] = None  # ids of the backend's live Models at the last refresh
         if backend is not None:
             try:
                 self._backend_ref = weakref.ref(backend)
@@ -105,9 +156,17 @@ class MobilintKVResidency:
         if self._backend_ref is None:
             return
         backend = self._backend_ref()
-        live_models = getattr(backend, "mxq_models", None) if backend is not None else []
-        if live_models is not None:
-            self.forget_stale_models(live_models)
+        live_models = kv_slot_models(backend) if backend is not None else []
+        if live_models is None:
+            return
+        self.forget_stale_models(live_models)
+        self._live_ids = {id(model) for model in live_models}
+        for model in live_models:
+            try:
+                if _MODEL_RESIDENCY.get(model) is None or _MODEL_RESIDENCY[model]() is not self:
+                    _MODEL_RESIDENCY[model] = weakref.ref(self)
+            except TypeError:  # Models without __weakref__ (test doubles)
+                pass
 
     # ------------------------------------------------------------------
     # Owner table
@@ -117,7 +176,10 @@ class MobilintKVResidency:
         """Return the layer whose KV the slot holds, or ``None``."""
         entry = self._owners.get((id(mxq_model), int(cache_id)))
         if entry is None:
-            return None
+            layer = pending_owner(mxq_model, cache_id)
+            if layer is not None:
+                self._record(mxq_model, cache_id, layer)
+            return layer
         model_ref, _, layer_ref = entry
         layer = layer_ref()
         if model_ref() is not mxq_model or layer is None:
@@ -127,12 +189,14 @@ class MobilintKVResidency:
 
     def _record(self, mxq_model: Any, cache_id: int, layer: Optional["MobilintLayer"]) -> None:
         key = (id(mxq_model), int(cache_id))
+        _PENDING_OWNERS.pop(key, None)
         if layer is None:
             self._owners.pop(key, None)
             return
         self._owners[key] = (weakref.ref(mxq_model), int(cache_id), weakref.ref(layer))
         layer._resident_at = weakref.ref(self)
         layer._residency_hint = weakref.ref(self)
+        layer._off_slot = False
 
     def is_resident(self, layer: "MobilintLayer") -> bool:
         # Refresh first: a slot on a disposed backend or a replaced Model must not count as live.
@@ -170,6 +234,7 @@ class MobilintKVResidency:
         layer._save_from_slot()
         self._record(mxq_model, cache_id, None)
         layer._resident_at = None
+        layer._off_slot = True
 
     def evict_layer(self, layer: "MobilintLayer") -> None:
         """Evict ``layer`` from its slot if it is resident here.
@@ -191,15 +256,18 @@ class MobilintKVResidency:
         """
         cache_id = int(cache_id)
         same_slot = layer.mxq_model is mxq_model and int(layer.cache_id) == cache_id
-        if same_slot and self.is_resident(layer):
+        if same_slot and self.owner(mxq_model, cache_id) is layer:  # callers refreshed already
             if reload:
                 layer._load_into_slot()
             return
 
-        # Resident somewhere else (another slot here, or another backend): save it there first.
+        # Resident somewhere else (another slot here, or another backend): save it there first. That includes a
+        # pending claim from a direct load that no owner table has adopted yet.
         previous = layer._resident_at() if layer._resident_at is not None else None
         if previous is not None:
             previous.evict_layer(layer)
+        if not same_slot and pending_owner(layer.mxq_model, layer.cache_id) is layer:
+            save_pending_owner(layer.mxq_model, layer.cache_id)
 
         if not same_slot:
             layer._retarget(mxq_model, cache_id)
@@ -211,6 +279,33 @@ class MobilintKVResidency:
     def release_slot(self, mxq_model: Any, cache_id: int) -> None:
         """Hand a slot to a forward that runs without a cache: save the owner, leave the slot unowned."""
         self.evict(mxq_model, cache_id)
+
+
+def kv_slot_models(backend: Any) -> Optional[list[Any]]:
+    """Return the backend's live Models that hold KV, or ``None`` when the backend does not say.
+
+    A backend lists them as ``kv_slot_models`` (the MoE backend: one shared MXQ per layer) or, for the regular
+    backend, as ``mxq_models``.
+    """
+    models = getattr(backend, "kv_slot_models", None)
+    if models is None:
+        models = getattr(backend, "mxq_models", None)
+    return None if models is None else list(models)
+
+
+def residency_for_model(mxq_model: Any) -> Optional[MobilintKVResidency]:
+    """Return the owner table of the backend running ``mxq_model``, if a model has bound a cache on it."""
+    try:
+        ref = _MODEL_RESIDENCY.get(mxq_model)
+    except TypeError:
+        return None
+    residency = ref() if ref is not None else None
+    if residency is None:
+        return None
+    residency.refresh()
+    if residency._live_ids is not None and id(mxq_model) not in residency._live_ids:
+        return None  # the Model belongs to a disposed launch
+    return residency
 
 
 def residency_of(backend: Any) -> MobilintKVResidency:
@@ -242,6 +337,11 @@ __all__ = [
     "MobilintKVResidency",
     "bind_cache_layers",
     "bind_cacheless",
+    "kv_slot_models",
     "mxq_kv_signature",
+    "note_direct_load",
+    "pending_owner",
+    "residency_for_model",
+    "save_pending_owner",
     "residency_of",
 ]

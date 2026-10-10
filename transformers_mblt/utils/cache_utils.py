@@ -2,6 +2,7 @@ import copy
 import json
 import os
 import time
+import weakref
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Type, Union
 
@@ -9,7 +10,14 @@ import qbruntime
 import torch
 from transformers.cache_utils import Cache
 
-from .cache_residency import MobilintCacheStateError, mxq_kv_signature
+from .cache_residency import (
+    MobilintCacheStateError,
+    mxq_kv_signature,
+    note_direct_load,
+    pending_owner,
+    residency_for_model,
+    save_pending_owner,
+)
 
 try:
     from transformers.cache_utils import CacheLayerMixin
@@ -77,6 +85,10 @@ class MobilintLayer(CacheLayerMixin):
         self._resident_at: Optional[Any] = None  # weakref to the MobilintKVResidency whose slot holds this KV
         self._residency_hint: Optional[Any] = None  # weakref to the residency that last managed this layer
         self._kv_signature: Optional[tuple] = None
+        self._owner_cache: Optional[Any] = None  # weakref to the multi-layer cache this layer belongs to, if any
+        # True once this layer's KV was saved to ``_host_kv`` because its slot was taken (by an owner table or by
+        # another direct load). The slot no longer holds this layer's KV until it is put back.
+        self._off_slot = False
 
     def lazy_initialization(self, key_states: torch.Tensor, value_states: Optional[torch.Tensor] = None):
         del value_states
@@ -154,7 +166,9 @@ class MobilintLayer(CacheLayerMixin):
     def is_resident(self) -> bool:
         """Whether the NPU slot currently holds this layer's KV."""
         residency = self._resident_at() if self._resident_at is not None else None
-        return residency is not None and residency.is_resident(self)
+        if residency is not None and residency.is_resident(self):
+            return True
+        return pending_owner(self.mxq_model, self.cache_id) is self
 
     @property
     def host_nbytes(self) -> int:
@@ -210,15 +224,37 @@ class MobilintLayer(CacheLayerMixin):
     def _residency(self) -> Optional[Any]:
         return self._residency_hint() if self._residency_hint is not None else None
 
+    def _loading_residency(self) -> Optional[Any]:
+        """The owner table an explicit load must go through: the one that managed this layer, or the one of the
+        backend running its Model. Loading behind the table's back would let it save the overwritten slot as the
+        previous owner's KV."""
+        return self._residency() or residency_for_model(self.mxq_model)
+
     def offload(self) -> None:
         """Save this layer's KV to its host buffer and free its NPU slot for other caches."""
         residency = self._resident_at() if self._resident_at is not None else None
         if residency is not None:
             residency.evict_layer(self)
+        elif pending_owner(self.mxq_model, self.cache_id) is self:
+            save_pending_owner(self.mxq_model, self.cache_id)
+
+    def _kv_is_off_slot(self) -> bool:
+        """Whether this layer's KV lives in ``_host_kv`` rather than on its slot."""
+        return (self.is_managed or self._off_slot) and not self.is_resident
+
+    def _put_back_on_slot(self) -> None:
+        """Load this layer's host KV back onto its slot so qbruntime can read it there (file dumps)."""
+        residency = self._loading_residency()
+        if residency is not None:
+            residency.acquire(self, self.mxq_model, self.cache_id)
+            return
+        save_pending_owner(self.mxq_model, self.cache_id)  # the direct load below overwrites the slot
+        self._load_into_slot()
+        note_direct_load(self)
 
     def dump_cache_memory(self):
         """Snapshot the current KV into ``buffer``; :meth:`load_cache_memory` restores it."""
-        if self.is_managed and not self.is_resident:
+        if self._kv_is_off_slot():
             # The KV is not on the NPU: it was saved to the host when this layer lost its slot.
             if self._seen_tokens > 0 and self.kv_valid and self._host_valid_len < self._seen_tokens:
                 raise MobilintCacheStateError(
@@ -240,28 +276,32 @@ class MobilintLayer(CacheLayerMixin):
             self._host_valid_len = self.buffer_seq_length
             # A snapshot of a fake-prefilled layer restores its length, not KV contents.
             self.kv_valid = self.buffer_kv_valid
-        residency = self._residency()
+        residency = self._loading_residency()
         if residency is not None:
             # Restore through the owner table so the cache that holds the slot is saved first.
             residency.acquire(self, self.mxq_model, self.cache_id, reload=True)
             return
         if self.get_seq_length() > 0:
+            if pending_owner(self.mxq_model, self.cache_id) is not self:
+                save_pending_owner(self.mxq_model, self.cache_id)
             self.mxq_model.load_cache_memory(self.buffer, self.cache_id)
+            note_direct_load(self)
 
     def dump_cache_memory_to(self, cache_dir: str):
-        residency = self._residency()
-        if residency is not None and not self.is_resident:
+        if self._kv_is_off_slot():
             # The slot holds another cache's KV: put this layer's KV back on it before writing the files.
-            residency.acquire(self, self.mxq_model, self.cache_id)
+            self._put_back_on_slot()
         self.mxq_model.dump_cache_memory_to(cache_dir, self.cache_id)
         seq_path = Path(cache_dir) / "seq_length.txt"
         seq_path.write_text(f"{self.get_seq_length()}\n", encoding="utf-8")
 
     def load_cache_memory_from(self, cache_dir: str):
-        residency = self._residency()
+        residency = self._loading_residency()
         if residency is not None:
             # The file overwrites the slot: save the cache that holds it, then take it over.
             residency.evict(self.mxq_model, self.cache_id)
+        elif pending_owner(self.mxq_model, self.cache_id) is not self:
+            save_pending_owner(self.mxq_model, self.cache_id)
         self.reset()
         seq_path = Path(cache_dir) / "seq_length.txt"
         if seq_path.exists():
@@ -272,6 +312,8 @@ class MobilintLayer(CacheLayerMixin):
         self.mxq_model.load_cache_memory_from(cache_dir, self.cache_id)
         if residency is not None:
             residency._record(self.mxq_model, self.cache_id, self)
+        elif self._seen_tokens > 0:
+            note_direct_load(self)
 
     def copy(self) -> "MobilintLayer":
         """Return an independent snapshot of this sequence's KV.
@@ -1299,9 +1341,11 @@ class MobilintMixtureOfExpertsCache(Cache):
 
     Only ``batch_size == 1`` is supported: each shared MXQ hosts a single cache entry.
 
-    The shared MXQs hold one sequence at a time, so ``owner`` (the model's NPU backend) records in ``kv_owner`` which
-    cache that sequence belongs to. Restoring KV memory with :meth:`load_cache_memory` / :meth:`load_cache_memory_from`
-    makes this cache the owner, so generation continues from it instead of re-prefilling.
+    The shared MXQs hold one sequence at a time. Like :class:`MobilintCache`, the cache is portable: before every
+    forward the model binds all shared layers (see :mod:`transformers_mblt.utils.cache_residency`), so a cache that
+    another sequence displaced is saved and restored instead of reset, and a cache can move to another instance of
+    the same release. ``owner`` is accepted for compatibility, unused, and held weakly so a cache that moved away
+    never keeps its source backend alive.
     """
 
     def __init__(self, shared_mxq_models: Sequence[qbruntime.Model], owner: Any = None) -> None:
@@ -1310,6 +1354,7 @@ class MobilintMixtureOfExpertsCache(Cache):
         self.owner = owner
         self.shared_mxq_models: List[qbruntime.Model] = list(shared_mxq_models)
         self.shared_layers: list[MobilintLayer] = [MobilintLayer(model, 0) for model in self.shared_mxq_models]
+        self._tag_layers()
         self.layers = [self.shared_layers[0]]
         self.layer_classes = MobilintLayer
         self.num_hidden_layers = 1
@@ -1322,6 +1367,50 @@ class MobilintMixtureOfExpertsCache(Cache):
     @property
     def max_batch_size(self) -> int:
         return 1
+
+    @property
+    def owner(self) -> Any:
+        return self._owner_ref() if self._owner_ref is not None else None
+
+    @owner.setter
+    def owner(self, value: Any) -> None:
+        try:
+            self._owner_ref = weakref.ref(value) if value is not None else None
+        except TypeError:  # objects without __weakref__ are dropped rather than kept alive
+            self._owner_ref = None
+
+    def _tag_layers(self) -> None:
+        # Lets the backend's ``kv_owner`` map a slot's owner layer back to its cache.
+        for layer in self.shared_layers:
+            layer._owner_cache = weakref.ref(self)
+
+    @property
+    def is_resident(self) -> bool:
+        return all(layer.is_resident for layer in self.shared_layers)
+
+    @property
+    def host_nbytes(self) -> int:
+        return sum(layer.host_nbytes for layer in self.shared_layers)
+
+    def offload(self) -> None:
+        """Save every shared layer's KV to host memory and free the shared MXQs for other caches."""
+        self._sync_shared_layers()
+        for layer in self.shared_layers:
+            layer.offload()
+
+    def bind_shared(self, shared_models: Sequence[Any], backend: Any) -> None:
+        """Make each shared MXQ hold this cache's KV before a forward, moving the cache to ``shared_models``."""
+        from .cache_residency import bind_cache_layers
+
+        shared_models = list(shared_models)
+        if len(shared_models) != len(self.shared_layers):
+            raise ValueError(
+                f"Cannot bind a cache of {len(self.shared_layers)} shared layers to a model with "
+                f"{len(shared_models)} shared MXQs."
+            )
+        self._sync_shared_layers()
+        bind_cache_layers(backend, ((layer, model, 0) for layer, model in zip(self.shared_layers, shared_models)))
+        self.shared_mxq_models = shared_models
 
     def _sync_shared_layers(self) -> None:
         """Propagate the ``layers[0]`` cursor to every shared layer."""
@@ -1347,13 +1436,13 @@ class MobilintMixtureOfExpertsCache(Cache):
     def fake_prefill(self, sequence_lengths: Union[dict[int, int], int], index: int = 0) -> None:
         """Mark every shared layer as prefilled without restoring KV cache memory (decode TPS benchmarks).
 
-        The cache also claims the NPU KV state, so ``generate()`` decodes on top of it instead of resetting it as a
-        stale cache. The KV contents are whatever the shared MXQs last held: the decoded tokens are meaningless, but
-        each step attends over ``sequence_lengths`` positions, so the measured decode cost is the real one.
+        The KV contents are whatever the shared MXQs last held, so the decoded tokens are meaningless, but each step
+        attends over ``sequence_lengths`` positions and the measured decode cost is the real one. The layers are
+        marked as holding no real KV, so binding them never dumps or loads.
         """
-        self.reset()
+        for layer in self.shared_layers:
+            layer.fake_prefill(0)
         self.set_seq_length(sequence_lengths, index=index)
-        self._claim_npu_kv()
 
     def update_cache_position(self, cache_position: torch.Tensor, index: int = 0) -> None:
         del index
@@ -1384,14 +1473,9 @@ class MobilintMixtureOfExpertsCache(Cache):
         for layer in self.shared_layers:
             layer.dump_cache_memory()
 
-    def _claim_npu_kv(self) -> None:
-        if self.owner is not None:
-            self.owner.kv_owner = self
-
     def load_cache_memory(self) -> None:
         for layer in self.shared_layers:
             layer.load_cache_memory()
-        self._claim_npu_kv()
 
     def dump_cache_memory_to(self, cache_dir: str, index: int = 0) -> None:
         del index
@@ -1405,12 +1489,13 @@ class MobilintMixtureOfExpertsCache(Cache):
         del index
         for layer_idx, layer in enumerate(self.shared_layers):
             layer.load_cache_memory_from(str(Path(cache_dir) / f"layer_{layer_idx}"))
-        self._claim_npu_kv()
 
     def copy(self) -> "MobilintMixtureOfExpertsCache":
-        """Copy the cursors and dumped KV buffers. The copy does not own the NPU KV until it is loaded."""
+        """Return a snapshot: resident layers save their KV first, and the copy is loaded on its first forward."""
+        self._sync_shared_layers()
         copied = MobilintMixtureOfExpertsCache(self.shared_mxq_models, owner=self.owner)
         copied.shared_layers = [layer.copy() for layer in self.shared_layers]
+        copied._tag_layers()
         copied.layers = [copied.shared_layers[0]]
         return copied
 
