@@ -48,8 +48,6 @@
 - `MobilintModelMixin` resolves its backend through `_resolve_npu_backend()`, so a model can run on a backend
   assembled from several config backends. The default still returns `config.<npu_backend_prefix>npu_backend`.
 
-## 0.1.1
-
 ### Fixed
 
 - `tps measure|sweep` and the benchmark scripts pass `use_cache=True` to every `generate()` call (prefill, decode with
