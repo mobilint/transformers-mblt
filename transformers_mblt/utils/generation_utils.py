@@ -19,6 +19,8 @@ from ..utils.cache_utils import (
     MobilintMixtureOfExpertsCache,
     build_mobilint_cache_from_model,
     cache_matches_backend_topology,
+    defer_eagle3_accept_tokens,
+    take_eagle3_unfed_tokens,
 )
 from ..utils.modeling_utils import MobilintModelMixin
 
@@ -63,6 +65,17 @@ def llm_eagle3_forward(
         past_key_values = model._get_cache("mobilint-eagle3", 1, 0)
     if not isinstance(past_key_values, MobilintEagle3Cache):
         raise TypeError("past_key_values must be MobilintEagle3Cache for EAGLE-3 models.")
+
+    unfed = take_eagle3_unfed_tokens(past_key_values)
+    if unfed is not None and position_ids is None and attention_mask is None:
+        # Feed the tokens a previous generate() returned without feeding, ahead of this input.
+        if input_ids is not None:
+            input_ids = torch.cat((unfed.to(input_ids.device), input_ids), dim=1)
+        elif inputs_embeds is not None:
+            unfed_embeds = model.eagle3_base_model.embed_tokens(unfed.to(inputs_embeds.device)).to(inputs_embeds.dtype)
+            inputs_embeds = torch.cat((unfed_embeds, inputs_embeds), dim=1)
+    elif unfed is not None:
+        past_key_values.unfed_tokens = unfed  # explicit positions/masks describe only the new input: leave them
 
     outputs, logits = model.eagle3_base_model(
         input_ids=input_ids,
@@ -729,8 +742,14 @@ class MobilintEagle3GenerationMixin(ABC, GenerationMixin):
 
     def _get_cache(self, cache_implementation: str, batch_size: int, max_cache_len: int, *args) -> MobilintEagle3Cache:
         del cache_implementation, batch_size, max_cache_len, args
-        if not isinstance(getattr(self, "_cache", None), MobilintEagle3Cache):
-            base_mxq_model, draft_mxq_model = self.get_cache_mxq_models()
+        base_mxq_model, draft_mxq_model = self.get_cache_mxq_models()
+        cache = getattr(self, "_cache", None)
+        if (
+            not isinstance(cache, MobilintEagle3Cache)
+            or cache.base_mxq_model is not base_mxq_model
+            or cache.draft_mxq_model is not draft_mxq_model
+        ):
+            # Built for an earlier launch (or another model): start a fresh cache on the live MXQs.
             self._cache = MobilintEagle3Cache(base_mxq_model, draft_mxq_model)
         else:
             self._cache.reset()
@@ -1141,12 +1160,9 @@ class MobilintEagle3GenerationMixin(ABC, GenerationMixin):
                     streamer.put(token_id.unsqueeze(0))
             stopping_scores = self._eagle3_stopping_scores_adapter(logits, generated=generated)
             if stopping_criteria_list(generated, stopping_scores):
-                accept_tokens = getattr(cache, "accept_tokens", None)
-                if accept_tokens is not None:
-                    accepted_prefix_length = int(accept_tokens.shape[1])
-                    if accepted_prefix_length > 0:
-                        cache.update_base_seen_tokens(accepted_prefix_length)
-                    cache.accept_tokens = None
+                # The accepted tokens were returned but never fed: keep them for the next call (see
+                # MobilintEagle3Cache.unfed_tokens) instead of counting their stale KV positions as cached.
+                defer_eagle3_accept_tokens(cache)
                 break
             if should_stop:
                 break

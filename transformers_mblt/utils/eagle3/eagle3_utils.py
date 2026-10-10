@@ -609,6 +609,11 @@ class MobilintEagle3BaseModelMixin:
         if attention_mask_numpy.ndim == 3:
             attention_mask_numpy = np.expand_dims(attention_mask_numpy, 1)
 
+        # The base MXQ must hold this cache's KV (it may have been displaced by another cache or built elsewhere).
+        bind_base = getattr(cache, "bind_base", None)
+        if callable(bind_base):
+            bind_base(self.get_mxq_model())
+
         hidden_states_chunks: list[torch.Tensor] = []
         logits_chunks: list[torch.Tensor] = []
         chunk_size = self.resolve_npu_prefill_chunk_size(getattr(self, "npu_prefill_chunk_size_override", None))
@@ -947,6 +952,10 @@ class MobilintEagle3DraftModelMixin:
             if hidden_states_numpy.ndim == 3:
                 hidden_states_numpy = np.expand_dims(hidden_states_numpy, 1)
 
+        bind_draft = getattr(cache, "bind_draft", None)
+        if callable(bind_draft):
+            bind_draft(self.get_mxq_model())
+
         chunk_size = self.resolve_npu_prefill_chunk_size(getattr(self, "npu_prefill_chunk_size_override", None))
         hidden_chunks: list[torch.Tensor] = []
         logits_chunks: list[torch.Tensor] = []
@@ -999,8 +1008,12 @@ class MobilintEagle3DraftModelMixin:
         logits_processor: Optional[Any],
         max_draft_tokens: Optional[int] = None,
         count_npu_time: bool = False,
+        input_ids_delta: Optional[torch.LongTensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Build draft tree candidates by iterative top-k expansion.
+
+        ``input_ids_delta`` is the token sequence the draft feeds before expanding (one token per row of
+        ``hidden_states``). When omitted it is derived from ``input_ids`` and the draft cache length.
 
         Returns:
             - ``draft_tokens``: ``[1, total_tokens+1]`` (root + selected nodes)
@@ -1021,11 +1034,14 @@ class MobilintEagle3DraftModelMixin:
         # `input_ids` may already be a prompt-delta sequence when `past_key_values`
         # is reused across turns. In that case, slicing by absolute draft cache
         # length would incorrectly produce an empty tensor.
-        input_ids_delta = (
-            input_ids_without_prompt_token[:, draft_seq_length:]
-            if input_ids_without_prompt_token.shape[1] > draft_seq_length
-            else input_ids_without_prompt_token
-        )
+        if input_ids_delta is None:
+            input_ids_delta = (
+                input_ids_without_prompt_token[:, draft_seq_length:]
+                if input_ids_without_prompt_token.shape[1] > draft_seq_length
+                else input_ids_without_prompt_token
+            )
+        else:
+            input_ids_delta = input_ids_delta.to(hidden_states.device)
         last_hidden, last_hidden_logits = self(
             hidden_states,
             input_ids=input_ids_delta,

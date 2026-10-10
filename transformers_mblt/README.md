@@ -449,8 +449,11 @@ model.generate(continuation_a, past_key_values=a, max_new_tokens=32)  # b is sav
 - `dump_cache_memory()` / `load_cache_memory()` keep their meaning: an explicit snapshot that `load_cache_memory()`
   restores, kept apart from the host copy used for moves. `fake_prefill()` caches are never moved or loaded.
 
-This applies to the dense LLM, Qwen3-VL text and Mixture-of-Experts paths. A `MobilintMixtureOfExpertsCache` binds
-all of its shared-MXQ layers together. EAGLE-3, Whisper and Qwen3-ASR caches keep their previous behavior for now.
+This applies to the dense LLM, Qwen3-VL text, Mixture-of-Experts and EAGLE-3 paths. A
+`MobilintMixtureOfExpertsCache` binds all of its shared-MXQ layers together, and a `MobilintEagle3Cache` binds its
+base and draft layers. When EAGLE-3 generation stops, the last accepted tokens are kept in
+`MobilintEagle3Cache.unfed_tokens` and fed at the start of the next call. Whisper and Qwen3-ASR caches keep their
+previous behavior for now.
 
 ## Listing Available Models
 

@@ -1,0 +1,227 @@
+"""EAGLE-3 caches: base/draft binding, unfed tokens after a stop, and cache rebuilds."""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+import torch
+
+from transformers_mblt.utils.cache_residency import MobilintCacheStateError
+from transformers_mblt.utils.cache_utils import MobilintEagle3Cache
+from transformers_mblt.utils.eagle3.tree_decoding import initialize_tree
+from transformers_mblt.utils.generation_utils import MobilintEagle3GenerationMixin, llm_eagle3_forward
+
+
+class _SlotMxq:
+    """MXQ double whose single KV slot holds a string."""
+
+    def __init__(self) -> None:
+        self.kv = ""
+        self.calls: list[str] = []
+
+    def dump_cache_memory(self, cache_id: int = 0) -> list[bytes]:
+        self.calls.append("dump")
+        return [self.kv.encode()]
+
+    def load_cache_memory(self, buffer: list[bytes], cache_id: int = 0) -> None:
+        self.calls.append("load")
+        self.kv = buffer[0].decode()
+
+
+def _write(layer, mxq: _SlotMxq, text: str) -> None:
+    mxq.kv = mxq.kv[: layer.get_seq_length()] + text
+    layer.update_seen_tokens(len(text))
+
+
+def test_two_eagle3_caches_alternate_on_the_base_and_draft_mxqs() -> None:
+    base, draft = _SlotMxq(), _SlotMxq()
+    a, b = MobilintEagle3Cache(base, draft), MobilintEagle3Cache(base, draft)
+
+    for cache, text in ((a, "aaa"), (b, "bb")):
+        cache.bind_base(base)
+        _write(cache.base_layer, base, text)
+        cache.bind_draft(draft)
+        _write(cache.draft_layer, draft, text)
+
+    a.bind_base(base)
+    a.bind_draft(draft)
+    assert (base.kv, draft.kv) == ("aaa", "aaa")
+    assert a.is_resident and not b.is_resident
+
+    b.bind_base(base)
+    b.bind_draft(draft)
+    assert (base.kv, draft.kv) == ("bb", "bb")
+
+
+def test_eagle3_cache_moves_to_another_instance() -> None:
+    src_base, src_draft, dst_base, dst_draft = _SlotMxq(), _SlotMxq(), _SlotMxq(), _SlotMxq()
+    cache = MobilintEagle3Cache(src_base, src_draft)
+    cache.bind_base(src_base)
+    _write(cache.base_layer, src_base, "hello")
+    cache.bind_draft(src_draft)
+    _write(cache.draft_layer, src_draft, "hello")
+
+    cache.bind_base(dst_base)
+    cache.bind_draft(dst_draft)
+
+    assert (dst_base.kv, dst_draft.kv) == ("hello", "hello")
+    assert cache.base_mxq_model is dst_base and cache.draft_mxq_model is dst_draft
+
+
+def test_lost_draft_kv_is_tolerated_but_lost_base_kv_is_refused() -> None:
+    """The draft only proposes tokens the base verifies, so missing draft KV is acceptable there and only there."""
+    base, draft = _SlotMxq(), _SlotMxq()
+    cache = MobilintEagle3Cache(base, draft)
+    cache.bind_base(base)
+    _write(cache.base_layer, base, "abc")
+    cache.bind_draft(draft)
+    _write(cache.draft_layer, draft, "abc")
+    base._acc = None  # dispose: the KV on both MXQs is gone, nothing was saved
+    draft._acc = None
+    new_base, new_draft = _SlotMxq(), _SlotMxq()
+
+    cache.bind_draft(new_draft)  # draft: continues on whatever the slot holds
+    assert cache.draft_mxq_model is new_draft
+    with pytest.raises(MobilintCacheStateError):
+        cache.bind_base(new_base)
+
+def test_copy_keeps_unfed_tokens_and_reset_clears_them() -> None:
+    cache = MobilintEagle3Cache(_SlotMxq(), _SlotMxq())
+    cache.accept_tokens = torch.tensor([[4, 5]])
+    cache.defer_accept_tokens()
+
+    copied = cache.copy()
+    assert torch.equal(copied.unfed_tokens, torch.tensor([[4, 5]]))
+    cache.reset()
+    assert cache.unfed_tokens is None and torch.equal(copied.unfed_tokens, torch.tensor([[4, 5]]))
+
+
+class _RecordingBase:
+    def __init__(self) -> None:
+        self.fed: list[list[int]] = []
+
+    def __call__(self, input_ids, *_args, **_kwargs):
+        self.fed.append(input_ids[0].tolist())
+        n = input_ids.shape[1]
+        return {"hidden_states": [torch.zeros((1, n, 4))]}, torch.zeros((1, 8))
+
+
+class _RecordingDraft:
+    def __init__(self) -> None:
+        self.fed: list[list[int]] = []
+
+    def topk_generate(self, hidden_states, *, input_ids_delta=None, **_kwargs):
+        self.fed.append(input_ids_delta[0].tolist())
+        assert input_ids_delta.shape[1] == hidden_states.shape[1]
+        return (
+            torch.tensor([[3]]),
+            torch.tensor([[0]]),
+            torch.ones((1, 1, 1, 1)),
+            torch.tensor([0]),
+        )
+
+
+def _cache_after_stop(committed: int, unfed: list[int]) -> SimpleNamespace:
+    seq = {"base": committed}
+    return SimpleNamespace(
+        unfed_tokens=torch.tensor([unfed]),
+        pending_draft_tokens=None,
+        retrieve_indices=None,
+        tree_mask=None,
+        tree_position_ids=None,
+        get_base_seq_length=lambda: seq["base"],
+        update_base_seen_tokens=lambda n: seq.__setitem__("base", seq["base"] + int(n)),
+        get_draft_seq_length=lambda: committed,
+    )
+
+
+@pytest.mark.parametrize(
+    "input_ids, expected_base",
+    [
+        ([1, 2, 3, 7, 8, 9, 10], [7, 8, 9, 10]),  # full sequence: already repeats the unfed tokens
+        ([9, 10], [7, 8, 9, 10]),  # delta only: the unfed tokens are prepended
+    ],
+)
+def test_next_generate_feeds_the_unfed_tokens_first(input_ids, expected_base) -> None:
+    base, draft = _RecordingBase(), _RecordingDraft()
+    model = SimpleNamespace(eagle3_base_model=base, eagle3_draft_model=draft)
+    cache = _cache_after_stop(committed=3, unfed=[7, 8])
+
+    initialize_tree(torch.tensor([input_ids]), model, cache, logits_processor=None)
+
+    assert base.fed == [expected_base]
+    assert draft.fed == [expected_base[1:] + [0]]  # shifted by one, then the sampled token (argmax of zeros)
+    assert cache.unfed_tokens is None
+    assert cache.get_base_seq_length() == 7
+
+
+def test_forward_after_a_stop_feeds_the_unfed_tokens_first() -> None:
+    base = _RecordingBase()
+    model = SimpleNamespace(eagle3_base_model=base, config=SimpleNamespace(vocab_size=8))
+    seen = {"n": 0}
+
+    class _Cache(MobilintEagle3Cache):
+        pass
+
+    cache = object.__new__(_Cache)
+    cache.unfed_tokens = torch.tensor([[7, 8]])
+    cache.base_layer = SimpleNamespace(update_seen_tokens=lambda n: seen.__setitem__("n", seen["n"] + n))
+
+    llm_eagle3_forward(model, input_ids=torch.tensor([[9]]), past_key_values=cache)
+
+    assert base.fed == [[7, 8, 9]]
+    assert seen["n"] == 3 and cache.unfed_tokens is None
+
+
+def test_get_cache_rebuilds_after_a_relaunch() -> None:
+    class _Model:
+        _get_cache = MobilintEagle3GenerationMixin._get_cache
+
+        def __init__(self) -> None:
+            self.models = (_SlotMxq(), _SlotMxq())
+
+        def get_cache_mxq_models(self):
+            return self.models
+
+    model = _Model()
+    first = model._get_cache("", 1, 0)
+    assert model._get_cache("", 1, 0) is first  # reused (and reset) while the MXQs are the same
+
+    model.models = (_SlotMxq(), _SlotMxq())  # dispose + launch
+    rebuilt = model._get_cache("", 1, 0)
+    assert rebuilt is not first and rebuilt.base_mxq_model is model.models[0]
+
+
+def test_base_forward_binds_the_cache_before_inferring() -> None:
+    from transformers_mblt.utils.eagle3.eagle3_utils import MobilintEagle3BaseModelMixin
+
+    calls: list[str] = []
+
+    class _Cache(MobilintEagle3Cache):
+        def bind_base(self, model):
+            calls.append("bind")
+
+    class _Mxq:
+        def infer(self, inputs, _outputs, cache_size):
+            calls.append("infer")
+            n = inputs[0].shape[2]
+            h = np.zeros((1, 1, n, 2), dtype=np.float32)
+            return [h, h, h, np.zeros((1, 1, n, 8), dtype=np.float32)]
+
+    base = MobilintEagle3BaseModelMixin.__new__(MobilintEagle3BaseModelMixin)
+    base.get_mxq_model = lambda: _Mxq()
+    base.embed_tokens = torch.nn.Embedding(16, 6)
+    base.rotary_emb = lambda embeds, positions: np.zeros((1, embeds.shape[1], 4), dtype=np.float32)
+    base.resolve_npu_prefill_chunk_size = lambda _override: 64
+    base._prepare_decoder_attention_mask = lambda mask, shape, embeds, past, cache: torch.zeros(
+        (1, 1, shape[1], past + shape[1])
+    )
+    cache = MobilintEagle3Cache(_SlotMxq(), _SlotMxq())
+    cache.__class__ = _Cache
+
+    with torch.no_grad():
+        base.forward(torch.tensor([[1, 2]]), cache=cache, requires_all_features_logits=False)
+
+    assert calls[:2] == ["bind", "infer"]

@@ -633,8 +633,11 @@ def test_qwen2_eagle3_generate_calls_stopping_criteria(monkeypatch) -> None:
     assert criteria.score_shapes == [(1, 16)]
 
 
-def test_qwen2_eagle3_generate_commits_pending_accept_tokens_on_stopping_criteria(monkeypatch) -> None:
-    """Commit pending accepted tokens before breaking on custom stopping criteria."""
+def test_qwen2_eagle3_generate_defers_pending_accept_tokens_on_stopping_criteria(monkeypatch) -> None:
+    """Keep accepted-but-unfed tokens for the next call when breaking on custom stopping criteria.
+
+    Their KV positions still hold the last tree's nodes, so they must not count as cached.
+    """
 
     class StopNowCriteria(StoppingCriteria):
         def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs: object) -> bool:
@@ -702,8 +705,9 @@ def test_qwen2_eagle3_generate_commits_pending_accept_tokens_on_stopping_criteri
     )
 
     assert torch.equal(output.sequences, torch.tensor([[1, 2, 4]], dtype=torch.long))
-    assert cache.get_base_seq_length() == 3
+    assert cache.get_base_seq_length() == 2
     assert cache.accept_tokens is None
+    assert torch.equal(cache.unfed_tokens, torch.tensor([[4]], dtype=torch.long))
 
 
 def test_qwen2_eagle3_generation_config_updates_max_draft_tokens() -> None:
@@ -830,7 +834,9 @@ def test_qwen2_eagle3_update_inference_inputs_caps_remaining_tokens() -> None:
 
     assert torch.equal(output, torch.tensor([[1, 2, 4, 5]], dtype=torch.long))
     assert cache.accept_tokens is None
-    assert base_seen_tokens["count"] == 2
+    # Stopping does not feed the accepted tokens: they wait in unfed_tokens instead of counting as cached.
+    assert base_seen_tokens["count"] == 0
+    assert torch.equal(cache.unfed_tokens, torch.tensor([[4, 5]], dtype=torch.long))
     assert new_token_count == 2
     assert should_stop is True
 
@@ -866,7 +872,9 @@ def test_qwen2_eagle3_update_inference_inputs_stops_at_mid_block_eos() -> None:
 
     assert torch.equal(output, torch.tensor([[1, 2, 4, 5]], dtype=torch.long))
     assert cache.accept_tokens is None
-    assert base_seen_tokens["count"] == 2
+    # Stopping does not feed the accepted tokens: they wait in unfed_tokens instead of counting as cached.
+    assert base_seen_tokens["count"] == 0
+    assert torch.equal(cache.unfed_tokens, torch.tensor([[4, 5]], dtype=torch.long))
     assert new_token_count == 2
     assert should_stop is True
 
