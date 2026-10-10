@@ -509,6 +509,25 @@ class MobilintMixtureOfExpertsGenerationMixin(MobilintGenerationMixin):
             cached is live for cached, live in zip(cache.shared_mxq_models, shared_models)
         )
 
+    def _cache_layout_matches(self, cache: MobilintMixtureOfExpertsCache) -> bool:
+        """Whether ``cache`` can move onto this model's shared MXQs: same layer count and, layer by layer, the same
+        KV layout. A layout that cannot be read counts as a mismatch."""
+        from .cache_residency import MobilintCacheStateError, mxq_kv_signature
+
+        shared_models = cast(Any, self).get_shared_mxq_models()
+        if len(cache.shared_layers) != len(shared_models):
+            return False
+        try:
+            for layer, model in zip(cache.shared_layers, shared_models):
+                if layer.mxq_model is model:
+                    continue
+                source, target = mxq_kv_signature(layer.mxq_model), mxq_kv_signature(model)
+                if source is not None and target is not None and source != target:
+                    return False
+        except MobilintCacheStateError:
+            return False
+        return True
+
     def build_mobilint_cache(self, batch_size: int = 1) -> MobilintMixtureOfExpertsCache:
         """Return a fresh cache for callers that drive generation themselves (the TPS fake-prefill decode sweep)."""
         self._require_single_batch(batch_size)
@@ -544,9 +563,9 @@ class MobilintMixtureOfExpertsGenerationMixin(MobilintGenerationMixin):
         current = model_kwargs.get(cache_name)
         if not isinstance(current, MobilintMixtureOfExpertsCache):
             model_kwargs[cache_name] = self._get_cache("mobilint", batch_size, max_cache_length)
-        elif len(current.shared_layers) != len(cast(Any, self).get_shared_mxq_models()):
-            # A different release: its layers cannot map onto this model's shared MXQs.
-            logger.warning("Replacing a MobilintMixtureOfExpertsCache built for a release with other layers.")
+        elif not self._cache_layout_matches(current):
+            # A different release: its KV cannot move onto this model's shared MXQs.
+            logger.warning("Replacing a MobilintMixtureOfExpertsCache built for a release with another KV layout.")
             model_kwargs[cache_name] = self._get_cache("mobilint", batch_size, max_cache_length)
         # Any other cache is used as is: the forward binds it, restoring KV another sequence displaced and moving a
         # cache built on another instance of the same release.

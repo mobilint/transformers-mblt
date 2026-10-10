@@ -340,6 +340,7 @@ class _Generator:
     _get_cache = MobilintMixtureOfExpertsGenerationMixin._get_cache
     _new_moe_cache = MobilintMixtureOfExpertsGenerationMixin._new_moe_cache
     _bind_moe_cache = MobilintMixtureOfExpertsModelMixin._bind_moe_cache
+    _cache_layout_matches = MobilintMixtureOfExpertsGenerationMixin._cache_layout_matches
 
     def __init__(self, num_shared: int = 2) -> None:
         self.npu_backend = _SlotBackend(num_shared)
@@ -648,3 +649,29 @@ def test_ambiguous_scales_need_the_manifest_to_derive_the_order(
     orders = script.derive_shared_output_order(shared, experts, NUM_EXPERTS, manifest=_manifest(tmp_path, 1))
     assert orders[-1] == ["expert_in", "residual", "gate"]
     assert orders[0] == ["residual", "expert_in", "gate"]
+
+
+def test_cache_from_a_release_with_the_same_depth_but_another_kv_layout_is_replaced() -> None:
+    def with_layout(generator: _Generator, layer_hash: str) -> _Generator:
+        for model in generator.get_shared_mxq_models():
+            model.get_core_mode = lambda: "single"
+            model.get_cache_infos = lambda h=layer_hash: [
+                type("Info", (), {"name": "k", "size": 8, "num_batches": 1, "cache_type": "d", "layer_hash": h})()
+            ]
+            model.get_model_input_shape = lambda: [(1, -1, 4)]
+            model.get_input_buffer_info = lambda: [type("Buf", (), {"max_cache_size": 64})()]
+        return generator
+
+    source = with_layout(_Generator(), "w8")
+    cache = source._new_moe_cache()
+    source.run(cache, "hello")
+
+    same_release = with_layout(_Generator(), "w8")
+    model_kwargs = {"past_key_values": cache}
+    same_release._prepare_cache_for_generation(None, model_kwargs, None, 1, 0)
+    assert model_kwargs["past_key_values"] is cache
+
+    other_release = with_layout(_Generator(), "w4")
+    model_kwargs = {"past_key_values": cache}
+    other_release._prepare_cache_for_generation(None, model_kwargs, None, 1, 0)
+    assert model_kwargs["past_key_values"] is not cache
