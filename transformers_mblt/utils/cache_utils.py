@@ -9,6 +9,8 @@ import qbruntime
 import torch
 from transformers.cache_utils import Cache
 
+from .cache_residency import MobilintCacheStateError, mxq_kv_signature
+
 try:
     from transformers.cache_utils import CacheLayerMixin
 except ImportError:
@@ -43,6 +45,22 @@ def append_whisper_beam_debug_event(event: dict[str, Any]) -> None:
 
 
 class MobilintLayer(CacheLayerMixin):
+    """One sequence's KV state for one MXQ KV slot ``(mxq_model, cache_id)``.
+
+    The NPU slot holds one sequence at a time. Once a model binds this layer before an infer (see
+    :mod:`transformers_mblt.utils.cache_residency`), the layer is *managed*: the backend's owner table records
+    whether the slot holds this layer's KV, and the layer moves its KV between the slot and its host ``buffer``
+    on its own. A layer that was never bound keeps talking to the MXQ directly.
+
+    Two host copies exist. ``buffer`` / ``buffer_seq_length`` is the snapshot the caller takes with
+    :meth:`dump_cache_memory` and restores with :meth:`load_cache_memory`; nothing else touches it. ``_host_kv``
+    is where the layer's KV goes when another cache takes its slot. ``_host_valid_len`` counts the leading
+    positions where ``_host_kv`` equals the layer's current KV: saving or loading sets it, and every infer that
+    writes from position ``p`` caps it at ``p``. A managed layer that is not resident can be restored only when
+    ``_host_valid_len`` covers ``_seen_tokens``. Blob lists are replaced, never mutated, so the two copies may
+    share one list.
+    """
+
     is_sliding = False
 
     def __init__(self, mxq_model: qbruntime.Model, cache_id: int = 0):
@@ -51,6 +69,14 @@ class MobilintLayer(CacheLayerMixin):
         self._seen_tokens = 0
         self.buffer: list[bytes] = []
         self.buffer_seq_length: Optional[int] = None
+        # False after fake_prefill: the length is real but the KV contents are not, so they are never moved.
+        self.kv_valid = True
+        self.buffer_kv_valid = True  # kv_valid at the time ``buffer`` was taken
+        self._host_kv: list[bytes] = []
+        self._host_valid_len = 0
+        self._resident_at: Optional[Any] = None  # weakref to the MobilintKVResidency whose slot holds this KV
+        self._residency_hint: Optional[Any] = None  # weakref to the residency that last managed this layer
+        self._kv_signature: Optional[tuple] = None
 
     def lazy_initialization(self, key_states: torch.Tensor, value_states: Optional[torch.Tensor] = None):
         del value_states
@@ -93,37 +119,149 @@ class MobilintLayer(CacheLayerMixin):
         """
         self.reset()
         self.set_seq_length(seq_length)
+        self.kv_valid = False
 
     def reset(self) -> None:
         self._seen_tokens = 0
         self.buffer = []
         self.buffer_seq_length = None
+        self.kv_valid = True
+        self.buffer_kv_valid = True
+        self._host_kv = []
+        self._host_valid_len = 0
 
     def reorder_cache(self, beam_idx: torch.LongTensor):
         raise NotImplementedError("reorder_cache is not implemented")
 
     def update_cache_position(self, cache_position: torch.Tensor):
+        self._note_write()
         self._seen_tokens += cache_position.numel()
 
     def update_seen_tokens(self, num_new_seen_tokens: int):
+        self._note_write()
         self._seen_tokens += num_new_seen_tokens
 
+    # ------------------------------------------------------------------
+    # Residency (see transformers_mblt.utils.cache_residency)
+    # ------------------------------------------------------------------
+
+    @property
+    def is_managed(self) -> bool:
+        """Whether a model has bound this layer, so it tracks where its KV lives."""
+        return self._residency_hint is not None and self._residency_hint() is not None
+
+    @property
+    def is_resident(self) -> bool:
+        """Whether the NPU slot currently holds this layer's KV."""
+        residency = self._resident_at() if self._resident_at is not None else None
+        return residency is not None and residency.is_resident(self)
+
+    @property
+    def host_nbytes(self) -> int:
+        """Bytes of KV this layer keeps in host memory (both copies, counted once when they are shared)."""
+        lists = [self.buffer] if self.buffer is self._host_kv else [self.buffer, self._host_kv]
+        return sum(
+            len(blob) if isinstance(blob, (bytes, bytearray)) else int(getattr(blob, "nbytes", 0))
+            for blobs in lists
+            for blob in blobs
+        )
+
+    def _note_write(self) -> None:
+        # The infer that just ran wrote KV from position ``_seen_tokens`` on.
+        self._host_valid_len = min(self._host_valid_len, self._seen_tokens)
+
+    def _signature(self) -> Optional[tuple]:
+        if self._kv_signature is None:
+            self._kv_signature = mxq_kv_signature(self.mxq_model)
+        return self._kv_signature
+
+    def _save_from_slot(self) -> None:
+        """Dump the slot into the host buffer; called by the owner table while this layer is resident."""
+        if self._seen_tokens > 0 and self.kv_valid:
+            self._host_kv = self.mxq_model.dump_cache_memory(self.cache_id)
+            self._host_valid_len = self._seen_tokens
+
+    def _load_into_slot(self) -> None:
+        """Load the host buffer into the slot, which the owner table is about to assign to this layer."""
+        if self._seen_tokens <= 0 or not self.kv_valid:
+            return
+        if self._host_valid_len < self._seen_tokens:
+            raise MobilintCacheStateError(
+                f"Cannot restore {self._seen_tokens} cached tokens: the host copy holds only "
+                f"{self._host_valid_len}. The KV was on an NPU slot that was released (for example the backend "
+                "was disposed) before it was saved. Call dump_cache_memory() before disposing, or reset() the cache."
+            )
+        self.mxq_model.load_cache_memory(self._host_kv, self.cache_id)
+
+    def _retarget(self, mxq_model: Any, cache_id: int) -> None:
+        """Point this layer at another slot, possibly on another model instance with the same MXQ."""
+        if self._seen_tokens > 0 and self.kv_valid:
+            source = self._signature()
+            target = mxq_kv_signature(mxq_model)
+            if source is not None and target is not None and source != target:
+                raise MobilintCacheStateError(
+                    "Cannot move this cache to a model whose MXQ has a different KV layout (different compiled "
+                    "model, quantization, core mode or KV capacity). Use a cache built for that model."
+                )
+        self.mxq_model = mxq_model
+        self.cache_id = int(cache_id)
+        self._kv_signature = None
+
+    def _residency(self) -> Optional[Any]:
+        return self._residency_hint() if self._residency_hint is not None else None
+
+    def offload(self) -> None:
+        """Save this layer's KV to its host buffer and free its NPU slot for other caches."""
+        residency = self._resident_at() if self._resident_at is not None else None
+        if residency is not None:
+            residency.evict_layer(self)
+
     def dump_cache_memory(self):
-        self.buffer = self.mxq_model.dump_cache_memory(self.cache_id)
+        """Snapshot the current KV into ``buffer``; :meth:`load_cache_memory` restores it."""
+        if self.is_managed and not self.is_resident:
+            # The KV is not on the NPU: it was saved to the host when this layer lost its slot.
+            if self._seen_tokens > 0 and self.kv_valid and self._host_valid_len < self._seen_tokens:
+                raise MobilintCacheStateError(
+                    f"Cannot snapshot {self._seen_tokens} cached tokens: only {self._host_valid_len} were saved "
+                    "before the NPU slot was released."
+                )
+            self.buffer = self._host_kv
+        else:
+            self.buffer = self.mxq_model.dump_cache_memory(self.cache_id)
+            self._host_kv = self.buffer
+            self._host_valid_len = self.get_seq_length()
         self.buffer_seq_length = self.get_seq_length()
+        self.buffer_kv_valid = self.kv_valid
 
     def load_cache_memory(self):
         if self.buffer_seq_length is not None:
             self.set_seq_length(self.buffer_seq_length)
+            self._host_kv = self.buffer
+            self._host_valid_len = self.buffer_seq_length
+            # A snapshot of a fake-prefilled layer restores its length, not KV contents.
+            self.kv_valid = self.buffer_kv_valid
+        residency = self._residency()
+        if residency is not None:
+            # Restore through the owner table so the cache that holds the slot is saved first.
+            residency.acquire(self, self.mxq_model, self.cache_id, reload=True)
+            return
         if self.get_seq_length() > 0:
             self.mxq_model.load_cache_memory(self.buffer, self.cache_id)
 
     def dump_cache_memory_to(self, cache_dir: str):
+        residency = self._residency()
+        if residency is not None and not self.is_resident:
+            # The slot holds another cache's KV: put this layer's KV back on it before writing the files.
+            residency.acquire(self, self.mxq_model, self.cache_id)
         self.mxq_model.dump_cache_memory_to(cache_dir, self.cache_id)
         seq_path = Path(cache_dir) / "seq_length.txt"
         seq_path.write_text(f"{self.get_seq_length()}\n", encoding="utf-8")
 
     def load_cache_memory_from(self, cache_dir: str):
+        residency = self._residency()
+        if residency is not None:
+            # The file overwrites the slot: save the cache that holds it, then take it over.
+            residency.evict(self.mxq_model, self.cache_id)
         self.reset()
         seq_path = Path(cache_dir) / "seq_length.txt"
         if seq_path.exists():
@@ -132,12 +270,27 @@ class MobilintLayer(CacheLayerMixin):
             seq_length = 0
         self.set_seq_length(seq_length)
         self.mxq_model.load_cache_memory_from(cache_dir, self.cache_id)
+        if residency is not None:
+            residency._record(self.mxq_model, self.cache_id, self)
 
     def copy(self) -> "MobilintLayer":
+        """Return an independent snapshot of this sequence's KV.
+
+        A resident layer saves its slot first, so the copy's host buffer is current. The copy is not resident:
+        its first bind loads the buffer into a slot.
+        """
+        if self.is_resident:
+            self._save_from_slot()
         copied = MobilintLayer(self.mxq_model, self.cache_id)
         copied._seen_tokens = self._seen_tokens
         copied.buffer = copy.deepcopy(self.buffer)
         copied.buffer_seq_length = self.buffer_seq_length
+        copied.kv_valid = self.kv_valid
+        copied.buffer_kv_valid = self.buffer_kv_valid
+        copied._host_kv = self._host_kv
+        copied._host_valid_len = self._host_valid_len
+        copied._residency_hint = self._residency_hint
+        copied._kv_signature = self._kv_signature
         return copied
 
 
@@ -148,6 +301,7 @@ class MobilintCache(Cache):
         per_model_batch: int = 1,
         *,
         batch_size: Optional[int] = None,
+        slots: Optional[Sequence[Tuple[int, int]]] = None,
     ):
         """Create a cache with fresh logical cursors across one or more runtime models.
 
@@ -177,6 +331,11 @@ class MobilintCache(Cache):
                 rejected with a multi-Model list because the legacy alias
                 would silently double the total capacity and pin the first
                 ``K`` rows entirely to slot 0.
+            slots: Place row ``i`` on ``slots[i] = (model_idx, cache_id)``
+                instead of the default ``divmod(i, K)`` layout. The cache then
+                has ``len(slots)`` rows; a serving engine uses this to keep one
+                cache per request on the slot it assigned. Slots must be
+                distinct and inside ``N * K``.
 
         Raises:
             TypeError: If both ``per_model_batch`` and legacy ``batch_size``
@@ -211,10 +370,28 @@ class MobilintCache(Cache):
         self.n_models: int = len(self.mxq_models)
         self._batch_size: int = self.n_models * self.k_per_model
 
+        if slots is None:
+            row_slots = [
+                (model_idx, cache_id) for model_idx in range(self.n_models) for cache_id in range(self.k_per_model)
+            ]
+        else:
+            row_slots = [(int(model_idx), int(cache_id)) for model_idx, cache_id in slots]
+            if not row_slots:
+                raise ValueError("slots must name at least one (model_idx, cache_id) slot")
+            if len(set(row_slots)) != len(row_slots):
+                raise ValueError(f"slots must be distinct, got {row_slots}")
+            for model_idx, cache_id in row_slots:
+                if not (0 <= model_idx < self.n_models and 0 <= cache_id < self.k_per_model):
+                    raise ValueError(
+                        f"slot ({model_idx}, {cache_id}) is outside the cache's N={self.n_models} x "
+                        f"K={self.k_per_model} topology"
+                    )
+            self._batch_size = len(row_slots)
+        self._row_slots: List[Tuple[int, int]] = row_slots
+        self._explicit_slots = slots is not None
+
         self.layers: list[MobilintLayer] = [
-            MobilintLayer(self.mxq_models[model_idx], cache_id)
-            for model_idx in range(self.n_models)
-            for cache_id in range(self.k_per_model)
+            MobilintLayer(self.mxq_models[model_idx], cache_id) for model_idx, cache_id in row_slots
         ]
         self.layer_classes = MobilintLayer
 
@@ -244,7 +421,59 @@ class MobilintCache(Cache):
                 f"row {row} out of range for cache with {len(self.layers)} rows "
                 f"(N={self.n_models}, K={self.k_per_model})"
             )
-        return divmod(row, self.k_per_model)
+        return self._row_slots[row]
+
+    # ------------------------------------------------------------------
+    # Residency (see transformers_mblt.utils.cache_residency)
+    # ------------------------------------------------------------------
+
+    @property
+    def is_resident(self) -> bool:
+        """Whether every row's KV is on its NPU slot."""
+        return all(layer.is_resident for layer in self.layers)
+
+    @property
+    def host_nbytes(self) -> int:
+        """Bytes of KV this cache keeps in host memory."""
+        return sum(layer.host_nbytes for layer in self.layers)
+
+    def offload(self) -> None:
+        """Save every resident row to host memory and free its NPU slot for other caches."""
+        for layer in self.layers:
+            layer.offload()
+
+    def adopt_backend(self, backend: Any) -> None:
+        """Point the cache at ``backend``'s live Model handles, moving it from another model instance if needed.
+
+        Rows keep their ``(model_idx, cache_id)`` placement, so the backend must have the same ``N x K``
+        topology. KV moves lazily: each row is saved on its old slot and loaded on the new one the next time it
+        is bound.
+        """
+        backend_models = list(getattr(backend, "mxq_models", None) or [])
+        if len(backend_models) == len(self.mxq_models) and all(
+            mine is theirs for mine, theirs in zip(self.mxq_models, backend_models)
+        ):
+            return
+        backend_k = max(1, int(getattr(backend, "k_per_model", 1) or 1))
+        if len(backend_models) != self.n_models or backend_k != self.k_per_model:
+            raise ValueError(
+                "Cannot move this MobilintCache to a backend with a different slot topology: cache "
+                f"N={self.n_models}, K={self.k_per_model}; backend N={len(backend_models)}, K={backend_k}."
+            )
+        self.mxq_models = backend_models
+
+    def bind_rows(self, backend: Any, rows: Iterable[int]) -> None:
+        """Make the NPU hold the KV of ``rows`` before an infer reads and writes them."""
+        from .cache_residency import bind_cache_layers
+
+        self.adopt_backend(backend)
+        bind_cache_layers(
+            backend,
+            (
+                (self.layers[row], self.mxq_models[self.slot_of(row)[0]], self.slot_of(row)[1])
+                for row in rows
+            ),
+        )
 
     def model_of(self, row: int) -> qbruntime.Model:
         """Return the :class:`qbruntime.Model` that owns the KV state for ``row``."""
@@ -337,6 +566,11 @@ class MobilintCache(Cache):
         batch_size = max(1, int(batch_size))
         if batch_size <= self.batch_size:
             return
+        if self._explicit_slots:
+            raise ValueError(
+                f"cannot grow a MobilintCache whose rows sit on chosen slots {self._row_slots}; "
+                "build it with every slot it needs"
+            )
         if self.n_models != 1:
             raise ValueError(
                 f"cannot grow multi-Model cache beyond {self.batch_size} rows "
@@ -345,15 +579,17 @@ class MobilintCache(Cache):
         only_model = self.mxq_models[0]
         for cache_id in range(self.batch_size, batch_size):
             self.layers.append(MobilintLayer(only_model, cache_id))
+            self._row_slots.append((0, cache_id))
         self.batch_size = batch_size
         self.k_per_model = batch_size
 
     def copy(self):
+        """Return an independent snapshot; resident rows save their KV first (see :meth:`MobilintLayer.copy`)."""
         copied = MobilintCache(list(self.mxq_models), per_model_batch=self.k_per_model)
-        if len(copied.layers) < self.batch_size:
-            copied.ensure_batch_size(self.batch_size)
-        for i in range(len(self.layers)):
-            copied.layers[i] = self.layers[i].copy()
+        copied._row_slots = list(self._row_slots)
+        copied._explicit_slots = self._explicit_slots
+        copied._batch_size = self._batch_size
+        copied.layers = [layer.copy() for layer in self.layers]
         return copied
 
 
@@ -838,11 +1074,13 @@ class MobilintDeepStackCache(MobilintCache):
         num_deepstack_layers: int = 0,
         hidden_size: int = 0,
         batch_size: Optional[int] = None,
+        slots: Optional[Sequence[Tuple[int, int]]] = None,
     ) -> None:
         super().__init__(
             mxq_models=mxq_models,
             per_model_batch=per_model_batch,
             batch_size=batch_size,
+            slots=slots,
         )
         if num_deepstack_layers < 0:
             raise ValueError(f"num_deepstack_layers must be non-negative, got {num_deepstack_layers}")
@@ -925,10 +1163,10 @@ class MobilintDeepStackCache(MobilintCache):
             num_deepstack_layers=self.num_deepstack_layers,
             hidden_size=self.hidden_size,
         )
-        if len(copied.layers) < self.batch_size:
-            copied.ensure_batch_size(self.batch_size)
-        for i in range(len(self.layers)):
-            copied.layers[i] = self.layers[i].copy()
+        copied._row_slots = list(self._row_slots)
+        copied._explicit_slots = self._explicit_slots
+        copied._batch_size = self._batch_size
+        copied.layers = [layer.copy() for layer in self.layers]
         copied._deepstack_tensor = None if self._deepstack_tensor is None else self._deepstack_tensor.clone()
         return copied
 

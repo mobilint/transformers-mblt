@@ -417,6 +417,41 @@ run one token at a time. A release whose last shared MXQ emits
 only the last token (a last-only build) runs any chunk that keeps more than its last position through the
 token path, with the same one-time warning as last-only LLM builds.
 
+### KV caches
+
+A `MobilintCache` holds one sequence's KV per row, and it can move. Each NPU backend records which cache's KV
+every slot `(qbruntime.Model, cache_id)` currently holds. Before an infer, the model makes the slots it uses hold
+the right cache. If another cache is there, that cache's KV is first dumped to host memory, and the incoming cache's
+KV is loaded back from host memory if it was moved out earlier. Everything stays in memory: no files are written.
+A cache that keeps decoding on its own slot never dumps.
+
+```python
+a = MobilintCache(model.npu_backend.mxq_models)
+b = MobilintCache(model.npu_backend.mxq_models)
+model.generate(prompt_a, past_key_values=a, max_new_tokens=32)
+model.generate(prompt_b, past_key_values=b, max_new_tokens=32)  # a is saved to host memory
+model.generate(continuation_a, past_key_values=a, max_new_tokens=32)  # b is saved, a is loaded back
+```
+
+- `copy()` returns a snapshot. A resident cache saves its slot first, and the copy is loaded on its first use.
+- `offload()` saves the cache to host memory now and frees its slots. `is_resident` reports whether every row is
+  on the NPU, and `host_nbytes` how much host memory the cache holds.
+- Passing a cache to another instance of the same checkpoint moves it: it is dumped there and loaded here. Both
+  instances must have the same slot topology (`N` Models x `K` cache slots each). The MXQs must also have the same
+  KV layout (same compiled model, quantization, core mode and KV capacity); otherwise the move raises
+  `MobilintCacheStateError`, and so does a move whose MXQ layout cannot be read.
+- `MobilintCache(mxq_models, per_model_batch=K, slots=[(model_idx, cache_id), ...])` places row `i` on
+  `slots[i]` instead of the default `divmod(i, K)` layout. A serving engine can then keep one cache per request
+  on the slot it assigned. Slots must be distinct and inside `N x K`. The cache has `len(slots)` rows, cannot
+  grow with `ensure_batch_size()`, and a single-row forward requires row 0 on slot `(0, 0)`.
+- KV that was on the NPU when the backend was disposed is lost unless `dump_cache_memory()` saved it first. Using
+  such a cache raises `MobilintCacheStateError` instead of loading stale bytes.
+- `dump_cache_memory()` / `load_cache_memory()` keep their meaning: an explicit snapshot that `load_cache_memory()`
+  restores, kept apart from the host copy used for moves. `fake_prefill()` caches are never moved or loaded.
+
+This applies to the dense LLM and Qwen3-VL text paths. EAGLE-3, MoE, Whisper and Qwen3-ASR caches keep their
+previous behavior for now.
+
 ## Listing Available Models
 
 **transformers-mblt** offers a function to list all available models. You can use the following code snippet to list the models for a specific task (e.g., `text-generation`, `automatic-speech-recognition`, etc.):
