@@ -1048,3 +1048,115 @@ class MobilintEagle3Cache(Cache):
         copied.layers = [copied.base_layer]
         copied.clear_tree_state()
         return copied
+
+
+class MobilintMixtureOfExpertsCache(Cache):
+    """Mobilint cache for Mixture-of-Experts releases.
+
+    Every decoder layer of a MoE release is its own ``shared`` MXQ holding its own KV cache. One forward step feeds
+    the same tokens through every shared MXQ, so their caches always advance in lockstep and one sequence length
+    describes all of them. The cache keeps one :class:`MobilintLayer` per shared MXQ so KV dumps and loads reach
+    every layer; ``layers[0]`` is the authoritative cursor, matching the single-entry ``MobilintCache`` API
+    (callers that rewind with ``cache.layers[0]._seen_tokens = n`` keep working).
+
+    Only ``batch_size == 1`` is supported: each shared MXQ hosts a single cache entry.
+    """
+
+    def __init__(self, shared_mxq_models: Sequence[qbruntime.Model]) -> None:
+        if not shared_mxq_models:
+            raise ValueError("shared_mxq_models must contain at least one Model")
+        self.shared_mxq_models: List[qbruntime.Model] = list(shared_mxq_models)
+        self.shared_layers: list[MobilintLayer] = [MobilintLayer(model, 0) for model in self.shared_mxq_models]
+        self.layers = [self.shared_layers[0]]
+        self.layer_classes = MobilintLayer
+        self.num_hidden_layers = 1
+        self.cache_processor = None
+
+    @property
+    def batch_size(self) -> int:
+        return 1
+
+    @property
+    def max_batch_size(self) -> int:
+        return 1
+
+    def _sync_shared_layers(self) -> None:
+        """Propagate the ``layers[0]`` cursor to every shared layer."""
+        seq_length = self.shared_layers[0].get_seq_length()
+        for layer in self.shared_layers[1:]:
+            layer.set_seq_length(seq_length)
+
+    def get_seq_length(self, index: int = 0) -> int:
+        del index
+        return self.shared_layers[0].get_seq_length()
+
+    def set_seq_length(self, sequence_lengths: Union[dict[int, int], int], index: int = 0) -> None:
+        del index
+        if isinstance(sequence_lengths, dict):
+            if list(sequence_lengths) != [0]:
+                raise ValueError(
+                    f"MobilintMixtureOfExpertsCache has a single cache entry; got cache ids {list(sequence_lengths)}"
+                )
+            sequence_lengths = sequence_lengths[0]
+        for layer in self.shared_layers:
+            layer.set_seq_length(int(sequence_lengths))
+
+    def fake_prefill(self, sequence_lengths: Union[dict[int, int], int], index: int = 0) -> None:
+        """Mark every shared layer as prefilled without restoring KV cache memory (decode TPS benchmarks)."""
+        self.reset()
+        self.set_seq_length(sequence_lengths, index=index)
+
+    def update_cache_position(self, cache_position: torch.Tensor, index: int = 0) -> None:
+        del index
+        self._sync_shared_layers()
+        for layer in self.shared_layers:
+            layer.update_cache_position(cache_position)
+
+    def update_seen_tokens(self, num_new_seen_tokens: int, index: int = 0) -> None:
+        del index
+        self._sync_shared_layers()
+        for layer in self.shared_layers:
+            layer.update_seen_tokens(num_new_seen_tokens)
+
+    def reset(self) -> None:
+        for layer in self.shared_layers:
+            layer.reset()
+
+    def crop(self, max_length: int) -> None:
+        if max_length < 0:
+            raise ValueError(f"max_length must be non-negative, got {max_length}")
+        self.set_seq_length(min(self.get_seq_length(), int(max_length)))
+
+    def reorder_cache(self, beam_idx: torch.LongTensor) -> None:
+        raise NotImplementedError("MobilintMixtureOfExpertsCache does not support beam search (batch_size=1).")
+
+    def dump_cache_memory(self) -> None:
+        self._sync_shared_layers()
+        for layer in self.shared_layers:
+            layer.dump_cache_memory()
+
+    def load_cache_memory(self) -> None:
+        for layer in self.shared_layers:
+            layer.load_cache_memory()
+
+    def dump_cache_memory_to(self, cache_dir: str, index: int = 0) -> None:
+        del index
+        self._sync_shared_layers()
+        for layer_idx, layer in enumerate(self.shared_layers):
+            layer_dir = Path(cache_dir) / f"layer_{layer_idx}"
+            layer_dir.mkdir(parents=True, exist_ok=True)
+            layer.dump_cache_memory_to(str(layer_dir))
+
+    def load_cache_memory_from(self, cache_dir: str, index: int = 0) -> None:
+        del index
+        for layer_idx, layer in enumerate(self.shared_layers):
+            layer.load_cache_memory_from(str(Path(cache_dir) / f"layer_{layer_idx}"))
+
+    def copy(self) -> "MobilintMixtureOfExpertsCache":
+        copied = MobilintMixtureOfExpertsCache(self.shared_mxq_models)
+        copied.shared_layers = [layer.copy() for layer in self.shared_layers]
+        copied.layers = [copied.shared_layers[0]]
+        return copied
+
+    def __repr__(self) -> str:
+        return f"MobilintMixtureOfExpertsCache(num_layers={len(self.shared_layers)}, seq_length={self.get_seq_length()})"

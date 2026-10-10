@@ -115,6 +115,18 @@ description: >-
   handling (including `MBLT_VISION_OUTPUT_ORDER` env override) live in
   `transformers_mblt/README.md`; per-artifact resolution and validation logic
   live in `transformers_mblt/models/qwen3_vl/modeling_qwen3_vl.py::_resolve_vision_output_order`.
+- Mixture-of-Experts contract (Qwen3-MoE): `MobilintMixtureOfExpertsConfigMixin` /
+  `MobilintMixtureOfExpertsModelMixin` / `MobilintMixtureOfExpertsGenerationMixin` /
+  `MobilintMixtureOfExpertsCache` pair like the EAGLE-3 mixins, and
+  `transformers_mblt/utils/moe_utils.py::MobilintMixtureOfExpertsNPUBackend` assembles the
+  `shared_` / `expert_` / `lm_head_` role backends instead of subclassing `MobilintNPUBackend`
+  (one MXQ file per backend does not fit thousands of MXQs). Roles are `single` core mode only,
+  placed round-robin over the devices their `"d:c:k"` targets cover, and unprefixed NPU kwargs are
+  deliberately not fanned out to the roles. `batch_size` stays `1`. Releases are packed
+  (`scripts/pack_moe_mxq.py`, `moe_mxq_pack_index`): qbruntime re-reads an MXQ during `launch()`,
+  so a member is materialized (Linux `memfd`, elsewhere a short-lived temp file) before `Model()`
+  and released only after `launch()`. Keep `moe_shared_output_order` authoritative; the
+  quantization-scale detection is the fallback and the cross-check.
 - Preserve local style in `transformers_mblt/models` and `transformers_mblt/utils`; they are
   excluded from repository-wide Ruff checks.
 

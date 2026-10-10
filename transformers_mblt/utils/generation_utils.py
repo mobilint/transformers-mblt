@@ -16,6 +16,7 @@ from transformers.utils import logging
 from ..utils.cache_utils import (
     MobilintCache,
     MobilintEagle3Cache,
+    MobilintMixtureOfExpertsCache,
     build_mobilint_cache_from_model,
     cache_matches_backend_topology,
 )
@@ -479,6 +480,65 @@ class MobilintGenerationMixin(ABC, GenerationMixin):
         else:
             model_kwargs[cache_name] = self._get_cache("mobilint", batch_size, max_cache_length, *args, model_kwargs)
             return True
+
+
+class MobilintMixtureOfExpertsGenerationMixin(MobilintGenerationMixin):
+    """Generation mixin for Mixture-of-Experts releases; pairs with :class:`MobilintMixtureOfExpertsModelMixin`.
+
+    The KV cache lives inside every per-layer ``shared`` MXQ, which holds exactly one sequence, so generation always
+    runs on a :class:`MobilintMixtureOfExpertsCache` with ``batch_size == 1``. A caller-supplied cache whose
+    sequence has since been overwritten on the NPU by another cache is reset so it re-prefills from scratch.
+    """
+
+    def get_cache_mxq_model(self) -> None:
+        """MoE releases have no single cache MXQ, so the single-model fake-prefill benchmark path does not apply."""
+        return None
+
+    @staticmethod
+    def _require_single_batch(batch_size: int) -> None:
+        if int(batch_size) > 1:
+            raise ValueError(f"Mixture-of-Experts releases support only batch_size=1, got {batch_size}.")
+
+    def _new_moe_cache(self) -> MobilintMixtureOfExpertsCache:
+        return MobilintMixtureOfExpertsCache(cast(Any, self).get_shared_mxq_models())
+
+    # Function arguments changed for transformers>=4.56.0; see MobilintGenerationMixin._get_cache.
+    def _get_cache(
+        self, cache_implementation: str, batch_size: int, max_cache_len: int, *args
+    ) -> MobilintMixtureOfExpertsCache:
+        self._require_single_batch(batch_size)
+        existing_cache = getattr(self, "_cache", None)
+        shared_models = cast(Any, self).get_shared_mxq_models()
+        if not isinstance(existing_cache, MobilintMixtureOfExpertsCache) or any(
+            cached is not live for cached, live in zip(existing_cache.shared_mxq_models, shared_models)
+        ) or len(existing_cache.shared_mxq_models) != len(shared_models):
+            self._cache = self._new_moe_cache()
+        else:
+            self._cache.reset()
+        return self._cache
+
+    # Function arguments changed for transformers>=4.56.0; see MobilintGenerationMixin._prepare_cache_for_generation.
+    def _prepare_cache_for_generation(
+        self,
+        generation_config: GenerationConfig,
+        model_kwargs: Dict,
+        assistant_model: "PreTrainedModel",
+        batch_size: int,
+        max_cache_length: int,
+        *args,
+    ) -> bool:
+        del generation_config, assistant_model, args
+        self._require_single_batch(batch_size)
+        cache_name = "past_key_values"
+        current = model_kwargs.get(cache_name)
+        if not isinstance(current, MobilintMixtureOfExpertsCache):
+            model_kwargs[cache_name] = self._get_cache("mobilint", batch_size, max_cache_length)
+        elif current is not getattr(self, "_active_moe_cache", None) and current.get_seq_length() > 0:
+            # Another cache ran on the NPU since this one was filled; its KV prefix is gone.
+            logger.warning("Resetting a MobilintMixtureOfExpertsCache whose NPU KV state was overwritten.")
+            current.reset()
+        self._active_moe_cache = model_kwargs[cache_name]
+        return True
 
 
 class MobilintEagle3GenerationMixin(ABC, GenerationMixin):

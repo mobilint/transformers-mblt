@@ -332,6 +332,76 @@ disagreement raises a legible `ValueError` at load rather than surfacing later a
 Malformed values raise `ValueError` at the first vision inference from either source rather
 than silently degrading output.
 
+### Mixture-of-Experts release contract
+
+Mixture-of-Experts models (Qwen3-MoE, e.g. `mobilint/Qwen3-30B-A3B-aries-rb`) are compiled into three MXQ
+roles instead of one MXQ:
+
+- `shared`: one MXQ per decoder layer (attention, router gate, and residual). Each one holds that layer's KV
+  cache.
+- `expert`: one MXQ per `(layer, expert)` pair.
+- `lm_head`: one MXQ.
+
+The router (softmax, top-k, and renormalization when `norm_topk_prob` is set) and the weighted sum of the
+expert outputs run on the host between the shared and expert MXQs. Only `batch_size=1` is supported, so
+`max_batch_size` stays `1` and `attention_mask` must be all ones.
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+model_id = "mobilint/Qwen3-30B-A3B-aries-rb"
+tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+model = AutoModelForCausalLM.from_pretrained(model_id, trust_remote_code=True)
+```
+
+Each role has its own NPU settings under the `shared_`, `expert_`, and `lm_head_` prefixes. Only
+`core_mode="single"` is supported, and every role must target the same board. The roles are placed
+round-robin over the devices that their fully qualified `target_cores` cover:
+
+- `shared[layer]` runs on the `layer % n`-th device of `shared_target_cores`.
+- `expert[layer][expert]` runs on the `expert % n`-th device of `expert_target_cores`.
+- The `lm_head` runs on the single device of `lm_head_target_cores`.
+
+Every MXQ on a device uses that role's cores on that device. Unprefixed settings such as `dev_no` are not
+applied to the roles, because the roles need different core sets: an unprefixed `dev_no` would expand every
+role to every core of the device. To move the release to other devices, override each role:
+
+```python
+model = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    trust_remote_code=True,
+    shared_target_cores=["1:0:0", "2:0:0", "3:0:0"],
+    expert_target_cores=[f"{dev}:{cluster}:{core}" for dev in (1, 2, 3) for cluster in (0, 1) for core in range(4)],
+    lm_head_target_cores=["3:0:0"],
+)
+```
+
+Releases ship the shared and expert MXQs packed: one uncompressed `mxq/block_{layer}.mxqpack` per layer that
+holds the shared MXQ and then every expert MXQ, each starting on a 4 KiB boundary, plus `mxq/index.json` with
+the byte size of every member. `config.json` points at the index through `moe_mxq_pack_index`. Packing keeps
+the Hub repository at a few dozen files, so the download stays within the Hub API rate limit. A packed member
+never exists as a regular file next to its pack. `qbruntime` opens MXQs only by path and re-reads them during
+`launch()`, so each member is materialized right before `Model()` and released right after `launch()`:
+
+- On Linux, the member is copied in the kernel (`os.sendfile`) into an anonymous `memfd`, and the consumed
+  range of the pack is dropped from the page cache.
+- On Windows, the member is written to a short-lived temporary file that is deleted right after `launch()`.
+
+Build a pack from individual MXQs with `scripts/pack_moe_mxq.py`. Without `moe_mxq_pack_index`, the
+`shared_mxq_path` and `expert_mxq_path` `str.format` templates (`{layer}`, `{expert}`) name individual MXQ files,
+which is convenient for a local compile output.
+
+`moe_shared_output_order` in `config.json` lists the role of each shared MXQ output (`residual`, `expert_in`,
+`gate`). Its `"default"` entry applies to every layer that has no override keyed by the layer index. When the
+field is missing, the backend identifies the gate by its `num_experts` channels and `expert_in` by its
+quantization scale, which is the reciprocal of the expert input scale. The loader also cross-checks a
+configured order against those scales and warns on a mismatch.
+
+Prefill runs `npu_prefill_chunk_size` tokens per shared MXQ call, and the per-call override is honored. A
+trailing partial chunk and every decode step run one token at a time. A release whose last shared MXQ emits
+only the last token (a last-only build) runs any chunk that keeps more than its last position through the
+token path, with the same one-time warning as last-only LLM builds.
+
 ## Listing Available Models
 
 **transformers-mblt** offers a function to list all available models. You can use the following code snippet to list the models for a specific task (e.g., `text-generation`, `automatic-speech-recognition`, etc.):
@@ -415,6 +485,9 @@ Some architectures have multiple `mxq` files (e.g. encoder-decoder models, or vi
 
 - Text/vision prefixes:
   - `text_...` and `vision_...` variants of the NPU settings above, e.g. `text_mxq_path`, `vision_core_mode`, `text_target_cores`, `vision_target_clusters`, etc.
+
+- Mixture-of-Experts prefixes:
+  - `shared_...`, `expert_...`, and `lm_head_...` variants, e.g. `expert_target_cores`, `lm_head_target_cores`. Unprefixed NPU settings are not applied to these roles; see [Mixture-of-Experts release contract](#mixture-of-experts-release-contract).
 
 For example, you can override only the encoder `mxq` file:
 

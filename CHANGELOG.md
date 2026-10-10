@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Added
+
+- Qwen3-MoE (`mobilint-qwen3_moe`, `MobilintQwen3MoEConfig` / `MobilintQwen3MoEForCausalLM`), ported from the
+  `mobilint/Qwen3-30B-A3B` remote code. The shared Mixture-of-Experts layer follows the EAGLE-3 layout:
+  `MobilintMixtureOfExpertsConfigMixin` (`shared_` / `expert_` / `lm_head_` role backends with fully qualified
+  `"d:c:k"` targets, `moe_shared_output_order`, `moe_mxq_pack_index`), `MobilintMixtureOfExpertsModelMixin`
+  (host routing and the chunked prefill / decode loop), `MobilintMixtureOfExpertsGenerationMixin`, and
+  `MobilintMixtureOfExpertsCache`, which keeps one `MobilintLayer` per shared MXQ so KV dumps and loads reach every
+  layer. The NPU side, `MobilintMixtureOfExpertsNPUBackend` in `transformers_mblt.utils.moe_utils`, loads every MXQ
+  against the role specs from `mblt_npu` and shares one `Accelerator` per device. Device-memory `BadAlloc` disposes
+  every loaded model and raises `MobilintBackendAllocError`. See
+  [Mixture-of-Experts release contract](transformers_mblt/README.md#mixture-of-experts-release-contract).
+- Packed MoE releases: one uncompressed `.mxqpack` per layer plus an index JSON, built with
+  `scripts/pack_moe_mxq.py`. Members are materialized only between `Model()` and `launch()`, through a `memfd` on
+  Linux and a short-lived temporary file elsewhere, so a release never keeps both forms on disk. Compared with the
+  individual MXQ files on 3 Aries devices, loading is about 20% faster, page-cache growth during load drops from
+  9-15 GiB to under 2 GiB, and the disk reads grow by 4%, because each member is copied in full.
+
 ### Changed
 
 - `datasets` moved from the runtime dependencies to the `dev` dependency group and is raised to `>=5.0.1`, which fixes
@@ -10,6 +28,8 @@
 - The ASR tests and `scripts/debug_whisper_beam_trace.py` read audio with `Audio(decode=False)` and decode it with
   soundfile, like the ASR benchmark already did. `datasets` 4.0 and later decode `Audio` columns through torchcodec,
   which needs a matching system FFmpeg.
+- `MobilintModelMixin` resolves its backend through `_resolve_npu_backend()`, so a model can run on a backend
+  assembled from several config backends. The default still returns `config.<npu_backend_prefix>npu_backend`.
 
 ## 0.1.1
 

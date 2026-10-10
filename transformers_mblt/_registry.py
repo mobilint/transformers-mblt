@@ -30,6 +30,7 @@ _ARCHITECTURES: tuple[str, ...] = (
     "llama_eagle3",
     "qwen2_eagle3",
     "qwen3_eagle3",
+    "qwen3_moe",
 )
 _MODULE_KINDS: tuple[str, ...] = ("configuration", "modeling", "processing")
 

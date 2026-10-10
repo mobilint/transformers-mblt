@@ -3,7 +3,7 @@ import math
 import os
 import time
 import warnings
-from typing import TYPE_CHECKING, Any, Callable, Literal, NamedTuple, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, Callable, Literal, NamedTuple, Optional, Sequence, Union, cast
 
 import numpy as np
 import qbruntime
@@ -12,12 +12,14 @@ import torch.nn as nn
 from transformers.modeling_utils import PreTrainedModel
 
 from .._npu import MobilintNPUBackend
-from ..utils.cache_utils import MobilintCache
+from ..utils.cache_utils import MobilintCache, MobilintMixtureOfExpertsCache
 from .base_utils import PretrainedOnlyMixin
 from .configuration_utils import (
     MobilintConfigMixin,
     MobilintEncoderDecoderConfigMixin,
+    MobilintMixtureOfExpertsConfigMixin,
 )
+from .moe_utils import MobilintMixtureOfExpertsNPUBackend
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +79,7 @@ class MobilintModelMixin(PretrainedOnlyMixin, PreTrainedModel):
         self.npu_time = None
         self.reset_npu_timing()
 
-        self.npu_backend: MobilintNPUBackend = self.config.__getattribute__(self.npu_backend_prefix + "npu_backend")
+        self.npu_backend: MobilintNPUBackend = self._resolve_npu_backend()
         self.npu_backend.name_or_path = self.config.name_or_path
         revision = getattr(self.config, "revision", None)
         if revision:
@@ -97,6 +99,10 @@ class MobilintModelMixin(PretrainedOnlyMixin, PreTrainedModel):
         self.npu_backend.create()
         if not no_launch:
             self.launch()
+
+    def _resolve_npu_backend(self) -> MobilintNPUBackend:
+        """Return the backend this model runs on; the config's ``{npu_backend_prefix}npu_backend`` by default."""
+        return self.config.__getattribute__(self.npu_backend_prefix + "npu_backend")
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: Optional[Union[str, os.PathLike]], *model_args, **kwargs):
@@ -1752,3 +1758,207 @@ class MobilintEagle3ModelMixin(MobilintModelMixin):
     child backends so future LLM architectures can reuse the same EAGLE-3
     runtime contracts without inheriting from a Qwen2-specific class.
     """
+
+
+class MobilintMixtureOfExpertsModelMixin(MobilintModelMixin):
+    """Base Mobilint model mixin for Mixture-of-Experts releases.
+
+    Pairs with :class:`MobilintMixtureOfExpertsConfigMixin`. The model runs on a
+    :class:`MobilintMixtureOfExpertsNPUBackend` assembled from the config's ``shared_`` / ``expert_`` /
+    ``lm_head_`` role backends, and :meth:`moe_forward` replaces :meth:`MobilintModelMixin.llm_forward`: each
+    decoder layer runs its ``shared`` MXQ, routes every token to its top-k experts on the host
+    (softmax -> top-k -> optional renormalization, as in upstream Qwen3-MoE), runs the selected expert MXQs in
+    parallel across devices, and adds the weighted expert outputs to the residual.
+
+    Prefill runs ``npu_prefill_chunk_size`` tokens per shared MXQ call. A trailing partial chunk and every decode
+    step run one token at a time, which uses the preallocated seqlen=1 buffers. Only ``batch_size == 1`` is
+    supported.
+    """
+
+    config: MobilintMixtureOfExpertsConfigMixin
+    npu_backend: MobilintMixtureOfExpertsNPUBackend
+
+    def _resolve_npu_backend(self) -> MobilintMixtureOfExpertsNPUBackend:
+        config = self.config
+        num_layers = int(config.num_hidden_layers)
+        return MobilintMixtureOfExpertsNPUBackend(
+            shared_backend=config.shared_npu_backend,
+            expert_backend=config.expert_npu_backend,
+            lm_head_backend=config.lm_head_npu_backend,
+            num_layers=num_layers,
+            num_experts=int(config.num_experts),
+            num_experts_per_tok=int(config.num_experts_per_tok),
+            hidden_size=int(config.hidden_size),
+            vocab_size=int(config.vocab_size),
+            num_expert_workers=int(config.num_expert_workers),
+            shared_output_indices=[config.get_moe_shared_output_indices(layer_idx) for layer_idx in range(num_layers)],
+            name_or_path=config.name_or_path,
+            mxq_pack_index=config.moe_mxq_pack_index,
+        )
+
+    def get_mxq_model(self) -> None:
+        """MoE releases have no single cache MXQ; KV state lives in every ``shared`` MXQ."""
+        return None
+
+    def get_shared_mxq_models(self) -> list[qbruntime.Model]:
+        """Return the per-layer ``shared`` MXQ models that hold the KV cache."""
+        return [layer.shared for layer in self.npu_backend.layers]
+
+    def _mxq_static_vocab_size(self) -> int:
+        return int(self.config.vocab_size)
+
+    def _moe_route(self, gate_logits: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Return the top-k expert indices and routing weights for ``[..., num_experts]`` gate logits."""
+        top_k = int(self.config.num_experts_per_tok)
+        shifted = gate_logits - np.max(gate_logits, axis=-1, keepdims=True)
+        probs = np.exp(shifted)
+        probs /= np.sum(probs, axis=-1, keepdims=True)
+        experts = np.argpartition(probs, -top_k, axis=-1)[..., -top_k:]
+        weights = np.take_along_axis(probs, experts, axis=-1)
+        if getattr(self.config, "norm_topk_prob", True):
+            weights = weights / np.clip(weights.sum(axis=-1, keepdims=True), 1e-9, None)
+        return experts, weights
+
+    def _moe_forward_token(
+        self, hidden_states: np.ndarray, cache_size: int, need_logits: bool
+    ) -> tuple[Optional[np.ndarray], float]:
+        """Run one ``[1, 1, hidden]`` token through every layer; return ``(logits[vocab] | None, npu_seconds)``."""
+        backend = self.npu_backend
+        npu_seconds = 0.0
+        hidden = hidden_states
+        for layer_idx in range(backend.num_layers):
+            t0 = time.perf_counter()
+            residual, gate = backend.shared_forward_token(layer_idx, hidden, cache_size)
+            npu_seconds += time.perf_counter() - t0
+            experts, weights = self._moe_route(gate[0, 0])
+            weight_of = {int(expert): float(weight) for expert, weight in zip(experts, weights)}
+            t0 = time.perf_counter()
+            for expert_idx, output in backend.experts_forward_token(layer_idx, list(weight_of)):
+                residual[0, 0, :] += weight_of[expert_idx] * output
+            npu_seconds += time.perf_counter() - t0
+            hidden = residual
+        if not need_logits:
+            return None, npu_seconds
+        t0 = time.perf_counter()
+        logits = backend.lm_head_forward(hidden[0, 0])
+        npu_seconds += time.perf_counter() - t0
+        return logits, npu_seconds
+
+    def _moe_forward_chunk(
+        self, hidden_states: np.ndarray, cache_size: int, kept: Sequence[int]
+    ) -> tuple[dict[int, np.ndarray], float]:
+        """Run a ``[1, C, hidden]`` chunk through every layer.
+
+        Returns the logits of the chunk-local positions in ``kept`` and the NPU seconds spent. On a last-only
+        release only position ``C - 1`` survives the final layer, so ``kept`` must be a subset of ``{C - 1}``.
+        """
+        backend = self.npu_backend
+        chunk_size = int(hidden_states.shape[1])
+        npu_seconds = 0.0
+        hidden = hidden_states
+        for layer_idx in range(backend.num_layers):
+            if hidden.shape[1] != chunk_size:
+                raise RuntimeError(
+                    f"shared[{layer_idx}] needs a {chunk_size}-token input but the previous layer is last-only."
+                )
+            t0 = time.perf_counter()
+            residual, gate, expert_in = backend.shared_forward_chunk(layer_idx, hidden, cache_size)
+            npu_seconds += time.perf_counter() - t0
+            experts, weights = self._moe_route(gate[0])
+            routed: dict[int, list[tuple[int, float]]] = {}
+            for token_idx in range(experts.shape[0]):
+                for slot in range(experts.shape[1]):
+                    routed.setdefault(int(experts[token_idx, slot]), []).append(
+                        (token_idx, float(weights[token_idx, slot]))
+                    )
+            expert_inputs = {
+                expert_idx: expert_in[0, [token_idx for token_idx, _ in tokens], :]
+                for expert_idx, tokens in routed.items()
+            }
+            t0 = time.perf_counter()
+            for expert_idx, outputs in backend.experts_forward_chunk(layer_idx, expert_inputs):
+                for row, (token_idx, weight) in enumerate(routed[expert_idx]):
+                    residual[0, token_idx, :] += weight * outputs[row]
+            npu_seconds += time.perf_counter() - t0
+            hidden = residual
+
+        logits: dict[int, np.ndarray] = {}
+        out_len = int(hidden.shape[1])
+        for position in kept:
+            row = position if out_len == chunk_size else position - (chunk_size - 1)
+            if not 0 <= row < out_len:
+                raise RuntimeError(f"Chunk position {position} was dropped by a last-only layer.")
+            t0 = time.perf_counter()
+            logits[position] = backend.lm_head_forward(hidden[0, row])
+            npu_seconds += time.perf_counter() - t0
+        return logits, npu_seconds
+
+    def moe_forward(
+        self,
+        inputs_embeds: torch.Tensor,
+        past_key_values: Optional[MobilintMixtureOfExpertsCache],
+        cache_position: torch.Tensor,
+        npu_prefill_chunk_size: Optional[int] = None,
+        count_npu_time: bool = False,
+        logits_to_keep: Union[int, torch.Tensor] = 1,
+    ) -> torch.Tensor:
+        """Chunked MoE prefill / decode with HF-style ``logits_to_keep``; returns ``[1, kept, vocab]`` logits.
+
+        A chunk takes the batched path when it holds more than one token and, on a last-only release, keeps no
+        position other than its last one. Otherwise it runs one token at a time and only the kept positions pay for
+        the ``lm_head``.
+        """
+        if inputs_embeds.dim() != 3 or inputs_embeds.shape[0] != 1:
+            raise ValueError(
+                f"{type(self).__name__} supports only batch_size=1 inputs_embeds of shape [1, seq, hidden]; "
+                f"got {tuple(inputs_embeds.shape)}"
+            )
+        seq_len = int(inputs_embeds.shape[1])
+        chunk_size = self.resolve_npu_prefill_chunk_size(npu_prefill_chunk_size)
+        output_positions = self._output_positions_for_logits_to_keep(logits_to_keep, seq_len)
+        kept = set(output_positions)
+        last_only = any(layer.last_only for layer in self.npu_backend.layers)
+        past_seen = 0 if past_key_values is None else past_key_values.get_seq_length()
+        timing_phase: Literal["prefill", "decode"] = "prefill" if past_seen == 0 else "decode"
+        if past_key_values is not None:
+            self._active_moe_cache = past_key_values
+
+        embeds = inputs_embeds.detach().to(device="cpu", dtype=torch.float32).numpy()
+        logits_by_position: dict[int, np.ndarray] = {}
+        npu_seconds = 0.0
+        start = 0
+        while start < seq_len:
+            end = min(start + chunk_size, seq_len)
+            local_kept = sorted(position - start for position in kept if start <= position < end)
+            n_tokens = end - start
+            if n_tokens == chunk_size and n_tokens > 1 and not (
+                last_only and any(position != n_tokens - 1 for position in local_kept)
+            ):
+                chunk_logits, elapsed = self._moe_forward_chunk(embeds[:, start:end, :], past_seen + start, local_kept)
+                npu_seconds += elapsed
+                for position, logits in chunk_logits.items():
+                    logits_by_position[start + position] = logits
+            else:
+                if last_only and n_tokens > 1 and len(local_kept) > 1:
+                    self._warn_last_only_slow_path_once()
+                for position in range(start, end):
+                    logits, elapsed = self._moe_forward_token(
+                        embeds[:, position : position + 1, :], past_seen + position, position in kept
+                    )
+                    npu_seconds += elapsed
+                    if logits is not None:
+                        logits_by_position[position] = logits
+            start = end
+
+        if past_key_values is not None:
+            past_key_values.update_cache_position(cache_position)
+        if count_npu_time:
+            self.npu_time = npu_seconds
+            self._record_npu_timing(timing_phase, npu_seconds)
+        else:
+            self.npu_time = None
+
+        if not output_positions:
+            return self._empty_kept_logits(1, inputs_embeds.dtype, inputs_embeds.device)
+        stacked = np.stack([logits_by_position[position] for position in output_positions])
+        return torch.from_numpy(stacked).unsqueeze(0).to(device=inputs_embeds.device)
