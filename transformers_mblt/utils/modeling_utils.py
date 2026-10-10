@@ -857,7 +857,7 @@ class MobilintModelMixin(PretrainedOnlyMixin, PreTrainedModel):
         if not getattr(backend, "mxq_models", None):
             return
         if past_key_values is None:
-            bind_cacheless(backend, [(backend.mxq_models[0], 0)])
+            bind_cacheless([(backend.mxq_models[0], 0)])
             return
         if not _is_bindable_cache(past_key_values):
             return
@@ -1838,9 +1838,9 @@ class MobilintMixtureOfExpertsModelMixin(MobilintModelMixin):
         if not shared_models or any(model is None for model in shared_models):
             return  # a backend double without shared MXQ handles
         if past_key_values is None:
-            bind_cacheless(backend, [(model, 0) for model in shared_models])
+            bind_cacheless([(model, 0) for model in shared_models])
             return
-        past_key_values.bind_shared(shared_models, backend)
+        past_key_values.bind_shared(shared_models)
 
     def get_shared_mxq_models(self) -> list[qbruntime.Model]:
         """Return the per-layer ``shared`` MXQ models that hold the KV cache."""

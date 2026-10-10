@@ -916,25 +916,19 @@ class MobilintMixtureOfExpertsNPUBackend:
         self._host_lm_head_out = None
 
     @property
-    def kv_slot_models(self) -> list[Model]:
-        """The shared MXQs, which hold the KV; the owner table of portable caches tracks their slots."""
-        return [layer.shared for layer in self.layers]
-
-    @property
     def kv_owner(self) -> Any:
         """The :class:`MobilintMixtureOfExpertsCache` whose sequence every shared MXQ holds, else ``None``.
 
         Read-only: binding a cache before each forward (see :mod:`transformers_mblt.utils.cache_residency`) decides
         what the shared MXQs hold.
         """
-        from .cache_residency import residency_of
+        from .cache_residency import owner
 
         if not self.layers:
             return None
-        residency = residency_of(self)
         owners = set()
         for layer in self.layers:
-            owner_layer = residency.owner(layer.shared, 0)
+            owner_layer = owner(layer.shared, 0)
             cache_ref = getattr(owner_layer, "_owner_cache", None)
             cache = cache_ref() if cache_ref is not None else None
             if cache is None:

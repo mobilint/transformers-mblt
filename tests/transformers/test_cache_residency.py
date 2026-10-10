@@ -7,7 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from transformers_mblt.utils.cache_residency import MobilintCacheStateError, residency_of
+from transformers_mblt.utils import cache_residency
+from transformers_mblt.utils.cache_residency import MobilintCacheStateError
 from transformers_mblt.utils.cache_utils import MobilintCache
 
 
@@ -50,6 +51,14 @@ class _Backend:
     def __init__(self, n: int = 1, k: int = 1, signature: str = "llama-w8") -> None:
         self.mxq_models = [_SlotMxq(k, signature) for _ in range(n)]
         self.k_per_model = k
+
+
+def _dispose(backend: _Backend, *, recreate: bool = False) -> None:
+    """Like the NPU backend's dispose(): every Model is disposed (qbruntime drops ``_acc``) and its KV is gone."""
+    for mxq in backend.mxq_models:
+        mxq._acc = None
+        mxq.dump_cache_memory = lambda cache_id=0: (_ for _ in ()).throw(AssertionError("dumped a disposed Model"))
+    backend.mxq_models = [_SlotMxq() for _ in backend.mxq_models] if recreate else []
 
 
 def _run(cache: MobilintCache, backend: _Backend, row: int, text: str) -> None:
@@ -104,10 +113,10 @@ def test_cacheless_forward_saves_the_owner_and_leaves_the_slot_unowned() -> None
     a = MobilintCache(backend.mxq_models)
     _run(a, backend, 0, "aaa")
 
-    bind_cacheless(backend, [(backend.mxq_models[0], 0)])
+    bind_cacheless([(backend.mxq_models[0], 0)])
     backend.mxq_models[0].write(0, "scratch")
 
-    assert residency_of(backend).owner(backend.mxq_models[0], 0) is None
+    assert cache_residency.owner(backend.mxq_models[0], 0) is None
     _run(a, backend, 0, "A")
     assert _slot(backend) == "aaaA"
 
@@ -232,7 +241,7 @@ def test_cache_moves_between_model_instances() -> None:
     assert instance_a.mxq_models[0].calls == [("dump", 0)]
     assert instance_b.mxq_models[0].calls == [("load", 0)]
     assert _slot(instance_b) == "hello!"
-    assert residency_of(instance_a).owner(instance_a.mxq_models[0], 0) is None
+    assert cache_residency.owner(instance_a.mxq_models[0], 0) is None
     assert cache.mxq_models == instance_b.mxq_models
 
     _run(cache, instance_a, 0, "?")  # and back
@@ -264,7 +273,7 @@ def test_disposed_backend_drops_unsaved_kv_and_says_so() -> None:
     cache = MobilintCache(backend.mxq_models)
     _run(cache, backend, 0, "hello")
 
-    backend.mxq_models = [_SlotMxq()]  # dispose + create: new handles, old KV memory gone
+    _dispose(backend, recreate=True)  # dispose + create: new handles, old KV memory gone
 
     with pytest.raises(MobilintCacheStateError, match="dump_cache_memory"):
         _run(cache, backend, 0, "!")
@@ -276,7 +285,7 @@ def test_disposed_backend_restores_kv_saved_before_dispose() -> None:
     _run(cache, backend, 0, "hello")
     cache.dump_cache_memory()
 
-    backend.mxq_models = [_SlotMxq()]
+    _dispose(backend, recreate=True)
     _run(cache, backend, 0, "!")
 
     assert _slot(backend) == "hello!"
@@ -486,9 +495,7 @@ def test_moving_off_a_disposed_backend_reports_lost_kv_without_touching_dead_mod
     target = _Backend()
     cache = MobilintCache(source.mxq_models)
     _run(cache, source, 0, "hello")
-    dead = source.mxq_models[0]
-    dead.dump_cache_memory = lambda cache_id=0: (_ for _ in ()).throw(AssertionError("dumped a disposed Model"))
-    source.mxq_models = []  # dispose
+    _dispose(source)
 
     with pytest.raises(MobilintCacheStateError, match="dump_cache_memory"):
         _run(cache, target, 0, "!")
@@ -500,7 +507,7 @@ def test_moving_off_a_disposed_backend_uses_kv_saved_before_dispose() -> None:
     cache = MobilintCache(source.mxq_models)
     _run(cache, source, 0, "hello")
     cache.dump_cache_memory()
-    source.mxq_models = []
+    _dispose(source)
 
     _run(cache, target, 0, "!")
 
@@ -558,9 +565,7 @@ def test_snapshots_after_dispose_never_touch_the_dead_model() -> None:
     _run(saved, backend, 0, "kept")
     saved.dump_cache_memory()
     _run(lost, backend, 0, "gone")  # saved is evicted (dumped), lost is resident
-    dead = backend.mxq_models[0]
-    dead.dump_cache_memory = lambda cache_id=0: (_ for _ in ()).throw(AssertionError("dumped a disposed Model"))
-    backend.mxq_models = []  # dispose
+    _dispose(backend)
 
     assert not lost.is_resident
     copied = saved.copy()  # uses the host copy
@@ -665,14 +670,6 @@ def test_cache_restored_before_any_forward_moves_to_another_instance(tmp_path) -
 
     assert _slot(target) == "saved!"
     assert source.mxq_models[0].calls == [("dump", 0)]
-
-
-def _dispose(backend: _Backend) -> None:
-    """Like qbruntime Model.dispose(): the accelerator is dropped and the KV memory is gone."""
-    for mxq in backend.mxq_models:
-        mxq._acc = None
-        mxq.dump_cache_memory = lambda cache_id=0: (_ for _ in ()).throw(AssertionError("dumped a disposed Model"))
-    backend.mxq_models = []
 
 
 def test_restored_cache_on_a_disposed_backend_uses_its_host_snapshot_or_reports_lost_kv(tmp_path) -> None:
