@@ -578,3 +578,19 @@ def test_cache_with_slots_matching_the_default_layout_still_refuses_to_grow() ->
         cache.ensure_batch_size(2)
     with pytest.raises(ValueError, match="chosen slots"):
         cache.copy().ensure_batch_size(2)
+
+
+def test_explicit_load_on_a_never_bound_cache_saves_the_slot_owner_first() -> None:
+    backend = _Backend()
+    a = MobilintCache(backend.mxq_models)
+    _run(a, backend, 0, "aaa")  # A is resident; the backend's owner table now knows the Model
+
+    restored = MobilintCache(backend.mxq_models)  # never bound, e.g. rebuilt from a saved snapshot
+    restored.layers[0].buffer = [b"ccc"]
+    restored.layers[0].buffer_seq_length = 3
+    restored.load_cache_memory()
+
+    assert _slot(backend) == "ccc"
+    assert restored.is_resident and not a.is_resident
+    _run(a, backend, 0, "!")  # A was saved before the load overwrote the slot
+    assert _slot(backend) == "aaa!"

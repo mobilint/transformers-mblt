@@ -15,9 +15,24 @@
 - `MobilintCache(..., slots=[(model_idx, cache_id), ...])` places rows on chosen NPU slots, so a serving engine can
   keep one cache per request on the slot it assigned. `MobilintCache.offload()`, `is_resident` and `host_nbytes`
   expose residency, and `copy()` is a snapshot that a resident cache saves before copying.
+- Portable caches, part 2 (Mixture-of-Experts). `moe_forward` binds all shared-MXQ layers of a
+  `MobilintMixtureOfExpertsCache` before it runs, so a MoE cache displaced by another cache or by a forward without a
+  cache is restored and continues instead of being reset and prefilled again. A MoE cache also moves to another
+  instance of the same release, and gains `offload()`, `is_resident` and `host_nbytes`. Binding all 48 layers of
+  Qwen3-30B-A3B when the cache is already resident costs about 0.05 ms per forward.
+
+### Changed
+
+- `MobilintMixtureOfExpertsNPUBackend.kv_owner` is now read-only and derived from the owner table: the cache whose
+  sequence every shared MXQ holds, else `None`. A forward that fails partway now leaves the cache on its slots
+  (writes start at the cache position, so its KV prefix is intact) instead of clearing the owner, and
+  `MobilintMixtureOfExpertsCache(owner=...)` is accepted but unused.
 
 ### Fixed
 
+- An explicit `load_cache_memory()` / `load_cache_memory_from()` on a cache that had never been bound wrote the NPU
+  slot without telling the owner table, which could later save the overwritten slot as the previous owner's KV. Such
+  loads now go through the owner table of the backend that runs the Model.
 - Reusing a dense-LLM cache after another cache, or a forward without a cache, had run on the same model no longer
   reads the other sequence's KV. Before, `generate(past_key_values=cache)` continued from the stale NPU state and
   produced wrong output silently.

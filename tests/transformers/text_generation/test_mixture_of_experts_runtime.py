@@ -19,6 +19,7 @@ from transformers_mblt.models.qwen3_moe.configuration_qwen3_moe import MobilintQ
 from transformers_mblt.utils import moe_utils
 from transformers_mblt.utils.cache_utils import MobilintMixtureOfExpertsCache
 from transformers_mblt.utils.generation_utils import MobilintMixtureOfExpertsGenerationMixin
+from transformers_mblt.utils.modeling_utils import MobilintMixtureOfExpertsModelMixin
 from transformers_mblt.utils.moe_utils import (
     MobilintMixtureOfExpertsNPUBackend,
     MobilintMixtureOfExpertsPackIndex,
@@ -306,60 +307,145 @@ def test_chunk_buffers_keep_only_recent_sizes(fake_runtime, tmp_path: Path) -> N
 # ---- KV ownership ---------------------------------------------------------------------------------------------
 
 
+class _SharedMxq:
+    """A shared MXQ double whose single KV slot holds a string."""
+
+    def __init__(self) -> None:
+        self.kv = ""
+        self.calls: list[str] = []
+
+    def dump_cache_memory(self, cache_id: int = 0) -> list[bytes]:
+        self.calls.append("dump")
+        return [self.kv.encode()]
+
+    def load_cache_memory(self, buffer: list[bytes], cache_id: int = 0) -> None:
+        self.calls.append("load")
+        self.kv = buffer[0].decode()
+
+
+class _SlotBackend:
+    """Backend double with real shared-MXQ slots; borrows kv_slot_models/kv_owner from the NPU backend."""
+
+    kv_slot_models = moe_utils.MobilintMixtureOfExpertsNPUBackend.kv_slot_models
+    kv_owner = moe_utils.MobilintMixtureOfExpertsNPUBackend.kv_owner
+
+    def __init__(self, num_shared: int) -> None:
+        self.layers = [type("Layer", (), {"shared": _SharedMxq(), "last_only": False})() for _ in range(num_shared)]
+
+
 class _Generator:
     _require_single_batch = staticmethod(MobilintMixtureOfExpertsGenerationMixin._require_single_batch)
     _prepare_cache_for_generation = MobilintMixtureOfExpertsGenerationMixin._prepare_cache_for_generation
     _cache_matches_backend = MobilintMixtureOfExpertsGenerationMixin._cache_matches_backend
     _get_cache = MobilintMixtureOfExpertsGenerationMixin._get_cache
     _new_moe_cache = MobilintMixtureOfExpertsGenerationMixin._new_moe_cache
+    _bind_moe_cache = MobilintMixtureOfExpertsModelMixin._bind_moe_cache
 
-    def __init__(self, num_shared: int = 1) -> None:
-        self.npu_backend = type("Backend", (), {"kv_owner": None})()
-        self.shared = [object() for _ in range(num_shared)]
+    def __init__(self, num_shared: int = 2) -> None:
+        self.npu_backend = _SlotBackend(num_shared)
 
     def get_shared_mxq_models(self) -> list:
-        return self.shared
+        return self.npu_backend.kv_slot_models
+
+    def run(self, cache, text: str) -> None:
+        """Stand-in for one forward: bind, write every shared slot from the cache position, advance."""
+        self._bind_moe_cache(cache)
+        start = 0 if cache is None else cache.get_seq_length()
+        for model in self.get_shared_mxq_models():
+            model.kv = model.kv[:start] + text
+        if cache is not None:
+            cache.update_seen_tokens(len(text))
 
 
-def test_generate_resets_a_cache_whose_kv_was_overwritten_by_a_cacheless_forward() -> None:
+def test_cache_displaced_by_a_cacheless_forward_resumes_instead_of_reset() -> None:
     generator = _Generator()
-    cache = MobilintMixtureOfExpertsCache(generator.shared, owner=generator.npu_backend)
-    cache.set_seq_length(12)
-    generator.npu_backend.kv_owner = cache
+    cache = generator._new_moe_cache()
+    generator.run(cache, "prompt")
+    generator.run(None, "scratch")  # a forward without a cache saves the cache and overwrites the slots
+    assert generator.npu_backend.kv_owner is None
 
-    generator.npu_backend.kv_owner = None  # what moe_forward records for a forward without past_key_values
     model_kwargs = {"past_key_values": cache}
     generator._prepare_cache_for_generation(None, model_kwargs, None, 1, 0)
+    assert model_kwargs["past_key_values"] is cache and cache.get_seq_length() == 6
 
-    assert cache.get_seq_length() == 0
+    generator.run(cache, "!")
+    assert [model.kv for model in generator.get_shared_mxq_models()] == ["prompt!", "prompt!"]
     assert generator.npu_backend.kv_owner is cache
 
 
-def test_restored_kv_is_reused_instead_of_reset() -> None:
+def test_two_caches_alternate_on_the_shared_mxqs() -> None:
     generator = _Generator()
-    cache = MobilintMixtureOfExpertsCache(generator.shared, owner=generator.npu_backend)
-    generator.npu_backend.kv_owner = object()  # another sequence ran on the NPU
+    a, b = generator._new_moe_cache(), generator._new_moe_cache()
+    generator.run(a, "aaa")
+    generator.run(b, "bb")
+    generator.run(a, "A")
+    assert [model.kv for model in generator.get_shared_mxq_models()] == ["aaaA", "aaaA"]
+    generator.run(b, "B")
+    assert [model.kv for model in generator.get_shared_mxq_models()] == ["bbB", "bbB"]
+    assert generator.npu_backend.kv_owner is b
 
-    cache.load_cache_memory()  # nothing dumped; restoring still claims the NPU KV
-    cache.set_seq_length(7)
-    generator._prepare_cache_for_generation(None, {"past_key_values": cache}, None, 1, 0)
 
-    assert cache.get_seq_length() == 7
-    assert cache.copy().owner is generator.npu_backend
-
-
-def test_fake_prefilled_cache_is_decoded_on_instead_of_reset() -> None:
-    generator = _Generator(num_shared=2)
-    cache = MobilintMixtureOfExpertsCache(generator.shared, owner=generator.npu_backend)
-    generator.npu_backend.kv_owner = object()  # some earlier sequence
-
+def test_fake_prefilled_cache_is_never_dumped_or_loaded() -> None:
+    generator = _Generator()
+    other = generator._new_moe_cache()
+    generator.run(other, "real")
+    cache = generator._new_moe_cache()
     cache.fake_prefill(512)
-    generator._prepare_cache_for_generation(None, {"past_key_values": cache}, None, 1, 0)
 
-    assert cache.get_seq_length() == 512
-    assert [layer.get_seq_length() for layer in cache.shared_layers] == [512, 512]
+    generator.run(cache, "t")
+
+    assert cache.get_seq_length() == 513
+    assert [layer.get_seq_length() for layer in cache.shared_layers] == [513, 513]
+    assert all(model.calls == ["dump"] for model in generator.get_shared_mxq_models())  # only `other` was saved
     assert generator.npu_backend.kv_owner is cache
 
+
+def test_cache_from_another_instance_moves_and_a_different_release_is_replaced() -> None:
+    source, target = _Generator(), _Generator()
+    cache = source._new_moe_cache()
+    source.run(cache, "hello")
+
+    model_kwargs = {"past_key_values": cache}
+    target._prepare_cache_for_generation(None, model_kwargs, None, 1, 0)
+    assert model_kwargs["past_key_values"] is cache
+    target.run(cache, "!")
+    assert [model.kv for model in target.get_shared_mxq_models()] == ["hello!", "hello!"]
+    assert source.npu_backend.kv_owner is None and target.npu_backend.kv_owner is cache
+
+    other_release = _Generator(num_shared=3)
+    model_kwargs = {"past_key_values": cache}
+    other_release._prepare_cache_for_generation(None, model_kwargs, None, 1, 0)
+    assert model_kwargs["past_key_values"] is not cache
+
+
+def test_a_failed_forward_keeps_the_cache_on_its_slots(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tests.transformers.text_generation.test_mixture_of_experts import _FakeMoEBackend, _harness, _small_config
+
+    config = _small_config()
+    backend = _FakeMoEBackend(
+        config.num_hidden_layers, config.hidden_size, config.num_experts, config.vocab_size, False
+    )
+    for layer in backend.layers:
+        layer.shared = _SharedMxq()
+    backend.kv_slot_models = [layer.shared for layer in backend.layers]
+    model = _harness(config, backend)
+    cache = MobilintMixtureOfExpertsCache(backend.kv_slot_models)
+    model.moe_forward(torch.zeros((1, 2, config.hidden_size)), cache, torch.arange(2))
+    original = backend.shared_forward_token
+
+    def fail_on_second_layer(layer_idx, *args):
+        if layer_idx == 1:
+            raise RuntimeError("NPU fault")
+        return original(layer_idx, *args)
+
+    monkeypatch.setattr(backend, "shared_forward_token", fail_on_second_layer)
+    with pytest.raises(RuntimeError, match="NPU fault"):
+        model.moe_forward(torch.zeros((1, 1, config.hidden_size)), cache, torch.arange(2, 3))
+
+    # Writes start at the cursor, so the 2-token prefix is intact: the cache keeps its slots and its length.
+    assert cache.get_seq_length() == 2
+    assert cache.is_resident
+    assert all(model.calls == [] for model in backend.kv_slot_models)
 
 def test_benchmark_fake_prefill_uses_the_model_cache_builder() -> None:
     from transformers_mblt.utils import benchmark_utils
@@ -400,44 +486,6 @@ def test_npu_clock_counts_overlapping_calls_once(monkeypatch: pytest.MonkeyPatch
 
     assert clock.pop_seconds() == pytest.approx(2.5)
     assert clock.pop_seconds() == 0.0  # popping clears the recorded calls
-
-
-def test_generate_replaces_a_cache_built_for_other_shared_models() -> None:
-    generator = _Generator()
-    foreign = MobilintMixtureOfExpertsCache([object()], owner=generator.npu_backend)  # e.g. an earlier launch
-    foreign.set_seq_length(8)
-    generator.npu_backend.kv_owner = foreign
-    model_kwargs = {"past_key_values": foreign}
-
-    generator._prepare_cache_for_generation(None, model_kwargs, None, 1, 0)
-
-    replacement = model_kwargs["past_key_values"]
-    assert replacement is not foreign and replacement.shared_mxq_models == generator.shared
-    assert replacement.get_seq_length() == 0 and generator.npu_backend.kv_owner is replacement
-
-
-def test_a_failed_forward_leaves_no_kv_owner(monkeypatch: pytest.MonkeyPatch) -> None:
-    from tests.transformers.text_generation.test_mixture_of_experts import _FakeMoEBackend, _harness, _small_config
-
-    config = _small_config()
-    backend = _FakeMoEBackend(
-        config.num_hidden_layers, config.hidden_size, config.num_experts, config.vocab_size, False
-    )
-    model = _harness(config, backend)
-    cache = MobilintMixtureOfExpertsCache([object()] * config.num_hidden_layers, owner=backend)
-    backend.kv_owner = cache
-    original = backend.shared_forward_token
-
-    def fail_on_second_layer(layer_idx, *args):
-        if layer_idx == 1:
-            raise RuntimeError("NPU fault")
-        return original(layer_idx, *args)
-
-    monkeypatch.setattr(backend, "shared_forward_token", fail_on_second_layer)
-    with pytest.raises(RuntimeError, match="NPU fault"):
-        model.moe_forward(torch.zeros((1, 1, config.hidden_size)), cache, torch.arange(1))
-    # Layer 0 already advanced on the NPU, so the cache must not look like the owner of a consistent sequence.
-    assert backend.kv_owner is None
 
 
 def test_failed_packed_load_deletes_materialized_files_held_by_failed_models(

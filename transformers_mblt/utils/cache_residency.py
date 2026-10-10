@@ -36,6 +36,9 @@ logger = logging.getLogger(__name__)
 
 _RESIDENCY_ATTR = "_mblt_kv_residency"
 _SIGNATURES: "weakref.WeakKeyDictionary[Any, Optional[tuple]]" = weakref.WeakKeyDictionary()
+# Every live Model a residency has seen -> that residency, so an explicit load on a cache that was never bound still
+# goes through the owner table of the backend that runs the Model.
+_MODEL_RESIDENCY: "weakref.WeakKeyDictionary[Any, weakref.ref[MobilintKVResidency]]" = weakref.WeakKeyDictionary()
 
 
 class MobilintCacheStateError(RuntimeError):
@@ -94,6 +97,7 @@ class MobilintKVResidency:
     def __init__(self, backend: Any = None) -> None:
         self._owners: dict[tuple[int, int], tuple["weakref.ref[Any]", int, "weakref.ref[MobilintLayer]"]] = {}
         self._backend_ref: Optional[Any] = None
+        self._live_ids: Optional[set[int]] = None  # ids of the backend's live Models at the last refresh
         if backend is not None:
             try:
                 self._backend_ref = weakref.ref(backend)
@@ -105,9 +109,17 @@ class MobilintKVResidency:
         if self._backend_ref is None:
             return
         backend = self._backend_ref()
-        live_models = getattr(backend, "mxq_models", None) if backend is not None else []
-        if live_models is not None:
-            self.forget_stale_models(live_models)
+        live_models = kv_slot_models(backend) if backend is not None else []
+        if live_models is None:
+            return
+        self.forget_stale_models(live_models)
+        self._live_ids = {id(model) for model in live_models}
+        for model in live_models:
+            try:
+                if _MODEL_RESIDENCY.get(model) is None or _MODEL_RESIDENCY[model]() is not self:
+                    _MODEL_RESIDENCY[model] = weakref.ref(self)
+            except TypeError:  # Models without __weakref__ (test doubles)
+                pass
 
     # ------------------------------------------------------------------
     # Owner table
@@ -191,7 +203,7 @@ class MobilintKVResidency:
         """
         cache_id = int(cache_id)
         same_slot = layer.mxq_model is mxq_model and int(layer.cache_id) == cache_id
-        if same_slot and self.is_resident(layer):
+        if same_slot and self.owner(mxq_model, cache_id) is layer:  # callers refreshed already
             if reload:
                 layer._load_into_slot()
             return
@@ -211,6 +223,33 @@ class MobilintKVResidency:
     def release_slot(self, mxq_model: Any, cache_id: int) -> None:
         """Hand a slot to a forward that runs without a cache: save the owner, leave the slot unowned."""
         self.evict(mxq_model, cache_id)
+
+
+def kv_slot_models(backend: Any) -> Optional[list[Any]]:
+    """Return the backend's live Models that hold KV, or ``None`` when the backend does not say.
+
+    A backend lists them as ``kv_slot_models`` (the MoE backend: one shared MXQ per layer) or, for the regular
+    backend, as ``mxq_models``.
+    """
+    models = getattr(backend, "kv_slot_models", None)
+    if models is None:
+        models = getattr(backend, "mxq_models", None)
+    return None if models is None else list(models)
+
+
+def residency_for_model(mxq_model: Any) -> Optional[MobilintKVResidency]:
+    """Return the owner table of the backend running ``mxq_model``, if a model has bound a cache on it."""
+    try:
+        ref = _MODEL_RESIDENCY.get(mxq_model)
+    except TypeError:
+        return None
+    residency = ref() if ref is not None else None
+    if residency is None:
+        return None
+    residency.refresh()
+    if residency._live_ids is not None and id(mxq_model) not in residency._live_ids:
+        return None  # the Model belongs to a disposed launch
+    return residency
 
 
 def residency_of(backend: Any) -> MobilintKVResidency:
@@ -242,6 +281,8 @@ __all__ = [
     "MobilintKVResidency",
     "bind_cache_layers",
     "bind_cacheless",
+    "kv_slot_models",
     "mxq_kv_signature",
+    "residency_for_model",
     "residency_of",
 ]

@@ -535,7 +535,6 @@ class MobilintMixtureOfExpertsNPUBackend:
         self._expert_pool: Optional[ThreadPoolExecutor] = None
         self._chunk_buffers: OrderedDict[int, _ChunkBuffers] = OrderedDict()
         # The cache whose sequence currently lives in the shared MXQs' KV state (``None`` after a cache-less forward).
-        self.kv_owner: Any = None
         self._exit_hook: Optional[Callable[[], None]] = None
         self.npu_clock = _NpuClock()
         self._expert_out_pool: dict[int, list[Any]] = {}
@@ -915,7 +914,33 @@ class MobilintMixtureOfExpertsNPUBackend:
         self._host_expert_out_pool = {}
         self._host_lm_head_in = None
         self._host_lm_head_out = None
-        self.kv_owner = None
+
+    @property
+    def kv_slot_models(self) -> list[Model]:
+        """The shared MXQs, which hold the KV; the owner table of portable caches tracks their slots."""
+        return [layer.shared for layer in self.layers]
+
+    @property
+    def kv_owner(self) -> Any:
+        """The :class:`MobilintMixtureOfExpertsCache` whose sequence every shared MXQ holds, else ``None``.
+
+        Read-only: binding a cache before each forward (see :mod:`transformers_mblt.utils.cache_residency`) decides
+        what the shared MXQs hold.
+        """
+        from .cache_residency import residency_of
+
+        if not self.layers:
+            return None
+        residency = residency_of(self)
+        owners = set()
+        for layer in self.layers:
+            owner_layer = residency.owner(layer.shared, 0)
+            cache_ref = getattr(owner_layer, "_owner_cache", None)
+            cache = cache_ref() if cache_ref is not None else None
+            if cache is None:
+                return None
+            owners.add(id(cache))
+        return cache if len(owners) == 1 else None
 
     def _register_exit_hook(self) -> None:
         """Release the NPU buffers at interpreter exit when :meth:`dispose` was never called.
