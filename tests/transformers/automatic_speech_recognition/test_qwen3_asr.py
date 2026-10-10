@@ -1,7 +1,7 @@
 import pytest
-from datasets import load_dataset
 from transformers import pipeline
 
+from tests.asr_samples import load_librispeech_dummy
 from tests.pipe_teardown import pipe_fixture
 
 MODEL_PATHS = ("mobilint/Qwen3-ASR-1.7B",)
@@ -41,10 +41,10 @@ def test_via_huggingface_pipeline(pipe):
     """
     pipe.generation_config.max_new_tokens = 256
 
-    ds = load_dataset("hf-internal-testing/librispeech_asr_dummy", "clean", split="validation")
+    samples = load_librispeech_dummy(5)
 
     for i in range(5):
-        sample = ds[i]["audio"]  # type: ignore
+        sample = samples[i]["audio"]
 
         output = pipe(
             sample,
@@ -54,18 +54,17 @@ def test_via_huggingface_pipeline(pipe):
         )
 
         print("Result: %s" % output["text"])
-        print("Answer: %s" % ds[i]["text"])  # type: ignore
+        print("Answer: %s" % samples[i]["text"])
 
 
 def test_via_huggingface_pipeline_beam_search(pipe):
     """Run Qwen3-ASR HF pipeline inference with beam search enabled."""
     pipe.generation_config.max_new_tokens = 256
 
-    ds = load_dataset("hf-internal-testing/librispeech_asr_dummy", "clean", split="validation")
-    sample = ds[0]["audio"]  # type: ignore
+    first = load_librispeech_dummy(1)[0]
 
     output = pipe(
-        sample,
+        first["audio"],
         generate_kwargs={
             "num_beams": 2,
             "early_stopping": True,
@@ -74,7 +73,7 @@ def test_via_huggingface_pipeline_beam_search(pipe):
 
     assert isinstance(output["text"], str)
     print("Beam Result: %s" % output["text"])
-    print("Answer: %s" % ds[0]["text"])  # type: ignore
+    print("Answer: %s" % first["text"])
 
 
 @pytest.fixture(params=MODEL_PATHS, scope="module")
@@ -109,10 +108,10 @@ def test_via_qwen_asr_transcribe(transcriber):
     이 path 를 건너뛰려면 본 함수와 위쪽 ``transcriber`` fixture 를 함께
     주석 처리.
     """
-    ds = load_dataset("hf-internal-testing/librispeech_asr_dummy", "clean", split="validation")
+    samples = load_librispeech_dummy(5)
 
     for i in range(5):
-        sample = ds[i]["audio"]  # type: ignore
+        sample = samples[i]["audio"]
 
         results = transcriber.transcribe(
             audio=(sample["array"], sample["sampling_rate"]),
@@ -120,4 +119,4 @@ def test_via_qwen_asr_transcribe(transcriber):
         )
 
         print("Result: %s (lang=%s)" % (results[0].text, results[0].language))
-        print("Answer: %s" % ds[i]["text"])  # type: ignore
+        print("Answer: %s" % samples[i]["text"])

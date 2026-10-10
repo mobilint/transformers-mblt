@@ -1,6 +1,6 @@
-from datasets import load_dataset
 from transformers import pipeline
 
+from tests.asr_samples import load_librispeech_dummy
 from tests.pipe_teardown import pipe_fixture
 
 MODEL_PATHS = (
@@ -26,10 +26,10 @@ def pipe(request, revision, encoder_decoder_npu_params):
 def test_whisper(pipe):
     pipe.generation_config.max_new_tokens = None
 
-    ds = load_dataset("hf-internal-testing/librispeech_asr_dummy", "clean", split="validation")
+    samples = load_librispeech_dummy(5)
 
     for i in range(5):
-        sample = ds[i]["audio"]  # type: ignore
+        sample = samples[i]["audio"]
 
         output = pipe(
             sample,
@@ -37,4 +37,4 @@ def test_whisper(pipe):
         )
 
         print("Result: %s" % output["text"])
-        print("Answer: %s" % ds[i]["text"])  # type: ignore
+        print("Answer: %s" % samples[i]["text"])

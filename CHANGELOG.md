@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- `datasets` moved from the runtime dependencies to the `dev` dependency group and is raised to `>=5.0.1`, which fixes
+  the folder-based builder path traversal (GHSA-379c-qx7v-6h59). The package itself never imports `datasets`; only
+  the ASR tests, the ASR benchmark, and `scripts/debug_whisper_beam_trace.py` load LibriSpeech with it.
+- The ASR tests and `scripts/debug_whisper_beam_trace.py` read audio with `Audio(decode=False)` and decode it with
+  soundfile, like the ASR benchmark already did. `datasets` 4.0 and later decode `Audio` columns through torchcodec,
+  which needs a matching system FFmpeg.
+
 ## 0.1.1
 
 ### Fixed
