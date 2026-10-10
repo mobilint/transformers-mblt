@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import weakref
 from pathlib import Path
 from typing import Any
 
@@ -68,24 +69,39 @@ class FakeModel:
     def get_input_scale(self):
         return [_Scale(4.0)]
 
-    def _acquire(self, *args: Any) -> object:
+    def _acquire(self, *args: Any) -> "_Buffer":
         FakeModel.acquired += 1
         if FakeModel.fail_acquire_after is not None and FakeModel.acquired > FakeModel.fail_acquire_after:
             raise qbruntime.QbRuntimeError("Model_BadAlloc occurred.")
-        return object()
+        buffer = _Buffer()
+        LIVE_BUFFERS.add(buffer)
+        return buffer
 
     acquire_input_npu_data = _acquire
     acquire_output_npu_data = _acquire
+
+
+class _Buffer:
+    """Stand-in for ``NPUData``; weakly tracked so tests can see which buffers outlive their accelerator."""
+
+
+LIVE_BUFFERS: "weakref.WeakSet[_Buffer]" = weakref.WeakSet()
+# Live buffer count observed each time a FakeAccelerator is destroyed (qbruntime warns when it is non-zero).
+BUFFERS_AT_ACCELERATOR_DESTRUCTION: list[int] = []
 
 
 class FakeAccelerator:
     def __init__(self, *args: Any) -> None:
         pass
 
+    def __del__(self) -> None:
+        BUFFERS_AT_ACCELERATOR_DESTRUCTION.append(len(LIVE_BUFFERS))
+
 
 @pytest.fixture()
 def fake_runtime(monkeypatch: pytest.MonkeyPatch):
     FakeModel.created = []
+    BUFFERS_AT_ACCELERATOR_DESTRUCTION.clear()
     FakeModel.fail_acquire_after = None
     FakeModel.acquired = 0
     monkeypatch.setattr(moe_utils, "Model", FakeModel)
@@ -157,6 +173,8 @@ def test_launch_detects_output_order_and_disposes_everything(fake_runtime, tmp_p
     backend.dispose()
     assert all(model.disposed for model in fake_runtime.created)
     assert backend.layers == [] and backend.accs == {}
+    # Every buffer is released before its accelerator goes away (qbruntime warns otherwise).
+    assert BUFFERS_AT_ACCELERATOR_DESTRUCTION == [0, 0]
 
 
 def test_buffer_bad_alloc_after_load_rolls_back_and_raises_alloc_error(fake_runtime, tmp_path: Path) -> None:

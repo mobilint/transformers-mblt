@@ -845,10 +845,9 @@ class MobilintMixtureOfExpertsNPUBackend:
 
     def dispose(self) -> None:
         """Release every model and accelerator handle held by this backend. Safe to call multiple times."""
-        models: list[Model] = []
-        for layer in self.layers:
-            models.append(layer.shared)
-            models.extend(layer.experts)
+        # A comprehension keeps no loop variable alive: a ``for layer in self.layers`` loop here would pin the last
+        # layer (and its NPU buffers) in this frame until the accelerators below are destroyed.
+        models: list[Model] = [model for layer in self.layers for model in (layer.shared, *layer.experts)]
         if self.lm_head is not None:
             models.append(self.lm_head)
         # NPU-resident buffers must go before their models and accelerators, or qbruntime warns that the

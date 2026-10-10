@@ -34,6 +34,8 @@
   the owner, so `generate()` continues it instead of re-prefilling.
 - Only the two most recently used prefill chunk sizes keep their NPU buffers. `dispose()` waits for running expert
   inferences, and the last-only check reads the token axis (`-2`) of the shared MXQ output.
+- `dispose()` releases every NPU buffer before destroying the accelerators. A loop variable used to keep the last
+  layer's buffers alive, which made qbruntime warn `Accelerator destroyed with N NPU-resident NPUData still alive`.
 
 ### Changed
 
