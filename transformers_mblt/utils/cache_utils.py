@@ -245,6 +245,10 @@ class MobilintLayer(CacheLayerMixin):
             self.mxq_model.load_cache_memory(self.buffer, self.cache_id)
 
     def dump_cache_memory_to(self, cache_dir: str):
+        residency = self._residency()
+        if residency is not None and not self.is_resident:
+            # The slot holds another cache's KV: put this layer's KV back on it before writing the files.
+            residency.acquire(self, self.mxq_model, self.cache_id)
         self.mxq_model.dump_cache_memory_to(cache_dir, self.cache_id)
         seq_path = Path(cache_dir) / "seq_length.txt"
         seq_path.write_text(f"{self.get_seq_length()}\n", encoding="utf-8")
@@ -556,6 +560,12 @@ class MobilintCache(Cache):
         batch_size = max(1, int(batch_size))
         if batch_size <= self.batch_size:
             return
+        default_layout = [divmod(row, self.k_per_model) for row in range(len(self._row_slots))]
+        if self._row_slots != default_layout:
+            raise ValueError(
+                f"cannot grow a MobilintCache whose rows sit on chosen slots {self._row_slots}; "
+                "build it with every slot it needs"
+            )
         if self.n_models != 1:
             raise ValueError(
                 f"cannot grow multi-Model cache beyond {self.batch_size} rows "

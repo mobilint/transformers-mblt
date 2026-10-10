@@ -462,3 +462,54 @@ def test_dispatch_places_single_row_caches_on_their_slots() -> None:
     assert backend.mxq_models[0].slots[2] == [1, 1]
     assert backend.mxq_models[0].slots[3] == [2]
     assert backend.mxq_models[0].calls == []
+
+
+def test_file_dump_of_an_evicted_cache_writes_its_own_kv(tmp_path) -> None:
+    backend = _Backend()
+    written: dict[str, object] = {}
+    mxq = backend.mxq_models[0]
+    mxq.dump_cache_memory_to = lambda cache_dir, cache_id=0: written.setdefault(cache_dir, mxq.slots[cache_id])
+    a = MobilintCache(backend.mxq_models)
+    b = MobilintCache(backend.mxq_models)
+    _run(a, backend, 0, "aaa")
+    _run(b, backend, 0, "bb")
+
+    a.dump_cache_memory_to(str(tmp_path))
+
+    assert written[str(tmp_path)] == "aaa"
+    _run(b, backend, 0, "B")  # B was saved before A came back, so it resumes correctly
+    assert _slot(backend) == "bbB"
+
+
+def test_moving_off_a_disposed_backend_reports_lost_kv_without_touching_dead_models() -> None:
+    source = _Backend()
+    target = _Backend()
+    cache = MobilintCache(source.mxq_models)
+    _run(cache, source, 0, "hello")
+    dead = source.mxq_models[0]
+    dead.dump_cache_memory = lambda cache_id=0: (_ for _ in ()).throw(AssertionError("dumped a disposed Model"))
+    source.mxq_models = []  # dispose
+
+    with pytest.raises(MobilintCacheStateError, match="dump_cache_memory"):
+        _run(cache, target, 0, "!")
+
+
+def test_moving_off_a_disposed_backend_uses_kv_saved_before_dispose() -> None:
+    source = _Backend()
+    target = _Backend()
+    cache = MobilintCache(source.mxq_models)
+    _run(cache, source, 0, "hello")
+    cache.dump_cache_memory()
+    source.mxq_models = []
+
+    _run(cache, target, 0, "!")
+
+    assert _slot(target) == "hello!"
+
+
+def test_cache_on_chosen_slots_refuses_to_grow() -> None:
+    backend = _Backend(n=1, k=4)
+    cache = MobilintCache(backend.mxq_models, per_model_batch=4, slots=[(0, 2)])
+
+    with pytest.raises(ValueError, match="chosen slots"):
+        cache.ensure_batch_size(2)

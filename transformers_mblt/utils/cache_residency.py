@@ -81,8 +81,23 @@ class MobilintKVResidency:
     again) is dropped without a dump, because that KV memory no longer exists.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, backend: Any = None) -> None:
         self._owners: dict[tuple[int, int], tuple["weakref.ref[Any]", int, "weakref.ref[MobilintLayer]"]] = {}
+        self._backend_ref: Optional[Any] = None
+        if backend is not None:
+            try:
+                self._backend_ref = weakref.ref(backend)
+            except TypeError:  # objects without __weakref__ (test doubles); the table lives on the backend anyway
+                self._backend_ref = lambda: backend
+
+    def refresh(self) -> None:
+        """Drop slots whose Model is no longer one of the backend's live handles (or the backend is gone)."""
+        if self._backend_ref is None:
+            return
+        backend = self._backend_ref()
+        live_models = getattr(backend, "mxq_models", None) if backend is not None else []
+        if live_models is not None:
+            self.forget_stale_models(live_models)
 
     # ------------------------------------------------------------------
     # Owner table
@@ -145,7 +160,12 @@ class MobilintKVResidency:
         layer._resident_at = None
 
     def evict_layer(self, layer: "MobilintLayer") -> None:
-        """Evict ``layer`` from its slot if it is resident here."""
+        """Evict ``layer`` from its slot if it is resident here.
+
+        Runs on the residency the layer is leaving, which may belong to another backend: refresh first so a slot
+        on a disposed backend is dropped (its KV is gone) instead of dumped from a dead Model.
+        """
+        self.refresh()
         if self.is_resident(layer):
             self.evict(layer.mxq_model, layer.cache_id)
         elif layer._resident_at is not None and layer._resident_at() is self:
@@ -185,11 +205,9 @@ def residency_of(backend: Any) -> MobilintKVResidency:
     """Return the backend's owner table, creating it on first use and dropping slots of disposed Models."""
     residency = getattr(backend, _RESIDENCY_ATTR, None)
     if residency is None:
-        residency = MobilintKVResidency()
+        residency = MobilintKVResidency(backend)
         setattr(backend, _RESIDENCY_ATTR, residency)
-    live_models = getattr(backend, "mxq_models", None)
-    if live_models is not None:
-        residency.forget_stale_models(live_models)
+    residency.refresh()
     return residency
 
 
