@@ -541,7 +541,8 @@ class MobilintMixtureOfExpertsNPUBackend:
         self._expert_out_pool: dict[int, list[Any]] = {}
         self._expert_out_pool_scale: dict[int, Any] = {}
         self._expert_corr: dict[tuple[int, int], Any] = {}
-        self._host_expert_out: Any = None
+        # One host buffer per expert output pool slot, so workers read results back in parallel.
+        self._host_expert_out_pool: dict[int, list[Any]] = {}
         self._host_lm_head_in: Any = None
         self._host_lm_head_out: Any = None
 
@@ -911,7 +912,7 @@ class MobilintMixtureOfExpertsNPUBackend:
         self._expert_out_pool = {}
         self._expert_out_pool_scale = {}
         self._expert_corr = {}
-        self._host_expert_out = None
+        self._host_expert_out_pool = {}
         self._host_lm_head_in = None
         self._host_lm_head_out = None
         self.kv_owner = None
@@ -1088,7 +1089,10 @@ class MobilintMixtureOfExpertsNPUBackend:
                 rep.acquire_output_npu_data([1, 1, hidden], 0, True) for _ in range(self.num_experts_per_tok)
             ]
             self._expert_out_pool_scale[dev] = _scale_value(rep.get_output_scale()[0])
-        self._host_expert_out = first_layer.experts[0].acquire_output_npu_data([1, 1, hidden], 0, False)
+            # Readback dequantizes with the source (pool) scale, so a host buffer from the same expert serves the slot.
+            self._host_expert_out_pool[dev] = [
+                rep.acquire_output_npu_data([1, 1, hidden], 0, False) for _ in range(self.num_experts_per_tok)
+            ]
 
         assert self.lm_head is not None
         self._host_lm_head_in = self.lm_head.acquire_input_npu_data([1, 1, hidden], 0, False)
@@ -1161,9 +1165,9 @@ class MobilintMixtureOfExpertsNPUBackend:
         residual = np.array(layer.host_residual[:], dtype=np.float32)
         return residual, gate
 
-    def _infer_expert_token(self, layer_idx: int, expert_idx: int, out_buffer: Any) -> int:
-        # Workers only call ``infer_npu_data``, which releases the GIL, so experts on different devices overlap.
-        # Readback (``copy_from``) holds the GIL and stays on the caller thread.
+    def _infer_expert_token(self, layer_idx: int, expert_idx: int, out_buffer: Any, host_out: Any) -> np.ndarray:
+        # Runs on a worker. ``infer_npu_data`` and ``copy_from`` release the GIL, so inferences and readbacks of
+        # different experts overlap instead of the caller reading every result back in turn.
         layer = self.layers[layer_idx]
         dev = self.expert_device_of(expert_idx)
         if dev == layer.shared_dev:
@@ -1172,7 +1176,8 @@ class MobilintMixtureOfExpertsNPUBackend:
         else:
             src = layer.npu_expert_in_by_dev[dev]
         self.npu_clock.call(layer.experts[expert_idx].infer_npu_data, [src], [out_buffer])
-        return expert_idx
+        self.npu_clock.call(host_out.copy_from, out_buffer)
+        return np.asarray(host_out[:], dtype=np.float32)[0, 0, :]
 
     def experts_forward_token(self, layer_idx: int, expert_indices: Sequence[int]) -> Iterator[tuple[int, np.ndarray]]:
         """Run the selected experts on the token from the last :meth:`shared_forward_token` call.
@@ -1194,14 +1199,19 @@ class MobilintMixtureOfExpertsNPUBackend:
         futures = {}
         for expert_idx in expert_indices:
             dev = self.expert_device_of(expert_idx)
-            out_buffer = self._expert_out_pool[dev][used.get(dev, 0)]
-            used[dev] = used.get(dev, 0) + 1
-            futures[self._expert_pool.submit(self._infer_expert_token, layer_idx, expert_idx, out_buffer)] = out_buffer
+            slot = used.get(dev, 0)
+            used[dev] = slot + 1
+            future = self._expert_pool.submit(
+                self._infer_expert_token,
+                layer_idx,
+                expert_idx,
+                self._expert_out_pool[dev][slot],
+                self._host_expert_out_pool[dev][slot],
+            )
+            futures[future] = expert_idx
         for future in as_completed(futures):
-            expert_idx = future.result()
-            self.npu_clock.call(self._host_expert_out.copy_from, futures[future])
-            output = np.asarray(self._host_expert_out[:], dtype=np.float32)[0, 0, :]
-            yield expert_idx, output * self._expert_correction(layer_idx, expert_idx)
+            expert_idx = futures[future]
+            yield expert_idx, future.result() * self._expert_correction(layer_idx, expert_idx)
 
     def shared_forward_chunk(
         self, layer_idx: int, hidden_states: np.ndarray, cache_size: int
@@ -1227,9 +1237,15 @@ class MobilintMixtureOfExpertsNPUBackend:
             np.array(buffers.host_expert_in[layer_idx][:], dtype=np.float32),
         )
 
-    def _infer_expert_chunk(self, layer_idx: int, expert_idx: int, npu_in: Any, npu_out: Any) -> int:
+    def _infer_expert_chunk(
+        self, layer_idx: int, expert_idx: int, host_in: Any, npu_in: Any, npu_out: Any, host_out: Any
+    ) -> Any:
+        # Runs on a worker: upload, inference, and readback all release the GIL, so the transfers of different
+        # experts overlap. Done one after another on the caller thread, they took most of the prefill expert stage.
+        self.npu_clock.call(npu_in.copy_from, host_in)
         self.npu_clock.call(self.layers[layer_idx].experts[expert_idx].infer_npu_data, [npu_in], [npu_out])
-        return expert_idx
+        self.npu_clock.call(host_out.copy_from, npu_out)
+        return host_out
 
     def experts_forward_chunk(
         self, layer_idx: int, expert_inputs: dict[int, np.ndarray]
@@ -1249,15 +1265,16 @@ class MobilintMixtureOfExpertsNPUBackend:
             npu_in = expert.acquire_input_npu_data([1, n_tokens, hidden], 0, True)
             npu_out = expert.acquire_output_npu_data([1, n_tokens, hidden], 0, True)
             host_out = expert.acquire_output_npu_data([1, n_tokens, hidden], 0, False)
+            # Buffer acquisition and the host write stay here: moved into the workers they contend for the GIL and
+            # end up slower.
             host_in[:] = tokens.reshape(1, n_tokens, hidden)
-            self.npu_clock.call(npu_in.copy_from, host_in)
-            future = self._expert_pool.submit(self._infer_expert_chunk, layer_idx, expert_idx, npu_in, npu_out)
-            futures[future] = (npu_out, host_out)
+            future = self._expert_pool.submit(
+                self._infer_expert_chunk, layer_idx, expert_idx, host_in, npu_in, npu_out, host_out
+            )
+            futures[future] = expert_idx
         for future in as_completed(futures):
-            expert_idx = future.result()
-            npu_out, host_out = futures[future]
-            self.npu_clock.call(host_out.copy_from, npu_out)
-            yield expert_idx, np.asarray(host_out[:], dtype=np.float32)[0]
+            host_out = future.result()
+            yield futures[future], np.asarray(host_out[:], dtype=np.float32)[0]
 
     def lm_head_forward(self, hidden_states: np.ndarray) -> np.ndarray:
         """Run the ``lm_head`` on one ``[hidden]`` hidden state and return ``[vocab]`` logits."""
