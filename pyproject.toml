@@ -75,7 +75,8 @@ dev = [
     "numba>=0.60.0, <=0.60.0",
     "hf_xet",
     "build",
-    "ruff",
+    # Keep in sync with the ruff-pre-commit rev in .pre-commit-config.yaml; formatter style changes between releases.
+    "ruff==0.15.11",
     "soundfile",
     "rich",
 ]

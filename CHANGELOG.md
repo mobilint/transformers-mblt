@@ -66,6 +66,8 @@
   Hub. The resolver reads the raw `config.json` before `AutoConfig`, so the stubbed config was bypassed and the
   published `mobilint/Llama-3.2-1B-Instruct-Batch16` `core_mode: "auto"` failed two tests whenever the Hub was
   reachable.
+- `.pre-commit-config.yaml` and the `dev` group now pin the same Ruff (0.15.11). The hook ran 0.6.9 while `ruff` in
+  the `dev` group was unpinned, and the two formatters disagreed on wrapped `assert` messages in nine files.
 
 ## 0.1.0
 
