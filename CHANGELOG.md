@@ -47,6 +47,13 @@
 
 ### Changed
 
+- MoE prefill runs a tail shorter than `npu_prefill_chunk_size` as one chunk instead of one decode step per token
+  (only a 1-token tail still takes the token path). A 300-token prompt prefills in 1.70 s instead of 6.0 s on three
+  Aries devices. Prefill also groups tokens by expert and sums the weighted expert outputs with numpy instead of
+  per-pair Python loops.
+- MoE expert workers upload, run, and read back their own tensors instead of the caller transferring every expert
+  in turn (`copy_from` releases the GIL). On three Aries devices, 128-token prefill rises from 152 to 211 tok/s
+  (TTFT 840 → 606 ms) and decode from 8.64 to 8.91 tok/s.
 - `datasets` moved from the runtime dependencies to the `dev` dependency group and is raised to `>=5.0.1`, which fixes
   the folder-based builder path traversal (GHSA-379c-qx7v-6h59). The package itself never imports `datasets`; only
   the ASR tests, the ASR benchmark, and `scripts/debug_whisper_beam_trace.py` load LibriSpeech with it.
