@@ -124,9 +124,14 @@ description: >-
   placed round-robin over the devices their `"d:c:k"` targets cover, and unprefixed NPU kwargs are
   deliberately not fanned out to the roles. `batch_size` stays `1`. Releases are packed
   (`scripts/pack_moe_mxq.py`, `moe_mxq_pack_index`): qbruntime re-reads an MXQ during `launch()`,
-  so a member is materialized (Linux `memfd`, elsewhere a short-lived temp file) before `Model()`
-  and released only after `launch()`. Keep `moe_shared_output_order` authoritative; the
-  quantization-scale detection is the fallback and the cross-check.
+  so a member is materialized (Linux `memfd` when `/proc/self/fd` works, otherwise a short-lived
+  temp file in `/dev/shm` or the temp dir; `MBLT_MOE_MXQ_MATERIALIZE` / `MBLT_MOE_MXQ_TMPDIR`)
+  before `Model()` and released only after `launch()`; `release()` must never raise. Every launch
+  failure, including post-load layer setup and buffer allocation, goes through `_rollback()`.
+  `npu_backend.kv_owner` names the cache whose sequence is in the shared MXQs' KV; every forward
+  sets it (to `None` without a cache). Keep `moe_shared_output_order` authoritative; the
+  quantization-scale detection is the fallback and the cross-check, and
+  `scripts/pack_moe_mxq.py --config` derives it from the MXQs at packaging time.
 - Preserve local style in `transformers_mblt/models` and `transformers_mblt/utils`; they are
   excluded from repository-wide Ruff checks.
 

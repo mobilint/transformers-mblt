@@ -19,6 +19,21 @@
   Linux and a short-lived temporary file elsewhere, so a release never keeps both forms on disk. Compared with the
   individual MXQ files on 3 Aries devices, loading is about 20% faster, page-cache growth during load drops from
   9-15 GiB to under 2 GiB, and the disk reads grow by 4%, because each member is copied in full.
+- When `/proc/self/fd` is not usable, Linux falls back to a temporary file in `/dev/shm`. `MBLT_MOE_MXQ_MATERIALIZE`
+  (`auto` / `memfd` / `tempfile`) forces the method and `MBLT_MOE_MXQ_TMPDIR` the directory.
+- `scripts/pack_moe_mxq.py --config` writes `moe_mxq_pack_index` and `moe_shared_output_order` into a release
+  `config.json`. The order is read from the MXQs (`qbruntime.Model` without a launch), and `--manifest`
+  cross-checks it against the compiler manifest. `--skip-pack` only derives the order.
+- MoE loading keeps every failure on one rollback path. A failure during the MXQ loads (including a non-qbruntime
+  error such as a full temp directory), during layer setup, or during buffer allocation disposes every loaded model.
+  A device-memory `BadAlloc` raises `MobilintBackendAllocError`.
+- The local-cache shortcut for MoE releases checks every pack (or MXQ) and its size, so an interrupted download
+  resumes instead of failing at load.
+- The NPU backend records which cache owns the shared MXQs' KV state (`kv_owner`). A forward without a cache now
+  invalidates the previous cache, and `load_cache_memory()` / `load_cache_memory_from()` make the restored cache
+  the owner, so `generate()` continues it instead of re-prefilling.
+- Only the two most recently used prefill chunk sizes keep their NPU buffers. `dispose()` waits for running expert
+  inferences, and the last-only check reads the token axis (`-2`) of the shared MXQ output.
 
 ### Changed
 

@@ -500,7 +500,7 @@ class MobilintMixtureOfExpertsGenerationMixin(MobilintGenerationMixin):
             raise ValueError(f"Mixture-of-Experts releases support only batch_size=1, got {batch_size}.")
 
     def _new_moe_cache(self) -> MobilintMixtureOfExpertsCache:
-        return MobilintMixtureOfExpertsCache(cast(Any, self).get_shared_mxq_models())
+        return MobilintMixtureOfExpertsCache(cast(Any, self).get_shared_mxq_models(), owner=cast(Any, self).npu_backend)
 
     # Function arguments changed for transformers>=4.56.0; see MobilintGenerationMixin._get_cache.
     def _get_cache(
@@ -533,11 +533,11 @@ class MobilintMixtureOfExpertsGenerationMixin(MobilintGenerationMixin):
         current = model_kwargs.get(cache_name)
         if not isinstance(current, MobilintMixtureOfExpertsCache):
             model_kwargs[cache_name] = self._get_cache("mobilint", batch_size, max_cache_length)
-        elif current is not getattr(self, "_active_moe_cache", None) and current.get_seq_length() > 0:
+        elif current is not cast(Any, self).npu_backend.kv_owner and current.get_seq_length() > 0:
             # Another cache ran on the NPU since this one was filled; its KV prefix is gone.
             logger.warning("Resetting a MobilintMixtureOfExpertsCache whose NPU KV state was overwritten.")
             current.reset()
-        self._active_moe_cache = model_kwargs[cache_name]
+        cast(Any, self).npu_backend.kv_owner = model_kwargs[cache_name]
         return True
 
 

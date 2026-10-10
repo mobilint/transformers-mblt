@@ -1060,11 +1060,16 @@ class MobilintMixtureOfExpertsCache(Cache):
     (callers that rewind with ``cache.layers[0]._seen_tokens = n`` keep working).
 
     Only ``batch_size == 1`` is supported: each shared MXQ hosts a single cache entry.
+
+    The shared MXQs hold one sequence at a time, so ``owner`` (the model's NPU backend) records in ``kv_owner`` which
+    cache that sequence belongs to. Restoring KV memory with :meth:`load_cache_memory` / :meth:`load_cache_memory_from`
+    makes this cache the owner, so generation continues from it instead of re-prefilling.
     """
 
-    def __init__(self, shared_mxq_models: Sequence[qbruntime.Model]) -> None:
+    def __init__(self, shared_mxq_models: Sequence[qbruntime.Model], owner: Any = None) -> None:
         if not shared_mxq_models:
             raise ValueError("shared_mxq_models must contain at least one Model")
+        self.owner = owner
         self.shared_mxq_models: List[qbruntime.Model] = list(shared_mxq_models)
         self.shared_layers: list[MobilintLayer] = [MobilintLayer(model, 0) for model in self.shared_mxq_models]
         self.layers = [self.shared_layers[0]]
@@ -1135,9 +1140,14 @@ class MobilintMixtureOfExpertsCache(Cache):
         for layer in self.shared_layers:
             layer.dump_cache_memory()
 
+    def _claim_npu_kv(self) -> None:
+        if self.owner is not None:
+            self.owner.kv_owner = self
+
     def load_cache_memory(self) -> None:
         for layer in self.shared_layers:
             layer.load_cache_memory()
+        self._claim_npu_kv()
 
     def dump_cache_memory_to(self, cache_dir: str, index: int = 0) -> None:
         del index
@@ -1151,9 +1161,11 @@ class MobilintMixtureOfExpertsCache(Cache):
         del index
         for layer_idx, layer in enumerate(self.shared_layers):
             layer.load_cache_memory_from(str(Path(cache_dir) / f"layer_{layer_idx}"))
+        self._claim_npu_kv()
 
     def copy(self) -> "MobilintMixtureOfExpertsCache":
-        copied = MobilintMixtureOfExpertsCache(self.shared_mxq_models)
+        """Copy the cursors and dumped KV buffers. The copy does not own the NPU KV until it is loaded."""
+        copied = MobilintMixtureOfExpertsCache(self.shared_mxq_models, owner=self.owner)
         copied.shared_layers = [layer.copy() for layer in self.shared_layers]
         copied.layers = [copied.shared_layers[0]]
         return copied

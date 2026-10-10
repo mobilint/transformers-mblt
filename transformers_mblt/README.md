@@ -383,13 +383,27 @@ the Hub repository at a few dozen files, so the download stays within the Hub AP
 never exists as a regular file next to its pack. `qbruntime` opens MXQs only by path and re-reads them during
 `launch()`, so each member is materialized right before `Model()` and released right after `launch()`:
 
-- On Linux, the member is copied in the kernel (`os.sendfile`) into an anonymous `memfd`, and the consumed
-  range of the pack is dropped from the page cache.
-- On Windows, the member is written to a short-lived temporary file that is deleted right after `launch()`.
+- On Linux, the member is copied in the kernel (`os.sendfile`) into an anonymous `memfd`, which `qbruntime`
+  opens as `/proc/self/fd/N`. The consumed range of the pack is dropped from the page cache.
+- When `/proc/self/fd` paths are not usable (a sandbox without `/proc`), on Windows, and on other systems, the
+  member is written to a short-lived temporary file that is deleted right after `launch()`. Linux uses the
+  RAM-backed `/dev/shm`, and other systems use the standard temporary directory (`TMPDIR` / `TEMP`).
+  `MBLT_MOE_MXQ_TMPDIR` overrides the directory.
+- `MBLT_MOE_MXQ_MATERIALIZE` (`auto`, `memfd`, or `tempfile`) forces one method. `memfd` fails at load when
+  `/proc/self/fd` is not usable.
 
-Build a pack from individual MXQs with `scripts/pack_moe_mxq.py`. Without `moe_mxq_pack_index`, the
-`shared_mxq_path` and `expert_mxq_path` `str.format` templates (`{layer}`, `{expert}`) name individual MXQ files,
-which is convenient for a local compile output.
+Build a release with `scripts/pack_moe_mxq.py`. It packs the individual MXQs, verifies every member byte for
+byte, and with `--config` writes `moe_mxq_pack_index` and `moe_shared_output_order` into the release
+`config.json`. The script reads the output order from the MXQs themselves (created with `qbruntime.Model`,
+without a launch), and `--manifest` cross-checks it against the compiler's `manifest.json`:
+
+```bash
+python scripts/pack_moe_mxq.py compile_out/mxq release/mxq --num-layers 48 --num-experts 128 \
+    --manifest compile_out/mxq/manifest.json --config release/config.json
+```
+
+Without `moe_mxq_pack_index`, the `shared_mxq_path` and `expert_mxq_path` `str.format` templates (`{layer}`,
+`{expert}`) name individual MXQ files, which is convenient for a local compile output.
 
 `moe_shared_output_order` in `config.json` lists the role of each shared MXQ output (`residual`, `expert_in`,
 `gate`). Its `"default"` entry applies to every layer that has no override keyed by the layer index. When the
@@ -397,8 +411,9 @@ field is missing, the backend identifies the gate by its `num_experts` channels 
 quantization scale, which is the reciprocal of the expert input scale. The loader also cross-checks a
 configured order against those scales and warns on a mismatch.
 
-Prefill runs `npu_prefill_chunk_size` tokens per shared MXQ call, and the per-call override is honored. A
-trailing partial chunk and every decode step run one token at a time. A release whose last shared MXQ emits
+Prefill runs `npu_prefill_chunk_size` tokens per shared MXQ call, and the per-call override is honored. Only
+the two most recently used chunk sizes keep their NPU buffers. A trailing partial chunk and every decode step
+run one token at a time. A release whose last shared MXQ emits
 only the last token (a last-only build) runs any chunk that keeps more than its last position through the
 token path, with the same one-time warning as last-only LLM builds.
 

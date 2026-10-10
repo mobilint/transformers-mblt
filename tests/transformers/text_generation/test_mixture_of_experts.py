@@ -151,14 +151,19 @@ def test_backend_rejects_unsupported_topologies(overrides: dict[str, Any], match
 def test_backend_create_resolves_local_release_and_reports_missing_files(tmp_path) -> None:
     config = _small_config()
     (tmp_path / "mxq").mkdir()
-    for path in ("mxq/lm_head.mxq", "mxq/block_0_shared.mxq"):
-        (tmp_path / path).write_bytes(b"")
+    (tmp_path / "mxq/lm_head.mxq").write_bytes(b"")
+    for layer in range(config.num_hidden_layers):
+        (tmp_path / f"mxq/block_{layer}_shared.mxq").write_bytes(b"")
+        for expert in range(config.num_experts):
+            (tmp_path / f"mxq/block_{layer}_expert_{expert}.mxq").write_bytes(b"")
+    (tmp_path / "mxq/block_1_expert_3.mxq").unlink()
 
     backend = _backend(config, name_or_path=str(tmp_path))
-    with pytest.raises(FileNotFoundError, match="block_2_expert_5"):
+    # Every expected file is checked, so a release with one hole (e.g. an interrupted download) is rejected.
+    with pytest.raises(FileNotFoundError, match="block_1_expert_3"):
         backend.create()
 
-    (tmp_path / "mxq/block_2_expert_5.mxq").write_bytes(b"")
+    (tmp_path / "mxq/block_1_expert_3.mxq").write_bytes(b"")
     backend.create()
     assert backend.model_dir == str(tmp_path)
     assert backend.expert_mxq_path(1, 4) == "mxq/block_1_expert_4.mxq"

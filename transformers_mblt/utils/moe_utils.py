@@ -22,6 +22,7 @@ right after ``launch()`` (see :class:`_MxqPackReader`).
 
 from __future__ import annotations
 
+import errno
 import gc
 import json
 import logging
@@ -32,6 +33,7 @@ import sys
 import tempfile
 import threading
 import uuid
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, Optional, Sequence
@@ -52,6 +54,10 @@ _ROLE_ACTIVATION_SLOTS: dict[str, int] = {"shared": 0, "expert": 0, "lm_head": 1
 _TEMPLATE_FIELD_RE = re.compile(r"\{[^{}]*\}")
 # A boundary tensor between shared and expert MXQs carries exactly reciprocal quantization scales.
 _EXPERT_IN_SCALE_TOLERANCE = 1e-3
+# Prefill chunk sizes whose shared-MXQ buffers stay allocated; older sizes are released (least recently used).
+_MAX_CACHED_CHUNK_SIZES = 2
+# Token axis of a shared MXQ output, matching ``MobilintModelMixin``'s ``_MXQ_TOKEN_AXIS_INDEX``.
+_MXQ_TOKEN_AXIS_INDEX = -2
 
 
 MXQ_PACK_FORMAT = "mobilint-moe-mxqpack"
@@ -132,31 +138,92 @@ class MobilintMixtureOfExpertsPackIndex:
                 )
 
 
+MXQ_MATERIALIZE_ENV = "MBLT_MOE_MXQ_MATERIALIZE"
+MXQ_TMPDIR_ENV = "MBLT_MOE_MXQ_TMPDIR"
+_MATERIALIZE_MODES = ("auto", "memfd", "tempfile")
+# sendfile() refuses some source/destination pairs (e.g. older kernels, FUSE or network mounts).
+_SENDFILE_UNSUPPORTED = {getattr(errno, name) for name in ("EINVAL", "ENOSYS", "EOPNOTSUPP", "ENOTSUP", "EXDEV") if hasattr(errno, name)}
+_COPY_CHUNK = 8 * 1024 * 1024
+
+
+def _memfd_path_usable() -> bool:
+    """Return True when a ``memfd`` can be reopened by path through ``/proc/self/fd``.
+
+    ``qbruntime.Model`` opens MXQs by path, so a ``memfd`` is only usable when ``/proc`` is mounted and readable. Some
+    sandboxes and minimal containers hide ``/proc``; probe it once instead of assuming.
+    """
+    if not (sys.platform.startswith("linux") and hasattr(os, "memfd_create")):
+        return False
+    try:
+        fd = os.memfd_create("mblt-moe-probe", os.MFD_CLOEXEC)
+    except OSError:
+        return False
+    try:
+        os.write(fd, b"\x01")
+        with open(f"/proc/self/fd/{fd}", "rb") as file:
+            return file.read(1) == b"\x01"
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def _default_tempdir() -> str:
+    """Pick the directory for materialized members when ``memfd`` is not used.
+
+    ``$MBLT_MOE_MXQ_TMPDIR`` wins. On Linux ``/dev/shm`` (RAM-backed tmpfs) is preferred over ``/tmp``, which is often a
+    disk. Otherwise ``tempfile.gettempdir()`` applies, which honors ``TMPDIR`` / ``TEMP``.
+    """
+    configured = os.environ.get(MXQ_TMPDIR_ENV)
+    if configured:
+        return configured
+    if sys.platform.startswith("linux") and os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK | os.X_OK):
+        return "/dev/shm"
+    return tempfile.gettempdir()
+
+
 class _MxqPackReader:
     """Materialize packed MXQ members as short-lived files for ``qbruntime.Model``.
 
     ``qbruntime.Model`` accepts only a path and re-reads the file during ``launch()``, so a member must exist as a
-    file from ``Model()`` until ``launch()`` returns, and no longer:
+    file from ``Model()`` until ``launch()`` returns, and no longer. Two materializations exist:
 
-    * Linux: an anonymous ``memfd`` filled with ``os.sendfile`` (an in-kernel copy, no user-space buffer), exposed
-      as ``/proc/self/fd/N``. Nothing touches the disk. The consumed pack range is then dropped from the page cache
-      with ``posix_fadvise(DONTNEED)`` so loading a 15-30 GB release does not crowd out application memory.
-    * Elsewhere (Windows): a temp file written from a read-only ``mmap`` view of the pack and created with
-      ``O_SHORT_LIVED`` (``FILE_ATTRIBUTE_TEMPORARY``), which the OS keeps in its cache instead of flushing it, and
-      deleted right after ``launch()``.
+    * ``memfd`` (Linux, when ``/proc/self/fd`` is usable): an anonymous in-memory file exposed as
+      ``/proc/self/fd/N``. Nothing touches the disk.
+    * ``tempfile`` (everywhere else, and the Linux fallback): a file in :func:`_default_tempdir` created with
+      ``O_SHORT_LIVED`` (``FILE_ATTRIBUTE_TEMPORARY`` on Windows) and deleted right after ``launch()``.
+
+    The copy is ``os.sendfile`` (in-kernel, no user-space buffer) where available, falling back to positional reads,
+    and a read-only ``mmap`` view of the pack on Windows. On Linux the consumed pack range is then dropped from the
+    page cache with ``posix_fadvise(DONTNEED)`` so loading a 15-30 GB release does not crowd out application memory.
+    ``$MBLT_MOE_MXQ_MATERIALIZE`` (``auto`` / ``memfd`` / ``tempfile``) overrides the choice.
+
+    Releasing never raises: a temp file that cannot be deleted yet (Windows keeps files open by another handle) is
+    retried in :meth:`close`, and anything still left is logged.
 
     Packs are opened once each and shared by the per-device loader threads; every read is positional, so no seek
     state is shared.
     """
 
-    def __init__(self, index_path: str, index: MobilintMixtureOfExpertsPackIndex) -> None:
+    def __init__(
+        self, index_path: str, index: MobilintMixtureOfExpertsPackIndex, *, mode: Optional[str] = None
+    ) -> None:
         self.index = index
         self._pack_dir = os.path.dirname(index_path)
         self._offsets = [index.offsets(layer_idx) for layer_idx in range(len(index.sizes))]
         self._lock = threading.Lock()
         self._fds: dict[int, int] = {}
         self._maps: dict[int, mmap.mmap] = {}
-        self._use_memfd = sys.platform.startswith("linux") and hasattr(os, "memfd_create")
+        self._pending_removal: list[str] = []
+        requested = (mode or os.environ.get(MXQ_MATERIALIZE_ENV) or "auto").strip().lower()
+        if requested not in _MATERIALIZE_MODES:
+            raise ValueError(f"{MXQ_MATERIALIZE_ENV} must be one of {_MATERIALIZE_MODES}, got {requested!r}.")
+        if requested == "memfd" and not _memfd_path_usable():
+            raise RuntimeError("memfd materialization requested, but /proc/self/fd paths are not usable here.")
+        self.mode = "memfd" if requested == "memfd" or (requested == "auto" and _memfd_path_usable()) else "tempfile"
+        self.tempdir = _default_tempdir() if self.mode == "tempfile" else None
+        self._sendfile_ok = hasattr(os, "sendfile")
+        logger.debug("MoE pack reader: mode=%s tempdir=%s", self.mode, self.tempdir)
 
     def pack_path(self, layer_idx: int) -> str:
         return os.path.join(self._pack_dir, self.index.pack.format(layer=layer_idx))
@@ -181,63 +248,118 @@ class _MxqPackReader:
             return pack_map
 
     def materialize(self, layer_idx: int, member_idx: int, name: str) -> tuple[str, Callable[[], None]]:
-        """Return ``(path, release)`` for member ``member_idx`` (0 = shared, 1 + e = expert e) of a layer."""
+        """Return ``(path, release)`` for member ``member_idx`` (0 = shared, 1 + e = expert e) of a layer.
+
+        ``release()`` never raises.
+        """
         offset = self._offsets[layer_idx][member_idx]
         size = self.index.sizes[layer_idx][member_idx]
-        if self._use_memfd:
+        if self.mode == "memfd":
             return self._materialize_memfd(layer_idx, offset, size, name)
         return self._materialize_tempfile(layer_idx, offset, size, name)
 
-    def _materialize_memfd(self, layer_idx: int, offset: int, size: int, name: str) -> tuple[str, Callable[[], None]]:
+    def _copy_member(self, layer_idx: int, dst: int, offset: int, size: int, name: str) -> None:
+        """Copy ``size`` bytes at ``offset`` of the layer pack into the writable descriptor ``dst``."""
         src = self._pack_fd(layer_idx)
+        copied = 0
+        if self._sendfile_ok:
+            try:
+                while copied < size:
+                    sent = os.sendfile(dst, src, offset + copied, size - copied)
+                    if sent == 0:
+                        break
+                    copied += sent
+            except OSError as exc:
+                if exc.errno not in _SENDFILE_UNSUPPORTED:
+                    raise
+                self._sendfile_ok = False
+                logger.debug("sendfile unsupported (%s); falling back to positional reads.", exc)
+        if copied < size and hasattr(os, "pread"):
+            while copied < size:
+                chunk = os.pread(src, min(_COPY_CHUNK, size - copied), offset + copied)
+                if not chunk:
+                    break
+                view = memoryview(chunk)
+                while view:
+                    view = view[os.write(dst, view) :]
+                copied += len(chunk)
+        elif copied < size:
+            pack_map = self._pack_map(layer_idx)
+            end = min(offset + size, len(pack_map))
+            with memoryview(pack_map) as whole, whole[offset + copied : end] as member:
+                view = member
+                while view:
+                    written = os.write(dst, view)
+                    copied += written
+                    view = view[written:]
+        if copied != size:
+            raise EOFError(f"{self.pack_path(layer_idx)} ends before member {name!r} ({copied}/{size} bytes).")
+        if hasattr(os, "posix_fadvise"):
+            os.posix_fadvise(src, offset, self.index.aligned(size), os.POSIX_FADV_DONTNEED)
+
+    def _materialize_memfd(self, layer_idx: int, offset: int, size: int, name: str) -> tuple[str, Callable[[], None]]:
         dst = os.memfd_create(name, os.MFD_CLOEXEC)
         try:
-            copied = 0
-            while copied < size:
-                sent = os.sendfile(dst, src, offset + copied, size - copied)
-                if sent == 0:
-                    raise EOFError(f"{self.pack_path(layer_idx)} ends before member {name!r} ({copied}/{size} bytes).")
-                copied += sent
+            self._copy_member(layer_idx, dst, offset, size, name)
         except BaseException:
             os.close(dst)
             raise
-        os.posix_fadvise(src, offset, self.index.aligned(size), os.POSIX_FADV_DONTNEED)
-        return f"/proc/self/fd/{dst}", lambda: os.close(dst)
+
+        def _release() -> None:
+            try:
+                os.close(dst)
+            except OSError as exc:
+                logger.warning("Could not close materialized MXQ %s: %s", name, exc)
+
+        return f"/proc/self/fd/{dst}", _release
 
     def _materialize_tempfile(self, layer_idx: int, offset: int, size: int, name: str) -> tuple[str, Callable[[], None]]:
-        pack_map = self._pack_map(layer_idx)
-        if offset + size > len(pack_map):
-            raise EOFError(f"{self.pack_path(layer_idx)} ends before member {name!r}.")
-        path = os.path.join(tempfile.gettempdir(), f"mblt-moe-{os.getpid()}-{uuid.uuid4().hex}-{name}")
+        assert self.tempdir is not None
+        path = os.path.join(self.tempdir, f"mblt-moe-{os.getpid()}-{uuid.uuid4().hex}-{name}")
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0) | getattr(os, "O_SHORT_LIVED", 0)
         fd = os.open(path, flags, 0o600)
         try:
-            with memoryview(pack_map) as view, view[offset : offset + size] as member:
-                written = 0
-                while written < size:
-                    written += os.write(fd, member[written:])
+            self._copy_member(layer_idx, fd, offset, size, name)
         except BaseException:
             os.close(fd)
-            os.remove(path)
+            self._remove(path)
             raise
         os.close(fd)
+        return path, lambda: self._remove(path)
 
-        def _release() -> None:
+    def _remove(self, path: str) -> None:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            # Windows refuses to delete a file another handle still holds; retry once everything is launched.
+            with self._lock:
+                self._pending_removal.append(path)
+
+    def close(self) -> None:
+        """Close every pack and delete any materialized file that could not be removed earlier. Never raises."""
+        with self._lock:
+            for pack_map in self._maps.values():
+                try:
+                    pack_map.close()
+                except (BufferError, OSError) as exc:
+                    logger.warning("Could not unmap an MXQ pack: %s", exc)
+            for fd in self._fds.values():
+                try:
+                    os.close(fd)
+                except OSError as exc:
+                    logger.warning("Could not close an MXQ pack: %s", exc)
+            self._maps = {}
+            self._fds = {}
+            pending, self._pending_removal = self._pending_removal, []
+        for path in pending:
             try:
                 os.remove(path)
             except FileNotFoundError:
                 pass
-
-        return path, _release
-
-    def close(self) -> None:
-        with self._lock:
-            for pack_map in self._maps.values():
-                pack_map.close()
-            for fd in self._fds.values():
-                os.close(fd)
-            self._maps = {}
-            self._fds = {}
+            except OSError as exc:
+                logger.warning("Could not delete materialized MXQ %s: %s", path, exc)
 
 
 def _is_bad_alloc(exc: BaseException) -> bool:
@@ -354,7 +476,9 @@ class MobilintMixtureOfExpertsNPUBackend:
         self.lm_head: Optional[Model] = None
         self._created = False
         self._expert_pool: Optional[ThreadPoolExecutor] = None
-        self._chunk_buffers: dict[int, _ChunkBuffers] = {}
+        self._chunk_buffers: OrderedDict[int, _ChunkBuffers] = OrderedDict()
+        # The cache whose sequence currently lives in the shared MXQs' KV state (``None`` after a cache-less forward).
+        self.kv_owner: Any = None
         self._expert_out_pool: dict[int, list[Any]] = {}
         self._expert_out_pool_scale: dict[int, Any] = {}
         self._expert_corr: dict[tuple[int, int], Any] = {}
@@ -463,12 +587,10 @@ class MobilintMixtureOfExpertsNPUBackend:
             pack_dir = os.path.dirname(self.mxq_pack_index)
             pack_glob = f"{pack_dir}/*.mxqpack" if pack_dir else "*.mxqpack"
             allow_patterns = sorted({self.lm_head_mxq_path(), self.mxq_pack_index, pack_glob})
-            sentinels: tuple[str, ...] = (self.lm_head_mxq_path(), self.mxq_pack_index)
         else:
             allow_patterns = sorted(
                 {_TEMPLATE_FIELD_RE.sub("*", self._role_template(role)) for role in self.role_backends}
             )
-            sentinels = (self.lm_head_mxq_path(), self.shared_mxq_path(self.num_layers - 1))
         revision = self.revision or self._commit_hash
         try:
             snapshot = snapshot_download(
@@ -477,11 +599,39 @@ class MobilintMixtureOfExpertsNPUBackend:
                 allow_patterns=allow_patterns,
                 local_files_only=True,
             )
-            if all(os.path.isfile(os.path.join(snapshot, path)) for path in sentinels):
+            if self._missing_artifacts(snapshot) == []:
                 return snapshot
         except LocalEntryNotFoundError:
             pass
         return snapshot_download(repo_id=self.name_or_path, revision=revision, allow_patterns=allow_patterns)
+
+    def _missing_artifacts(self, root: str) -> list[str]:
+        """Return the release files missing under ``root`` (a pack of the wrong size counts as missing).
+
+        A download that stopped halfway leaves some files behind; checking every expected file keeps the local-cache
+        shortcut from treating such a snapshot as complete, so the next load resumes the download instead.
+        """
+        missing = [path for path in (self.lm_head_mxq_path(),) if not os.path.isfile(os.path.join(root, path))]
+        if self.mxq_pack_index:
+            index_path = os.path.join(root, self.mxq_pack_index)
+            if not os.path.isfile(index_path):
+                return missing + [self.mxq_pack_index]
+            try:
+                index = MobilintMixtureOfExpertsPackIndex.load(index_path)
+            except (OSError, ValueError, KeyError):
+                return missing + [self.mxq_pack_index]
+            pack_dir = os.path.dirname(index_path)
+            for layer_idx in range(len(index.sizes)):
+                pack_path = os.path.join(pack_dir, index.pack.format(layer=layer_idx))
+                if not os.path.isfile(pack_path) or os.path.getsize(pack_path) != index.pack_size(layer_idx):
+                    missing.append(os.path.relpath(pack_path, root))
+            return missing
+        for layer_idx in range(self.num_layers):
+            paths = [self.shared_mxq_path(layer_idx)] + [
+                self.expert_mxq_path(layer_idx, expert_idx) for expert_idx in range(self.num_experts)
+            ]
+            missing.extend(path for path in paths if not os.path.isfile(os.path.join(root, path)))
+        return missing
 
     # ---- Lifecycle ----------------------------------------------------------------------------------------------
 
@@ -491,16 +641,10 @@ class MobilintMixtureOfExpertsNPUBackend:
         self.model_dir = self._resolve_artifact_dir()
         if self.mxq_pack_index:
             self._load_pack_index()
-            required = [self.lm_head_mxq_path()]
-        else:
-            required = [
-                self.lm_head_mxq_path(),
-                self.shared_mxq_path(0),
-                self.expert_mxq_path(self.num_layers - 1, self.num_experts - 1),
-            ]
-        missing = [path for path in required if not os.path.isfile(os.path.join(self.model_dir, path))]
+        missing = self._missing_artifacts(self.model_dir)
         if missing:
-            raise FileNotFoundError(f"MoE release under {self.model_dir!r} is missing {missing}.")
+            shown = ", ".join(missing[:5]) + (f" and {len(missing) - 5} more" if len(missing) > 5 else "")
+            raise FileNotFoundError(f"MoE release under {self.model_dir!r} is missing {shown}.")
         self._created = True
 
     def _load_pack_index(self) -> None:
@@ -577,7 +721,7 @@ class MobilintMixtureOfExpertsNPUBackend:
         launched = [0]
         loaded_lock = threading.Lock()
         stop = threading.Event()
-        failures: list[tuple[str, int, int, QbRuntimeError]] = []
+        failures: list[tuple[str, int, int, BaseException]] = []
 
         try:
             from tqdm.auto import tqdm
@@ -609,14 +753,12 @@ class MobilintMixtureOfExpertsNPUBackend:
                     model.launch(self.accs[dev])
                     with loaded_lock:
                         launched[0] += 1
-                except QbRuntimeError as exc:
+                except BaseException as exc:  # noqa: BLE001 - recorded and re-raised after every thread stops.
                     failures.append((phase, slot_idx, dev, exc))
                     stop.set()
                     return
-                except BaseException:
-                    stop.set()
-                    raise
                 finally:
+                    # ``release`` never raises, so it cannot mask the failure recorded above.
                     if release is not None:
                         release()
                 if role == "shared":
@@ -645,34 +787,64 @@ class MobilintMixtureOfExpertsNPUBackend:
 
         if failures:
             phase, slot_idx, dev, exc = failures[0]
-            self._dispose_models(loaded)
-            self.accs = {}
-            if _is_bad_alloc(exc):
-                raise MobilintBackendAllocError(
-                    phase=phase,
-                    slot=slot_idx,
-                    dev=int(dev),
-                    succeeded_so_far=launched[0],
-                    n_total=len(plan),
-                    max_batch_size=self.max_batch_size,
-                    k_per_model=self.k_per_model,
-                    original=exc,
-                ) from exc
-            raise exc
+            self._rollback(loaded)
+            self._raise_load_failure(exc, phase=phase, slot=slot_idx, dev=dev, launched=launched[0], total=len(plan))
 
-        self.lm_head = lm_head[0]
-        self.layers = [
-            self._build_layer(layer_idx, shared[layer_idx], experts[layer_idx])  # type: ignore[arg-type]
-            for layer_idx in range(self.num_layers)
-        ]
-        self._allocate_shared_buffers()
-        self._expert_pool = ThreadPoolExecutor(max_workers=self.num_expert_workers)
+        # Layer setup and buffer allocation can still fail (an unresolvable output order, a buffer BadAlloc); the
+        # loaded models are not reachable from ``self`` until this succeeds, so roll back here as well.
+        try:
+            self.lm_head = lm_head[0]
+            for layer_idx in range(self.num_layers):
+                self.layers.append(self._build_layer(layer_idx, shared[layer_idx], experts[layer_idx]))  # type: ignore[arg-type]
+            self._allocate_shared_buffers()
+            self._expert_pool = ThreadPoolExecutor(max_workers=self.num_expert_workers)
+        except BaseException as exc:
+            self._rollback(loaded)
+            self._raise_load_failure(exc, phase="allocate", slot=len(plan), dev=-1, launched=launched[0], total=len(plan))
+
+    def _rollback(self, loaded: Sequence[Model]) -> None:
+        """Release every buffer and model of a failed :meth:`launch`."""
+        self._release_buffers()
+        gc.collect()
+        self._dispose_models(loaded)
+        gc.collect()
+        self.accs = {}
+
+    def _raise_load_failure(
+        self, exc: BaseException, *, phase: str, slot: int, dev: int, launched: int, total: int
+    ) -> None:
+        if isinstance(exc, QbRuntimeError) and _is_bad_alloc(exc):
+            raise MobilintBackendAllocError(
+                phase=phase,
+                slot=slot,
+                dev=int(dev),
+                succeeded_so_far=launched,
+                n_total=total,
+                max_batch_size=self.max_batch_size,
+                k_per_model=self.k_per_model,
+                original=exc,
+            ) from exc
+        raise exc
+
+    def _release_buffers(self) -> None:
+        """Drop every NPU buffer reference and the model handles that own them."""
+        if self._expert_pool is not None:
+            # Running expert inferences must finish before their models are disposed.
+            self._expert_pool.shutdown(wait=True, cancel_futures=True)
+            self._expert_pool = None
+        self.layers = []
+        self.lm_head = None
+        self._chunk_buffers = OrderedDict()
+        self._expert_out_pool = {}
+        self._expert_out_pool_scale = {}
+        self._expert_corr = {}
+        self._host_expert_out = None
+        self._host_lm_head_in = None
+        self._host_lm_head_out = None
+        self.kv_owner = None
 
     def dispose(self) -> None:
         """Release every model and accelerator handle held by this backend. Safe to call multiple times."""
-        if self._expert_pool is not None:
-            self._expert_pool.shutdown(wait=False, cancel_futures=True)
-            self._expert_pool = None
         models: list[Model] = []
         for layer in self.layers:
             models.append(layer.shared)
@@ -681,15 +853,7 @@ class MobilintMixtureOfExpertsNPUBackend:
             models.append(self.lm_head)
         # NPU-resident buffers must go before their models and accelerators, or qbruntime warns that the
         # accelerator was destroyed with live NPUData.
-        self.layers = []
-        self.lm_head = None
-        self._chunk_buffers = {}
-        self._expert_out_pool = {}
-        self._expert_out_pool_scale = {}
-        self._expert_corr = {}
-        self._host_expert_out = None
-        self._host_lm_head_in = None
-        self._host_lm_head_out = None
+        self._release_buffers()
         gc.collect()
         self._dispose_models(models)
         del models
@@ -771,7 +935,7 @@ class MobilintMixtureOfExpertsNPUBackend:
     def _build_layer(self, layer_idx: int, shared: Model, experts: list[Model]) -> MobilintMixtureOfExpertsLayer:
         residual_idx, expert_in_idx, gate_idx = self._resolve_output_indices(layer_idx, shared, experts[0])
         # The final shared MXQ may be compiled to emit only the last token (only it feeds the lm_head).
-        last_only = int(shared.get_model_output_shape()[0][1]) == 1
+        last_only = int(shared.get_model_output_shape()[0][_MXQ_TOKEN_AXIS_INDEX]) == 1
         return MobilintMixtureOfExpertsLayer(
             shared=shared,
             experts=experts,
@@ -827,12 +991,18 @@ class MobilintMixtureOfExpertsNPUBackend:
     def _get_chunk_buffers(self, chunk_size: int) -> _ChunkBuffers:
         """Return the shared-MXQ I/O buffers for ``chunk_size``, acquiring them on first use.
 
-        The shared MXQs are compiled with a dynamic sequence axis, so any chunk size works. Buffers are kept per
-        size for the lifetime of the backend; each size costs one input and three output NPU buffers per layer.
+        The shared MXQs are compiled with a dynamic sequence axis, so any chunk size works. Each size costs one input
+        and three output NPU buffers per layer, so only the ``_MAX_CACHED_CHUNK_SIZES`` most recently used sizes stay
+        allocated; a per-call ``npu_prefill_chunk_size`` sweep therefore cannot grow device memory without bound.
         """
         buffers = self._chunk_buffers.get(chunk_size)
         if buffers is not None:
+            self._chunk_buffers.move_to_end(chunk_size)
             return buffers
+        while len(self._chunk_buffers) >= _MAX_CACHED_CHUNK_SIZES:
+            # Dropping the last reference frees the NPUData; collect before allocating the replacement.
+            self._chunk_buffers.popitem(last=False)
+            gc.collect()
         hidden = self.hidden_size
         buffers = _ChunkBuffers([], [], [], [], [], [])
         for layer in self.layers:
