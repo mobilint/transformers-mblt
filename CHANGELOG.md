@@ -8,7 +8,7 @@
   (`transformers_mblt.utils.cache_residency`). Before every infer, the single-row `llm_forward` and
   `MultiSlotDispatcher.dispatch` bind the cache rows they will use: if a slot holds another cache's KV, that cache is
   dumped to host memory first, and the incoming cache's KV is loaded back. A cache that keeps decoding on its own slot
-  never dumps. Design: [docs/design/portable-cache.md](docs/design/portable-cache.md).
+  never dumps.
 - A `MobilintCache` handed to another model instance with the same MXQ and slot topology moves there: it is dumped on
   the old instance and loaded on the new one. A cache from an MXQ with a different KV layout (compiled model,
   quantization, core mode, KV capacity) raises `MobilintCacheStateError`.
