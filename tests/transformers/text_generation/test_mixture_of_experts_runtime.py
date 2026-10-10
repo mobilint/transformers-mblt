@@ -284,6 +284,60 @@ def test_restored_kv_is_reused_instead_of_reset() -> None:
     assert cache.copy().owner is generator.npu_backend
 
 
+def test_fake_prefilled_cache_is_decoded_on_instead_of_reset() -> None:
+    generator = _Generator()
+    cache = MobilintMixtureOfExpertsCache([object(), object()], owner=generator.npu_backend)
+    generator.npu_backend.kv_owner = object()  # some earlier sequence
+
+    cache.fake_prefill(512)
+    generator._prepare_cache_for_generation(None, {"past_key_values": cache}, None, 1, 0)
+
+    assert cache.get_seq_length() == 512
+    assert [layer.get_seq_length() for layer in cache.shared_layers] == [512, 512]
+    assert generator.npu_backend.kv_owner is cache
+
+
+def test_benchmark_fake_prefill_uses_the_model_cache_builder() -> None:
+    from transformers_mblt.utils import benchmark_utils
+
+    built: list[int] = []
+    sentinel = object()
+
+    class _MoEModel:
+        npu_backend = object()
+
+        def get_cache_mxq_model(self) -> None:
+            return None
+
+        def build_mobilint_cache(self, batch_size: int) -> object:
+            built.append(batch_size)
+            return sentinel
+
+    model = _MoEModel()
+    assert benchmark_utils._supports_fake_decode_prefill(model)
+    assert benchmark_utils._build_batched_mobilint_cache(model, 1) is sentinel
+    assert built == [1]
+
+    class _NoCacheModel:
+        npu_backend = object()
+
+        def get_cache_mxq_model(self) -> None:
+            return None
+
+    assert not benchmark_utils._supports_fake_decode_prefill(_NoCacheModel())
+
+
+def test_npu_clock_counts_overlapping_calls_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    ticks = iter([0.0, 1.0, 0.5, 2.0, 3.0, 3.5])  # [0, 1] and [0.5, 2] overlap (two devices), then [3, 3.5]
+    monkeypatch.setattr(moe_utils.time, "perf_counter", lambda: next(ticks))
+    clock = moe_utils._NpuClock()
+    for _ in range(3):
+        clock.call(lambda: None)
+
+    assert clock.pop_seconds() == pytest.approx(2.5)
+    assert clock.pop_seconds() == 0.0  # popping clears the recorded calls
+
+
 # ---- Pack reader fallbacks ------------------------------------------------------------------------------------
 
 

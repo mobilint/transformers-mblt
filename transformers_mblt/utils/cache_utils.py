@@ -1107,9 +1107,15 @@ class MobilintMixtureOfExpertsCache(Cache):
             layer.set_seq_length(int(sequence_lengths))
 
     def fake_prefill(self, sequence_lengths: Union[dict[int, int], int], index: int = 0) -> None:
-        """Mark every shared layer as prefilled without restoring KV cache memory (decode TPS benchmarks)."""
+        """Mark every shared layer as prefilled without restoring KV cache memory (decode TPS benchmarks).
+
+        The cache also claims the NPU KV state, so ``generate()`` decodes on top of it instead of resetting it as a
+        stale cache. The KV contents are whatever the shared MXQs last held: the decoded tokens are meaningless, but
+        each step attends over ``sequence_lengths`` positions, so the measured decode cost is the real one.
+        """
         self.reset()
         self.set_seq_length(sequence_lengths, index=index)
+        self._claim_npu_kv()
 
     def update_cache_position(self, cache_position: torch.Tensor, index: int = 0) -> None:
         del index

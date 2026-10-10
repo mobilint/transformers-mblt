@@ -502,6 +502,11 @@ class MobilintMixtureOfExpertsGenerationMixin(MobilintGenerationMixin):
     def _new_moe_cache(self) -> MobilintMixtureOfExpertsCache:
         return MobilintMixtureOfExpertsCache(cast(Any, self).get_shared_mxq_models(), owner=cast(Any, self).npu_backend)
 
+    def build_mobilint_cache(self, batch_size: int = 1) -> MobilintMixtureOfExpertsCache:
+        """Return a fresh cache for callers that drive generation themselves (the TPS fake-prefill decode sweep)."""
+        self._require_single_batch(batch_size)
+        return self._new_moe_cache()
+
     # Function arguments changed for transformers>=4.56.0; see MobilintGenerationMixin._get_cache.
     def _get_cache(
         self, cache_implementation: str, batch_size: int, max_cache_len: int, *args

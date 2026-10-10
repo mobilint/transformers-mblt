@@ -1821,49 +1821,39 @@ class MobilintMixtureOfExpertsModelMixin(MobilintModelMixin):
 
     def _moe_forward_token(
         self, hidden_states: np.ndarray, cache_size: int, need_logits: bool
-    ) -> tuple[Optional[np.ndarray], float]:
-        """Run one ``[1, 1, hidden]`` token through every layer; return ``(logits[vocab] | None, npu_seconds)``."""
+    ) -> Optional[np.ndarray]:
+        """Run one ``[1, 1, hidden]`` token through every layer; return ``logits[vocab]`` or ``None``."""
         backend = self.npu_backend
-        npu_seconds = 0.0
         hidden = hidden_states
         for layer_idx in range(backend.num_layers):
-            t0 = time.perf_counter()
             residual, gate = backend.shared_forward_token(layer_idx, hidden, cache_size)
-            npu_seconds += time.perf_counter() - t0
             experts, weights = self._moe_route(gate[0, 0])
             weight_of = {int(expert): float(weight) for expert, weight in zip(experts, weights)}
-            t0 = time.perf_counter()
             for expert_idx, output in backend.experts_forward_token(layer_idx, list(weight_of)):
                 residual[0, 0, :] += weight_of[expert_idx] * output
-            npu_seconds += time.perf_counter() - t0
             hidden = residual
         if not need_logits:
-            return None, npu_seconds
-        t0 = time.perf_counter()
+            return None
         logits = backend.lm_head_forward(hidden[0, 0])
-        npu_seconds += time.perf_counter() - t0
-        return logits, npu_seconds
+        return logits
 
     def _moe_forward_chunk(
         self, hidden_states: np.ndarray, cache_size: int, kept: Sequence[int]
-    ) -> tuple[dict[int, np.ndarray], float]:
+    ) -> dict[int, np.ndarray]:
         """Run a ``[1, C, hidden]`` chunk through every layer.
 
-        Returns the logits of the chunk-local positions in ``kept`` and the NPU seconds spent. On a last-only
+        Returns the logits of the chunk-local positions in ``kept``. On a last-only
         release only position ``C - 1`` survives the final layer, so ``kept`` must be a subset of ``{C - 1}``.
         """
         backend = self.npu_backend
         chunk_size = int(hidden_states.shape[1])
-        npu_seconds = 0.0
         hidden = hidden_states
         for layer_idx in range(backend.num_layers):
             if hidden.shape[1] != chunk_size:
                 raise RuntimeError(
                     f"shared[{layer_idx}] needs a {chunk_size}-token input but the previous layer is last-only."
                 )
-            t0 = time.perf_counter()
             residual, gate, expert_in = backend.shared_forward_chunk(layer_idx, hidden, cache_size)
-            npu_seconds += time.perf_counter() - t0
             experts, weights = self._moe_route(gate[0])
             routed: dict[int, list[tuple[int, float]]] = {}
             for token_idx in range(experts.shape[0]):
@@ -1875,11 +1865,9 @@ class MobilintMixtureOfExpertsModelMixin(MobilintModelMixin):
                 expert_idx: expert_in[0, [token_idx for token_idx, _ in tokens], :]
                 for expert_idx, tokens in routed.items()
             }
-            t0 = time.perf_counter()
             for expert_idx, outputs in backend.experts_forward_chunk(layer_idx, expert_inputs):
                 for row, (token_idx, weight) in enumerate(routed[expert_idx]):
                     residual[0, token_idx, :] += weight * outputs[row]
-            npu_seconds += time.perf_counter() - t0
             hidden = residual
 
         logits: dict[int, np.ndarray] = {}
@@ -1888,10 +1876,8 @@ class MobilintMixtureOfExpertsModelMixin(MobilintModelMixin):
             row = position if out_len == chunk_size else position - (chunk_size - 1)
             if not 0 <= row < out_len:
                 raise RuntimeError(f"Chunk position {position} was dropped by a last-only layer.")
-            t0 = time.perf_counter()
             logits[position] = backend.lm_head_forward(hidden[0, row])
-            npu_seconds += time.perf_counter() - t0
-        return logits, npu_seconds
+        return logits
 
     def moe_forward(
         self,
@@ -1925,7 +1911,8 @@ class MobilintMixtureOfExpertsModelMixin(MobilintModelMixin):
 
         embeds = inputs_embeds.detach().to(device="cpu", dtype=torch.float32).numpy()
         logits_by_position: dict[int, np.ndarray] = {}
-        npu_seconds = 0.0
+        # NPU time is the union of the backend's qbruntime call intervals during this forward.
+        self.npu_backend.npu_clock.pop_seconds()
         start = 0
         while start < seq_len:
             end = min(start + chunk_size, seq_len)
@@ -1934,24 +1921,23 @@ class MobilintMixtureOfExpertsModelMixin(MobilintModelMixin):
             if n_tokens == chunk_size and n_tokens > 1 and not (
                 last_only and any(position != n_tokens - 1 for position in local_kept)
             ):
-                chunk_logits, elapsed = self._moe_forward_chunk(embeds[:, start:end, :], past_seen + start, local_kept)
-                npu_seconds += elapsed
+                chunk_logits = self._moe_forward_chunk(embeds[:, start:end, :], past_seen + start, local_kept)
                 for position, logits in chunk_logits.items():
                     logits_by_position[start + position] = logits
             else:
                 if last_only and n_tokens > 1 and len(local_kept) > 1:
                     self._warn_last_only_slow_path_once()
                 for position in range(start, end):
-                    logits, elapsed = self._moe_forward_token(
+                    logits = self._moe_forward_token(
                         embeds[:, position : position + 1, :], past_seen + position, position in kept
                     )
-                    npu_seconds += elapsed
                     if logits is not None:
                         logits_by_position[position] = logits
             start = end
 
         if past_key_values is not None:
             past_key_values.update_cache_position(cache_position)
+        npu_seconds = self.npu_backend.npu_clock.pop_seconds()
         if count_npu_time:
             self.npu_time = npu_seconds
             self._record_npu_timing(timing_phase, npu_seconds)

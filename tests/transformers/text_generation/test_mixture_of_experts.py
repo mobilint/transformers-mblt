@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from transformers_mblt.models.qwen3_moe.configuration_qwen3_moe import MobilintQwen3MoEConfig
+from transformers_mblt.utils import moe_utils
 from transformers_mblt.utils.cache_utils import MobilintMixtureOfExpertsCache
 from transformers_mblt.utils.modeling_utils import MobilintMixtureOfExpertsModelMixin, MobilintModelMixin
 from transformers_mblt.utils.moe_utils import MobilintMixtureOfExpertsNPUBackend
@@ -216,6 +217,7 @@ class _FakeMoEBackend:
         self.layers = [type("Layer", (), {"last_only": last_only and i == num_layers - 1})() for i in range(num_layers)]
         self.calls: list[tuple[str, int, int, int]] = []
         self._token_expert_in: Optional[np.ndarray] = None
+        self.npu_clock = moe_utils._NpuClock()
 
     def _expert(self, layer_idx: int, expert_idx: int, x: np.ndarray) -> np.ndarray:
         return x * (layer_idx + 1) * (expert_idx + 1) / 10.0

@@ -38,6 +38,12 @@
   layer's buffers alive, which made qbruntime warn `Accelerator destroyed with N NPU-resident NPUData still alive`.
   The same warning on exit or model unload is gone as well: an `atexit` hook and the backend finalizer release the
   buffers first when a CLI run or `transformers serve` never calls `dispose()`.
+- `tps sweep` decode rows use fake prefill for MoE releases. A model can provide `build_mobilint_cache(batch_size)`
+  for the benchmark helpers instead of the single-MXQ `MobilintCache`; the MoE generation mixin returns a
+  `MobilintMixtureOfExpertsCache`, whose `fake_prefill()` now claims the NPU KV so `generate()` decodes on top of it.
+- `count_npu_time` on MoE releases counts only qbruntime calls (`infer_npu_data` and `copy_from`), taking the
+  union of overlapping expert calls across devices. Host routing, numpy conversion, the weighted expert sum, buffer
+  acquisition, and thread scheduling are no longer counted as NPU time (decode NPU share: 97.9% -> 70.7%).
 
 ### Changed
 

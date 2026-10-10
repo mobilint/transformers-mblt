@@ -33,6 +33,7 @@ import re
 import sys
 import tempfile
 import threading
+import time
 import uuid
 import weakref
 from collections import OrderedDict
@@ -364,6 +365,44 @@ class _MxqPackReader:
                 logger.warning("Could not delete materialized MXQ %s: %s", path, exc)
 
 
+class _NpuClock:
+    """Time spent in qbruntime calls, counting calls that overlap (experts on different devices) once.
+
+    Every ``infer_npu_data`` / ``copy_from`` goes through :meth:`call`, which records its ``[start, end]`` interval;
+    :meth:`pop_seconds` returns the length of the union of the recorded intervals and clears them. Host work between
+    the calls (routing, numpy conversions, the weighted expert sum, buffer acquisition, thread scheduling) is left out,
+    matching ``MobilintModelMixin``, which times only ``Model.infer``.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._spans: list[tuple[float, float]] = []
+
+    def call(self, fn: Callable[..., Any], *args: Any) -> Any:
+        start = time.perf_counter()
+        try:
+            return fn(*args)
+        finally:
+            end = time.perf_counter()
+            with self._lock:
+                self._spans.append((start, end))
+
+    def pop_seconds(self) -> float:
+        with self._lock:
+            spans, self._spans = self._spans, []
+        total, cur_start, cur_end = 0.0, None, None
+        for start, end in sorted(spans):
+            if cur_end is None or start > cur_end:
+                if cur_end is not None:
+                    total += cur_end - cur_start
+                cur_start, cur_end = start, end
+            elif end > cur_end:
+                cur_end = end
+        if cur_end is not None:
+            total += cur_end - cur_start
+        return total
+
+
 def _is_bad_alloc(exc: BaseException) -> bool:
     """Return True when ``exc`` reports a qbruntime device-memory ``BadAlloc``."""
     return "badalloc" in str(exc).lower().replace(" ", "")
@@ -482,6 +521,7 @@ class MobilintMixtureOfExpertsNPUBackend:
         # The cache whose sequence currently lives in the shared MXQs' KV state (``None`` after a cache-less forward).
         self.kv_owner: Any = None
         self._exit_hook: Optional[Callable[[], None]] = None
+        self.npu_clock = _NpuClock()
         self._expert_out_pool: dict[int, list[Any]] = {}
         self._expert_out_pool_scale: dict[int, Any] = {}
         self._expert_corr: dict[tuple[int, int], Any] = {}
@@ -1080,10 +1120,10 @@ class MobilintMixtureOfExpertsNPUBackend:
         """
         layer = self.layers[layer_idx]
         layer.host_in[:] = hidden_states
-        layer.npu_in.copy_from(layer.host_in)
-        layer.shared.infer_npu_data([layer.npu_in], layer.npu_out, cache_size)
-        layer.host_gate.copy_from(layer.npu_out[layer.gate_idx])
-        layer.host_residual.copy_from(layer.npu_out[layer.residual_idx])
+        self.npu_clock.call(layer.npu_in.copy_from, layer.host_in)
+        self.npu_clock.call(layer.shared.infer_npu_data, [layer.npu_in], layer.npu_out, cache_size)
+        self.npu_clock.call(layer.host_gate.copy_from, layer.npu_out[layer.gate_idx])
+        self.npu_clock.call(layer.host_residual.copy_from, layer.npu_out[layer.residual_idx])
         gate = np.array(layer.host_gate[:], dtype=np.float32)
         residual = np.array(layer.host_residual[:], dtype=np.float32)
         return residual, gate
@@ -1098,7 +1138,7 @@ class MobilintMixtureOfExpertsNPUBackend:
             src = layer.npu_out[layer.expert_in_idx]
         else:
             src = layer.npu_expert_in_by_dev[dev]
-        layer.experts[expert_idx].infer_npu_data([src], [out_buffer])
+        self.npu_clock.call(layer.experts[expert_idx].infer_npu_data, [src], [out_buffer])
         return expert_idx
 
     def experts_forward_token(self, layer_idx: int, expert_indices: Sequence[int]) -> Iterator[tuple[int, np.ndarray]]:
@@ -1112,10 +1152,10 @@ class MobilintMixtureOfExpertsNPUBackend:
         devices = {self.expert_device_of(expert_idx) for expert_idx in expert_indices}
         remote = devices - {layer.shared_dev}
         if remote:
-            layer.host_expert_in.copy_from(layer.npu_out[layer.expert_in_idx])
+            self.npu_clock.call(layer.host_expert_in.copy_from, layer.npu_out[layer.expert_in_idx])
             for dev in remote:
                 layer.host_expert_in_by_dev[dev][:] = layer.host_expert_in[:]
-                layer.npu_expert_in_by_dev[dev].copy_from(layer.host_expert_in_by_dev[dev])
+                self.npu_clock.call(layer.npu_expert_in_by_dev[dev].copy_from, layer.host_expert_in_by_dev[dev])
 
         used: dict[int, int] = {}
         futures = {}
@@ -1126,7 +1166,7 @@ class MobilintMixtureOfExpertsNPUBackend:
             futures[self._expert_pool.submit(self._infer_expert_token, layer_idx, expert_idx, out_buffer)] = out_buffer
         for future in as_completed(futures):
             expert_idx = future.result()
-            self._host_expert_out.copy_from(futures[future])
+            self.npu_clock.call(self._host_expert_out.copy_from, futures[future])
             output = np.asarray(self._host_expert_out[:], dtype=np.float32)[0, 0, :]
             yield expert_idx, output * self._expert_correction(layer_idx, expert_idx)
 
@@ -1142,12 +1182,12 @@ class MobilintMixtureOfExpertsNPUBackend:
         buffers = self._get_chunk_buffers(chunk_size)
         layer = self.layers[layer_idx]
         buffers.host_in[layer_idx][:] = hidden_states
-        buffers.npu_in[layer_idx].copy_from(buffers.host_in[layer_idx])
+        self.npu_clock.call(buffers.npu_in[layer_idx].copy_from, buffers.host_in[layer_idx])
         npu_out = buffers.npu_out[layer_idx]
-        layer.shared.infer_npu_data([buffers.npu_in[layer_idx]], npu_out, cache_size)
-        buffers.host_gate[layer_idx].copy_from(npu_out[layer.gate_idx])
-        buffers.host_expert_in[layer_idx].copy_from(npu_out[layer.expert_in_idx])
-        buffers.host_residual[layer_idx].copy_from(npu_out[layer.residual_idx])
+        self.npu_clock.call(layer.shared.infer_npu_data, [buffers.npu_in[layer_idx]], npu_out, cache_size)
+        self.npu_clock.call(buffers.host_gate[layer_idx].copy_from, npu_out[layer.gate_idx])
+        self.npu_clock.call(buffers.host_expert_in[layer_idx].copy_from, npu_out[layer.expert_in_idx])
+        self.npu_clock.call(buffers.host_residual[layer_idx].copy_from, npu_out[layer.residual_idx])
         return (
             np.array(buffers.host_residual[layer_idx][:], dtype=np.float32),
             np.array(buffers.host_gate[layer_idx][:], dtype=np.float32),
@@ -1155,7 +1195,7 @@ class MobilintMixtureOfExpertsNPUBackend:
         )
 
     def _infer_expert_chunk(self, layer_idx: int, expert_idx: int, npu_in: Any, npu_out: Any) -> int:
-        self.layers[layer_idx].experts[expert_idx].infer_npu_data([npu_in], [npu_out])
+        self.npu_clock.call(self.layers[layer_idx].experts[expert_idx].infer_npu_data, [npu_in], [npu_out])
         return expert_idx
 
     def experts_forward_chunk(
@@ -1177,18 +1217,18 @@ class MobilintMixtureOfExpertsNPUBackend:
             npu_out = expert.acquire_output_npu_data([1, n_tokens, hidden], 0, True)
             host_out = expert.acquire_output_npu_data([1, n_tokens, hidden], 0, False)
             host_in[:] = tokens.reshape(1, n_tokens, hidden)
-            npu_in.copy_from(host_in)
+            self.npu_clock.call(npu_in.copy_from, host_in)
             future = self._expert_pool.submit(self._infer_expert_chunk, layer_idx, expert_idx, npu_in, npu_out)
             futures[future] = (npu_out, host_out)
         for future in as_completed(futures):
             expert_idx = future.result()
             npu_out, host_out = futures[future]
-            host_out.copy_from(npu_out)
+            self.npu_clock.call(host_out.copy_from, npu_out)
             yield expert_idx, np.asarray(host_out[:], dtype=np.float32)[0]
 
     def lm_head_forward(self, hidden_states: np.ndarray) -> np.ndarray:
         """Run the ``lm_head`` on one ``[hidden]`` hidden state and return ``[vocab]`` logits."""
         assert self.lm_head is not None, "launch() must run before inference."
         self._host_lm_head_in[:] = hidden_states.reshape(1, 1, self.hidden_size)
-        self.lm_head.infer_npu_data([self._host_lm_head_in], [self._host_lm_head_out])
+        self.npu_clock.call(self.lm_head.infer_npu_data, [self._host_lm_head_in], [self._host_lm_head_out])
         return np.array(self._host_lm_head_out[:], dtype=np.float32)[0, 0]
