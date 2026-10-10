@@ -541,3 +541,11 @@ def test_snapshot_of_an_evicted_fake_prefill_cache_restores_length_only() -> Non
     assert fake.get_seq_length() == 65
     assert not fake.layers[0].kv_valid
     assert [call for call in backend.mxq_models[0].calls if call[0] == "load"] == []
+
+
+def test_batched_request_larger_than_the_chosen_slots_is_rejected_up_front() -> None:
+    cache = MobilintCache(_Backend(n=1, k=4).mxq_models, per_model_batch=4, slots=[(0, 1), (0, 2)])
+
+    MobilintModelMixin._validate_batch_cache(cache, 2)
+    with pytest.raises(ValueError, match="cache rows=2, input batch_size=3"):
+        MobilintModelMixin._validate_batch_cache(cache, 3)

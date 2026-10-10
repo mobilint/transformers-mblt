@@ -1675,10 +1675,14 @@ class MobilintModelMixin(PretrainedOnlyMixin, PreTrainedModel):
             cache_batch_size = n_models * k_per_model
         else:
             cache_batch_size = getattr(past_key_values, "batch_size", 1)
+        # A cache built with ``slots=`` has only the rows it names, fewer than its N * K topology.
+        layers = getattr(past_key_values, "layers", None)
+        if hasattr(past_key_values, "slot_of") and isinstance(layers, list):
+            cache_batch_size = min(cache_batch_size, len(layers))
         if cache_batch_size < batch_size:
             raise ValueError(
                 "Batch cache size is too small: "
-                f"cache capacity (n_models*k_per_model)={cache_batch_size}, input batch_size={batch_size}. "
+                f"cache rows={cache_batch_size}, input batch_size={batch_size}. "
                 "Create MobilintCache with capacity greater than or equal to the batched request."
             )
 
