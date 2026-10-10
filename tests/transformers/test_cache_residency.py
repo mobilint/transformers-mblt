@@ -697,3 +697,26 @@ def test_restored_cache_on_a_disposed_backend_uses_its_host_snapshot_or_reports_
 
     _run(from_snapshot, target, 0, "!")
     assert _slot(target) == "kept!"
+
+
+def test_cache_displaced_by_a_second_restore_snapshots_its_own_kv(tmp_path) -> None:
+    backend = _Backend()
+    first, second = MobilintCache(backend.mxq_models), MobilintCache(backend.mxq_models)
+    for name in ("a", "b", "out"):
+        (tmp_path / name).mkdir()
+    _restore_from_file(first, backend, "first", tmp_path / "a")
+    _restore_from_file(second, backend, "second", tmp_path / "b")  # `first` is saved to the host
+
+    first.dump_cache_memory()
+    assert first.layers[0].buffer == [b"first"]
+
+    written: dict[str, object] = {}
+    mxq = backend.mxq_models[0]
+    mxq.dump_cache_memory_to = lambda cache_dir, cache_id=0: written.setdefault(cache_dir, mxq.slots[cache_id])
+    first.dump_cache_memory_to(str(tmp_path / "out"))
+    assert written[str(tmp_path / "out")] == "first"
+
+    _run(second, backend, 0, "?")  # `second` was saved before `first` went back on the slot
+    assert _slot(backend) == "second?"
+    _run(first, backend, 0, "!")
+    assert _slot(backend) == "first!"

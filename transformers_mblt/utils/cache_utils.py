@@ -86,6 +86,9 @@ class MobilintLayer(CacheLayerMixin):
         self._residency_hint: Optional[Any] = None  # weakref to the residency that last managed this layer
         self._kv_signature: Optional[tuple] = None
         self._owner_cache: Optional[Any] = None  # weakref to the multi-layer cache this layer belongs to, if any
+        # True once this layer's KV was saved to ``_host_kv`` because its slot was taken (by an owner table or by
+        # another direct load). The slot no longer holds this layer's KV until it is put back.
+        self._off_slot = False
 
     def lazy_initialization(self, key_states: torch.Tensor, value_states: Optional[torch.Tensor] = None):
         del value_states
@@ -235,9 +238,23 @@ class MobilintLayer(CacheLayerMixin):
         elif pending_owner(self.mxq_model, self.cache_id) is self:
             save_pending_owner(self.mxq_model, self.cache_id)
 
+    def _kv_is_off_slot(self) -> bool:
+        """Whether this layer's KV lives in ``_host_kv`` rather than on its slot."""
+        return (self.is_managed or self._off_slot) and not self.is_resident
+
+    def _put_back_on_slot(self) -> None:
+        """Load this layer's host KV back onto its slot so qbruntime can read it there (file dumps)."""
+        residency = self._loading_residency()
+        if residency is not None:
+            residency.acquire(self, self.mxq_model, self.cache_id)
+            return
+        save_pending_owner(self.mxq_model, self.cache_id)  # the direct load below overwrites the slot
+        self._load_into_slot()
+        note_direct_load(self)
+
     def dump_cache_memory(self):
         """Snapshot the current KV into ``buffer``; :meth:`load_cache_memory` restores it."""
-        if self.is_managed and not self.is_resident:
+        if self._kv_is_off_slot():
             # The KV is not on the NPU: it was saved to the host when this layer lost its slot.
             if self._seen_tokens > 0 and self.kv_valid and self._host_valid_len < self._seen_tokens:
                 raise MobilintCacheStateError(
@@ -271,10 +288,9 @@ class MobilintLayer(CacheLayerMixin):
             note_direct_load(self)
 
     def dump_cache_memory_to(self, cache_dir: str):
-        residency = self._residency()
-        if residency is not None and not self.is_resident:
+        if self._kv_is_off_slot():
             # The slot holds another cache's KV: put this layer's KV back on it before writing the files.
-            residency.acquire(self, self.mxq_model, self.cache_id)
+            self._put_back_on_slot()
         self.mxq_model.dump_cache_memory_to(cache_dir, self.cache_id)
         seq_path = Path(cache_dir) / "seq_length.txt"
         seq_path.write_text(f"{self.get_seq_length()}\n", encoding="utf-8")

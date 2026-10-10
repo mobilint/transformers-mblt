@@ -61,12 +61,7 @@ def pending_owner(mxq_model: Any, cache_id: int) -> Optional["MobilintLayer"]:
         return None
     model_ref, layer_ref = entry
     layer = layer_ref()
-    if (
-        model_ref() is not mxq_model
-        or layer is None
-        or layer.mxq_model is not mxq_model
-        or _is_disposed(mxq_model)
-    ):
+    if model_ref() is not mxq_model or layer is None or layer.mxq_model is not mxq_model or _is_disposed(mxq_model):
         _PENDING_OWNERS.pop((id(mxq_model), int(cache_id)), None)
         return None
     return layer
@@ -78,6 +73,7 @@ def save_pending_owner(mxq_model: Any, cache_id: int) -> None:
     if layer is not None:
         layer._save_from_slot()
         _PENDING_OWNERS.pop((id(mxq_model), int(cache_id)), None)
+        layer._off_slot = True
 
 
 def note_direct_load(layer: "MobilintLayer") -> None:
@@ -85,6 +81,7 @@ def note_direct_load(layer: "MobilintLayer") -> None:
 
     Call :func:`save_pending_owner` for the slot before the load, so a previous pending owner is saved first.
     """
+    layer._off_slot = False
     try:
         _PENDING_OWNERS[(id(layer.mxq_model), int(layer.cache_id))] = (weakref.ref(layer.mxq_model), weakref.ref(layer))
     except TypeError:  # Models without __weakref__ (test doubles)
@@ -199,6 +196,7 @@ class MobilintKVResidency:
         self._owners[key] = (weakref.ref(mxq_model), int(cache_id), weakref.ref(layer))
         layer._resident_at = weakref.ref(self)
         layer._residency_hint = weakref.ref(self)
+        layer._off_slot = False
 
     def is_resident(self, layer: "MobilintLayer") -> bool:
         # Refresh first: a slot on a disposed backend or a replaced Model must not count as live.
@@ -236,6 +234,7 @@ class MobilintKVResidency:
         layer._save_from_slot()
         self._record(mxq_model, cache_id, None)
         layer._resident_at = None
+        layer._off_slot = True
 
     def evict_layer(self, layer: "MobilintLayer") -> None:
         """Evict ``layer`` from its slot if it is resident here.
