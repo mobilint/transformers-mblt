@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Portable caches, part 1 (dense LLMs). Each backend keeps an owner table of its KV slots
+  (`transformers_mblt.utils.cache_residency`). Before every infer, the single-row `llm_forward` and
+  `MultiSlotDispatcher.dispatch` bind the cache rows they will use: if a slot holds another cache's KV, that cache is
+  dumped to host memory first, and the incoming cache's KV is loaded back. A cache that keeps decoding on its own slot
+  never dumps. Design: [docs/design/portable-cache.md](docs/design/portable-cache.md).
+- A `MobilintCache` handed to another model instance with the same MXQ and slot topology moves there: it is dumped on
+  the old instance and loaded on the new one. A cache from an MXQ with a different KV layout (compiled model,
+  quantization, core mode, KV capacity) raises `MobilintCacheStateError`.
+- `MobilintCache(..., slots=[(model_idx, cache_id), ...])` places rows on chosen NPU slots, so a serving engine can
+  keep one cache per request on the slot it assigned. `MobilintCache.offload()`, `is_resident` and `host_nbytes`
+  expose residency, and `copy()` is a snapshot that a resident cache saves before copying.
+
+### Fixed
+
+- Reusing a dense-LLM cache after another cache, or a forward without a cache, had run on the same model no longer
+  reads the other sequence's KV. Before, `generate(past_key_values=cache)` continued from the stale NPU state and
+  produced wrong output silently.
+
 ## 0.2.0
 
 ### Added

@@ -33,6 +33,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _is_bindable_cache(past_key_values: object) -> bool:
+    """Whether the cache moves its KV through the backend's owner table.
+
+    Beam caches replay token histories on one slot instead and keep their own bookkeeping.
+    """
+    from .cache_utils import MobilintBeamCache, MobilintCache
+
+    return isinstance(past_key_values, MobilintCache) and not isinstance(past_key_values, MobilintBeamCache)
+
+
 PhaseName = Literal["prefill", "decode"]
 LayoutName = Literal["n_items", "n_tokens"]
 
@@ -209,6 +219,12 @@ class MultiSlotDispatcher:
             ``backend.output_layout``); ``first_group_shape`` is the first
             group's ``inputs_embeds_numpy.shape`` retained for debug logging.
         """
+        # A cache built on another model instance with the same topology moves
+        # here: point it at this backend's handles before the identity check.
+        bindable = _is_bindable_cache(past_key_values)
+        if bindable:
+            past_key_values.adopt_backend(self.backend)  # type: ignore[union-attr]
+
         # Topology + identity check: reject a caller-supplied cache whose
         # ``(N, K)`` disagrees with the backend or whose ``mxq_models``
         # reference stale slot handles. Runs once per dispatch, before any
@@ -258,8 +274,27 @@ class MultiSlotDispatcher:
                 )
                 for m in sorted(buckets.keys())
             ]
+        elif past_key_values is not None and hasattr(past_key_values, "slot_of"):
+            # A cache may place rows on chosen cache_ids (``MobilintCache(slots=...)``).
+            groups = [(0, list(range(len(cache_ids))), [self.slot_of(row, past_key_values)[1] for row in cache_ids])]
         else:
             groups = [(0, list(range(len(cache_ids))), list(cache_ids))]
+
+        # Every slot this dispatch writes must hold the right sequence's KV. Bind
+        # here, on the caller thread, before infers fan out to worker threads.
+        if bindable:
+            past_key_values.bind_rows(self.backend, cache_ids)  # type: ignore[union-attr]
+        elif past_key_values is None:
+            from .cache_residency import bind_cacheless
+
+            bind_cacheless(
+                self.backend,
+                [
+                    (mxq_models[m_idx], local_id)
+                    for m_idx, _items, local_ids in groups
+                    for local_id in local_ids
+                ],
+            )
 
         def _classify_phase() -> PhaseName:
             # Path 3 fallback advances a shared cursor across the batch and

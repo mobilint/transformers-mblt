@@ -798,6 +798,7 @@ class MobilintModelMixin(PretrainedOnlyMixin, PreTrainedModel):
             inputs_embeds_numpy = np.expand_dims(inputs_embeds_numpy, 1)  # (batch, 1, seqlen, hidden_size)
 
         seq_len = inputs_embeds_numpy.shape[2]
+        self._bind_single_slot_cache(past_key_values)
         mxq_model = self.npu_backend.mxq_models[0]
         initial_cache_size = 0 if past_key_values is None else past_key_values.get_seq_length()
         timing_phase: Literal["prefill", "decode"] = "prefill" if initial_cache_size == 0 else "decode"
@@ -841,6 +842,28 @@ class MobilintModelMixin(PretrainedOnlyMixin, PreTrainedModel):
             device=inputs_embeds.device,
         )
         return logits.squeeze(0)
+
+    def _bind_single_slot_cache(self, past_key_values: Optional[MobilintCache]) -> None:
+        """Make slot ``(mxq_models[0], cache_id 0)`` hold ``past_key_values``' row 0 before a single-row infer.
+
+        Saves whichever cache held the slot, loads this cache's KV if it was elsewhere (another cache ran in
+        between, or it was built on another model instance), and records the new owner. Without a cache, the
+        slot's owner is saved and the slot is left unowned.
+        """
+        from .cache_residency import bind_cacheless
+        from .multi_slot_dispatch import _is_bindable_cache
+
+        backend = self.npu_backend
+        if past_key_values is None:
+            bind_cacheless(backend, [(backend.mxq_models[0], 0)])
+            return
+        if not _is_bindable_cache(past_key_values):
+            return
+        if past_key_values.slot_of(0) != (0, 0):
+            raise ValueError(
+                f"Single-row forward runs on slot (0, 0), but the cache places row 0 on {past_key_values.slot_of(0)}."
+            )
+        past_key_values.bind_rows(backend, [0])
 
     def resolve_batched_attention_mask(
         self,
