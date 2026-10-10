@@ -1167,7 +1167,10 @@ def test_llm_eagle3_forward_accepts_dict_hidden_states() -> None:
 
     model = _DummyModel()
     cache = object.__new__(_FakeEagle3Cache)
-    cache.base_layer = SimpleNamespace(update_seen_tokens=lambda _n: None)
+    seen = {"n": 0}
+    cache.base_layer = SimpleNamespace(
+        update_seen_tokens=lambda n: seen.__setitem__("n", seen["n"] + n), get_seq_length=lambda: seen["n"]
+    )
 
     output = llm_eagle3_forward(model, input_ids=torch.tensor([[1]], dtype=torch.long), past_key_values=cache)
 
@@ -1206,7 +1209,10 @@ def test_llm_eagle3_forward_accepts_object_hidden_states_and_missing_hidden_stat
         """Type-check compatible cache stub for llm_eagle3_forward tests."""
 
     cache = object.__new__(_FakeEagle3Cache)
-    cache.base_layer = SimpleNamespace(update_seen_tokens=lambda _n: None)
+    seen = {"n": 0}
+    cache.base_layer = SimpleNamespace(
+        update_seen_tokens=lambda n: seen.__setitem__("n", seen["n"] + n), get_seq_length=lambda: seen["n"]
+    )
     with_hidden = llm_eagle3_forward(
         _DummyModel(with_hidden_states=True),
         input_ids=torch.tensor([[1]], dtype=torch.long),

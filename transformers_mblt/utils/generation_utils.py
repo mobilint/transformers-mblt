@@ -20,6 +20,7 @@ from ..utils.cache_utils import (
     build_mobilint_cache_from_model,
     cache_matches_backend_topology,
     defer_eagle3_accept_tokens,
+    note_eagle3_fed_tokens,
     take_eagle3_unfed_tokens,
 )
 from ..utils.modeling_utils import MobilintModelMixin
@@ -107,6 +108,7 @@ def llm_eagle3_forward(
         consumed_tokens = int(inputs_embeds.shape[1])
     if consumed_tokens > 0:
         past_key_values.update_base_seen_tokens(consumed_tokens)
+        note_eagle3_fed_tokens(past_key_values, input_ids)  # embeddings only: the ids are unknown
 
     loss = None
     if labels is not None:

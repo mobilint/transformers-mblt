@@ -451,6 +451,7 @@ def test_a_failed_forward_keeps_the_cache_on_its_slots(monkeypatch: pytest.Monke
     assert cache.is_resident
     assert all(model.calls == [] for model in shared_models)
 
+
 def test_benchmark_fake_prefill_uses_the_model_cache_builder() -> None:
     from transformers_mblt.utils import benchmark_utils
 

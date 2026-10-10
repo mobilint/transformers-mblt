@@ -1182,6 +1182,38 @@ def take_eagle3_unfed_tokens(cache: Any) -> Optional[torch.LongTensor]:
     return tokens
 
 
+def note_eagle3_fed_tokens(cache: Any, token_ids: Optional[torch.LongTensor]) -> None:
+    """Record ids just fed to the base MXQ (after its length advanced), or ``None`` when they are unknown.
+
+    ``fed_token_ids`` lets the next call tell a full-sequence input (it starts with exactly these ids) from a
+    delta-only one. A gap in the record (ids fed somewhere that did not note them) makes it unknown.
+    """
+    if token_ids is None:
+        cache.fed_token_ids = None
+        return
+    token_ids = token_ids.detach().to("cpu", dtype=torch.long)
+    base_len = int(cache.get_base_seq_length())
+    previous_len = base_len - int(token_ids.shape[1])
+    known = eagle3_fed_tokens(cache, length=previous_len)
+    if known is not None:
+        cache.fed_token_ids = torch.cat((known, token_ids), dim=1)
+    elif previous_len == 0:
+        cache.fed_token_ids = token_ids.clone()
+    else:
+        cache.fed_token_ids = None
+
+
+def eagle3_fed_tokens(cache: Any, length: Optional[int] = None) -> Optional[torch.LongTensor]:
+    """The ids of the first ``length`` (default: all cached) base tokens, if the cache knows them."""
+    length = int(cache.get_base_seq_length()) if length is None else int(length)
+    if length == 0:
+        return torch.empty((1, 0), dtype=torch.long)
+    known = getattr(cache, "fed_token_ids", None)
+    if known is None or known.shape[1] < length:
+        return None
+    return known[:, :length]
+
+
 class MobilintEagle3Cache(Cache):
     """Mobilint cache for EAGLE-3 speculative decoding.
 
@@ -1211,6 +1243,8 @@ class MobilintEagle3Cache(Cache):
         # Tokens already returned to the caller whose KV the base and draft MXQs do not hold yet: generation stops
         # without feeding the last accepted tokens, and the next generate() or forward feeds them first.
         self.unfed_tokens: Optional[torch.LongTensor] = None
+        # Ids of the tokens the base MXQ holds, when every feed recorded them (see note_eagle3_fed_tokens).
+        self.fed_token_ids: Optional[torch.LongTensor] = torch.empty((1, 0), dtype=torch.long)
 
     @property
     def is_resident(self) -> bool:
@@ -1246,10 +1280,11 @@ class MobilintEagle3Cache(Cache):
 
     def set_seq_length(self, sequence_length: int, index: int = 0) -> None:
         del index
-        self.base_layer.set_seq_length(sequence_length)
+        self.set_base_seq_length(sequence_length)
 
     def set_base_seq_length(self, sequence_length: int) -> None:
         self.base_layer.set_seq_length(sequence_length)
+        self.fed_token_ids = eagle3_fed_tokens(self)  # keep only the ids of the tokens still cached
 
     def set_draft_seq_length(self, sequence_length: int) -> None:
         self.draft_layer.set_seq_length(sequence_length)
@@ -1274,6 +1309,7 @@ class MobilintEagle3Cache(Cache):
         self.draft_layer.fake_prefill(sequence_length)
         self.clear_tree_state()
         self.unfed_tokens = None
+        self.fed_token_ids = None
 
     def clear_tree_state(self) -> None:
         """Drop speculative decoding metadata while preserving KV cache state."""
@@ -1289,6 +1325,7 @@ class MobilintEagle3Cache(Cache):
         self.clear_tree_state()
         self.unfed_tokens = None
         self._snapshot_unfed_tokens = None
+        self.fed_token_ids = torch.empty((1, 0), dtype=torch.long)
 
     def bind_base(self, base_mxq_model: Any) -> None:
         """Make ``base_mxq_model`` hold this cache's base KV before a base infer (moving it there if needed)."""
@@ -1309,12 +1346,16 @@ class MobilintEagle3Cache(Cache):
         self.draft_layer.dump_cache_memory()
         unfed = getattr(self, "unfed_tokens", None)
         self._snapshot_unfed_tokens = None if unfed is None else unfed.clone()
+        fed = eagle3_fed_tokens(self)
+        self._snapshot_fed_token_ids = None if fed is None else fed.clone()
 
     def load_cache_memory(self) -> None:
         self.base_layer.load_cache_memory()
         self.draft_layer.load_cache_memory()
         snapshot = getattr(self, "_snapshot_unfed_tokens", None)
         self.unfed_tokens = None if snapshot is None else snapshot.clone()
+        fed = getattr(self, "_snapshot_fed_token_ids", None)
+        self.fed_token_ids = None if fed is None else fed.clone()
 
     def dump_cache_memory_to(self, cache_dir: str, index: int = 0) -> None:
         del index
@@ -1326,10 +1367,16 @@ class MobilintEagle3Cache(Cache):
         self.draft_layer.dump_cache_memory_to(str(draft_dir))
         unfed = getattr(self, "unfed_tokens", None)
         unfed_path = Path(cache_dir) / self._UNFED_TOKENS_FILE
-        if unfed is None:
-            unfed_path.unlink(missing_ok=True)
-        else:
-            unfed_path.write_text(json.dumps(unfed.tolist()), encoding="utf-8")
+        fed = eagle3_fed_tokens(self)
+        unfed_path.write_text(
+            json.dumps(
+                {
+                    "unfed_tokens": None if unfed is None else unfed.tolist(),
+                    "fed_token_ids": None if fed is None else fed.tolist(),
+                }
+            ),
+            encoding="utf-8",
+        )
 
     def load_cache_memory_from(self, cache_dir: str, index: int = 0) -> None:
         del index
@@ -1337,8 +1384,13 @@ class MobilintEagle3Cache(Cache):
         self.base_layer.load_cache_memory_from(str(Path(cache_dir) / "base"))
         self.draft_layer.load_cache_memory_from(str(Path(cache_dir) / "draft"))
         unfed_path = Path(cache_dir) / self._UNFED_TOKENS_FILE
+        self.fed_token_ids = None  # unknown unless the snapshot recorded them
         if unfed_path.exists():
-            self.unfed_tokens = torch.tensor(json.loads(unfed_path.read_text(encoding="utf-8")), dtype=torch.long)
+            state = json.loads(unfed_path.read_text(encoding="utf-8"))
+            if state.get("unfed_tokens") is not None:
+                self.unfed_tokens = torch.tensor(state["unfed_tokens"], dtype=torch.long)
+            if state.get("fed_token_ids") is not None:
+                self.fed_token_ids = torch.tensor(state["fed_token_ids"], dtype=torch.long)
 
     def copy(self) -> "MobilintEagle3Cache":
         """Return a snapshot of the committed KV state and the tokens still to be fed.
@@ -1356,6 +1408,10 @@ class MobilintEagle3Cache(Cache):
         copied.unfed_tokens = None if unfed is None else unfed.clone()
         snapshot = getattr(self, "_snapshot_unfed_tokens", None)
         copied._snapshot_unfed_tokens = None if snapshot is None else snapshot.clone()
+        fed = getattr(self, "fed_token_ids", None)
+        copied.fed_token_ids = None if fed is None else fed.clone()
+        fed_snapshot = getattr(self, "_snapshot_fed_token_ids", None)
+        copied._snapshot_fed_token_ids = None if fed_snapshot is None else fed_snapshot.clone()
         return copied
 
 

@@ -15,7 +15,13 @@ from transformers.generation.logits_process import (
 )
 from transformers.utils import logging
 
-from ..cache_utils import MobilintEagle3Cache, defer_eagle3_accept_tokens, take_eagle3_unfed_tokens
+from ..cache_utils import (
+    MobilintEagle3Cache,
+    defer_eagle3_accept_tokens,
+    eagle3_fed_tokens,
+    note_eagle3_fed_tokens,
+    take_eagle3_unfed_tokens,
+)
 
 logger = logging.get_logger(__name__)
 
@@ -151,6 +157,7 @@ def _commit_accept_tokens_to_base(cache: MobilintEagle3Cache) -> None:
     accepted_prefix_length = int(cache.accept_tokens.shape[1])
     if accepted_prefix_length > 0:
         cache.update_base_seen_tokens(accepted_prefix_length)
+        note_eagle3_fed_tokens(cache, cache.accept_tokens)
     cache.accept_tokens = None
 
 
@@ -378,16 +385,27 @@ def initialize_tree(
     unfed = take_eagle3_unfed_tokens(cache)
     if unfed is not None:
         unfed = unfed.to(input_ids.device)
+    # A reused cache accepts the full sequence (HF style) or only the new tokens. The input is the full sequence
+    # when it starts with exactly the ids the base already holds; when the cache does not know them (fed as
+    # embeddings, restored from an older snapshot) only the length can tell.
+    known_ids = eagle3_fed_tokens(cache)
+    if known_ids is not None:
+        full_sequence = input_ids.shape[1] > base_seq_length and torch.equal(
+            input_ids[:, :base_seq_length], known_ids.to(input_ids.device)
+        )
+    elif unfed is not None:
         fed_end = base_seq_length + unfed.shape[1]
-        if not (input_ids.shape[1] > fed_end - 1 and torch.equal(input_ids[:, base_seq_length:fed_end], unfed)):
-            # A delta-only input does not repeat the tokens the previous call returned without feeding them.
-            input_ids = torch.cat((unfed, input_ids), dim=1)
-            prompt_delta_input_ids = input_ids
-        else:
-            prompt_delta_input_ids = input_ids[:, base_seq_length:]
-    # Support both HF-style delta-only inputs and full-sequence inputs when cache is reused.
-    elif input_ids.shape[1] > base_seq_length:
+        full_sequence = input_ids.shape[1] >= fed_end and torch.equal(input_ids[:, base_seq_length:fed_end], unfed)
+    else:
+        full_sequence = input_ids.shape[1] > base_seq_length
+    if full_sequence:
+        # The full sequence carries the tokens a previous call returned without feeding (or the caller's edit
+        # of them), so it is fed as given.
         prompt_delta_input_ids = input_ids[:, base_seq_length:]
+    elif unfed is not None:
+        # A delta-only input does not repeat the tokens the previous call returned without feeding them.
+        input_ids = torch.cat((unfed, input_ids), dim=1)
+        prompt_delta_input_ids = input_ids
     else:
         prompt_delta_input_ids = input_ids
     if prompt_delta_input_ids.shape[1] == 0:
@@ -409,6 +427,7 @@ def initialize_tree(
             cache.unfed_tokens = unfed  # not fed: keep them for a retry
         raise
     cache.update_base_seen_tokens(prompt_delta_input_ids.shape[1])
+    note_eagle3_fed_tokens(cache, prompt_delta_input_ids)
 
     if logits_processor is not None:
         token = _sample_next_token_from_processor(logits, logits_processor)

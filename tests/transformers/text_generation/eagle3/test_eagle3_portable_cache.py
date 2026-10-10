@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from transformers_mblt.utils.cache_residency import MobilintCacheStateError
-from transformers_mblt.utils.cache_utils import MobilintEagle3Cache
+from transformers_mblt.utils.cache_utils import MobilintEagle3Cache, eagle3_fed_tokens, note_eagle3_fed_tokens
 from transformers_mblt.utils.eagle3.tree_decoding import initialize_tree
 from transformers_mblt.utils.generation_utils import MobilintEagle3GenerationMixin, llm_eagle3_forward
 
@@ -158,6 +158,71 @@ def test_next_generate_feeds_the_unfed_tokens_first(input_ids, expected_base) ->
     assert cache.get_base_seq_length() == 7
 
 
+@pytest.mark.parametrize(
+    "input_ids, expected_base",
+    [
+        ([9, 7, 10], [7, 9, 7, 10]),  # delta only, even though it contains the unfed token right after one token
+        ([1, 7, 10], [7, 10]),  # full sequence: starts with the cached ids and repeats the unfed token
+        ([1, 5, 6], [5, 6]),  # full sequence that replaces the unfed token: fed as given
+    ],
+)
+def test_known_fed_ids_tell_a_full_sequence_from_a_long_delta(input_ids, expected_base) -> None:
+    base, draft = _RecordingBase(), _RecordingDraft()
+    model = SimpleNamespace(eagle3_base_model=base, eagle3_draft_model=draft)
+    cache = _cache_after_stop(committed=1, unfed=[7])
+    cache.fed_token_ids = torch.tensor([[1]])
+
+    initialize_tree(torch.tensor([input_ids]), model, cache, logits_processor=None)
+
+    assert base.fed == [expected_base]
+    assert cache.fed_token_ids.tolist() == [[1] + expected_base]
+
+
+def test_eagle3_cache_tracks_the_ids_its_base_holds(tmp_path) -> None:
+    class _FileMxq(_SlotMxq):
+        def dump_cache_memory_to(self, cache_dir, cache_id=0):
+            (tmp_path / "kv").write_text(self.kv)
+
+        def load_cache_memory_from(self, cache_dir, cache_id=0):
+            self.kv = (tmp_path / "kv").read_text()
+
+    cache = MobilintEagle3Cache(_FileMxq(), _FileMxq())
+    assert eagle3_fed_tokens(cache).shape == (1, 0)
+
+    def feed(ids):
+        cache.update_base_seen_tokens(len(ids))
+        note_eagle3_fed_tokens(cache, None if ids is None else torch.tensor([ids]))
+
+    feed([1, 2, 3])
+    feed([4])
+    assert eagle3_fed_tokens(cache).tolist() == [[1, 2, 3, 4]]
+
+    cache.set_base_seq_length(2)  # rewind
+    feed([9])
+    assert eagle3_fed_tokens(cache).tolist() == [[1, 2, 9]]
+
+    cache.dump_cache_memory()
+    copied = cache.copy()
+    cache.dump_cache_memory_to(str(tmp_path))
+    cache.update_base_seen_tokens(2)  # fed as embeddings: the ids are unknown from here on
+    note_eagle3_fed_tokens(cache, None)
+    assert eagle3_fed_tokens(cache) is None
+    feed([5])
+    assert eagle3_fed_tokens(cache) is None
+
+    cache.load_cache_memory()
+    assert eagle3_fed_tokens(cache).tolist() == [[1, 2, 9]]
+    assert eagle3_fed_tokens(copied).tolist() == [[1, 2, 9]]
+    restored = MobilintEagle3Cache(_FileMxq(), _FileMxq())
+    restored.load_cache_memory_from(str(tmp_path))
+    assert eagle3_fed_tokens(restored).tolist() == [[1, 2, 9]]
+
+    cache.reset()
+    assert eagle3_fed_tokens(cache).shape == (1, 0)
+    cache.fake_prefill(4)
+    assert eagle3_fed_tokens(cache) is None
+
+
 def test_forward_after_a_stop_feeds_the_unfed_tokens_first() -> None:
     base = _RecordingBase()
     model = SimpleNamespace(eagle3_base_model=base, config=SimpleNamespace(vocab_size=8))
@@ -168,7 +233,9 @@ def test_forward_after_a_stop_feeds_the_unfed_tokens_first() -> None:
 
     cache = object.__new__(_Cache)
     cache.unfed_tokens = torch.tensor([[7, 8]])
-    cache.base_layer = SimpleNamespace(update_seen_tokens=lambda n: seen.__setitem__("n", seen["n"] + n))
+    cache.base_layer = SimpleNamespace(
+        update_seen_tokens=lambda n: seen.__setitem__("n", seen["n"] + n), get_seq_length=lambda: seen["n"]
+    )
 
     llm_eagle3_forward(model, input_ids=torch.tensor([[9]]), past_key_values=cache)
 
