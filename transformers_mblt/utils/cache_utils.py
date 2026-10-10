@@ -71,6 +71,7 @@ class MobilintLayer(CacheLayerMixin):
         self.buffer_seq_length: Optional[int] = None
         # False after fake_prefill: the length is real but the KV contents are not, so they are never moved.
         self.kv_valid = True
+        self.buffer_kv_valid = True  # kv_valid at the time ``buffer`` was taken
         self._host_kv: list[bytes] = []
         self._host_valid_len = 0
         self._resident_at: Optional[Any] = None  # weakref to the MobilintKVResidency whose slot holds this KV
@@ -125,6 +126,7 @@ class MobilintLayer(CacheLayerMixin):
         self.buffer = []
         self.buffer_seq_length = None
         self.kv_valid = True
+        self.buffer_kv_valid = True
         self._host_kv = []
         self._host_valid_len = 0
 
@@ -229,13 +231,15 @@ class MobilintLayer(CacheLayerMixin):
             self._host_kv = self.buffer
             self._host_valid_len = self.get_seq_length()
         self.buffer_seq_length = self.get_seq_length()
+        self.buffer_kv_valid = self.kv_valid
 
     def load_cache_memory(self):
         if self.buffer_seq_length is not None:
             self.set_seq_length(self.buffer_seq_length)
             self._host_kv = self.buffer
             self._host_valid_len = self.buffer_seq_length
-            self.kv_valid = True
+            # A snapshot of a fake-prefilled layer restores its length, not KV contents.
+            self.kv_valid = self.buffer_kv_valid
         residency = self._residency()
         if residency is not None:
             # Restore through the owner table so the cache that holds the slot is saved first.
@@ -282,6 +286,7 @@ class MobilintLayer(CacheLayerMixin):
         copied.buffer = copy.deepcopy(self.buffer)
         copied.buffer_seq_length = self.buffer_seq_length
         copied.kv_valid = self.kv_valid
+        copied.buffer_kv_valid = self.buffer_kv_valid
         copied._host_kv = self._host_kv
         copied._host_valid_len = self._host_valid_len
         copied._residency_hint = self._residency_hint

@@ -854,6 +854,8 @@ class MobilintModelMixin(PretrainedOnlyMixin, PreTrainedModel):
         from .multi_slot_dispatch import _is_bindable_cache
 
         backend = self.npu_backend
+        if not getattr(backend, "mxq_models", None):
+            return
         if past_key_values is None:
             bind_cacheless(backend, [(backend.mxq_models[0], 0)])
             return

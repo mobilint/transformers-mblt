@@ -1409,6 +1409,7 @@ class MobilintQwen3VLTextModel(MobilintModelMixin, MobilintGenerationMixin, Mobi
 
         resolved_npu_prefill_chunk_size = self.resolve_npu_prefill_chunk_size(npu_prefill_chunk_size)
 
+        self._bind_single_slot_cache(past_key_values)
         mxq_model = self.get_mxq_model()
 
         def _do_infer(start_index: int, end_index: int) -> np.ndarray:

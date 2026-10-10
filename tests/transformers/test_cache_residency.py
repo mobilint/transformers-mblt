@@ -524,3 +524,20 @@ def test_move_is_refused_when_the_target_kv_layout_cannot_be_read() -> None:
 
     with pytest.raises(MobilintCacheStateError, match="KV layout"):
         _run(cache, target, 0, "!")
+
+
+def test_snapshot_of_an_evicted_fake_prefill_cache_restores_length_only() -> None:
+    backend = _Backend()
+    fake = MobilintCache(backend.mxq_models)
+    other = MobilintCache(backend.mxq_models)
+    fake.fake_prefill(64)
+    _run(fake, backend, 0, "t")
+    _run(other, backend, 0, "o")  # evicts the fake-prefill cache: nothing is saved
+
+    fake.dump_cache_memory()
+    fake.set_seq_length(0)
+    fake.load_cache_memory()
+
+    assert fake.get_seq_length() == 65
+    assert not fake.layers[0].kv_valid
+    assert [call for call in backend.mxq_models[0].calls if call[0] == "load"] == []
