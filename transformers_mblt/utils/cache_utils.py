@@ -10,7 +10,14 @@ import qbruntime
 import torch
 from transformers.cache_utils import Cache
 
-from .cache_residency import MobilintCacheStateError, mxq_kv_signature, note_direct_load, residency_for_model
+from .cache_residency import (
+    MobilintCacheStateError,
+    mxq_kv_signature,
+    note_direct_load,
+    pending_owner,
+    residency_for_model,
+    save_pending_owner,
+)
 
 try:
     from transformers.cache_utils import CacheLayerMixin
@@ -156,7 +163,9 @@ class MobilintLayer(CacheLayerMixin):
     def is_resident(self) -> bool:
         """Whether the NPU slot currently holds this layer's KV."""
         residency = self._resident_at() if self._resident_at is not None else None
-        return residency is not None and residency.is_resident(self)
+        if residency is not None and residency.is_resident(self):
+            return True
+        return pending_owner(self.mxq_model, self.cache_id) is self
 
     @property
     def host_nbytes(self) -> int:
@@ -223,6 +232,8 @@ class MobilintLayer(CacheLayerMixin):
         residency = self._resident_at() if self._resident_at is not None else None
         if residency is not None:
             residency.evict_layer(self)
+        elif pending_owner(self.mxq_model, self.cache_id) is self:
+            save_pending_owner(self.mxq_model, self.cache_id)
 
     def dump_cache_memory(self):
         """Snapshot the current KV into ``buffer``; :meth:`load_cache_memory` restores it."""
@@ -254,6 +265,8 @@ class MobilintLayer(CacheLayerMixin):
             residency.acquire(self, self.mxq_model, self.cache_id, reload=True)
             return
         if self.get_seq_length() > 0:
+            if pending_owner(self.mxq_model, self.cache_id) is not self:
+                save_pending_owner(self.mxq_model, self.cache_id)
             self.mxq_model.load_cache_memory(self.buffer, self.cache_id)
             note_direct_load(self)
 
@@ -271,6 +284,8 @@ class MobilintLayer(CacheLayerMixin):
         if residency is not None:
             # The file overwrites the slot: save the cache that holds it, then take it over.
             residency.evict(self.mxq_model, self.cache_id)
+        elif pending_owner(self.mxq_model, self.cache_id) is not self:
+            save_pending_owner(self.mxq_model, self.cache_id)
         self.reset()
         seq_path = Path(cache_dir) / "seq_length.txt"
         if seq_path.exists():

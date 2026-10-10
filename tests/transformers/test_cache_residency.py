@@ -625,3 +625,32 @@ def test_file_restore_before_any_forward_survives_another_cache_running_first(tm
     _run(restored, backend, 0, "!")
 
     assert _slot(backend) == "saved!"
+
+
+def test_two_file_restores_before_any_forward_keep_both_caches(tmp_path) -> None:
+    backend = _Backend()
+    first, second = MobilintCache(backend.mxq_models), MobilintCache(backend.mxq_models)
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    _restore_from_file(first, backend, "first", tmp_path / "a")
+    _restore_from_file(second, backend, "second", tmp_path / "b")  # saves `first` before overwriting the slot
+
+    assert second.is_resident and not first.is_resident
+    _run(first, backend, 0, "!")
+    assert _slot(backend) == "first!"
+    _run(second, backend, 0, "?")
+    assert _slot(backend) == "second?"
+
+
+def test_offload_of_a_cache_restored_before_any_forward(tmp_path) -> None:
+    backend = _Backend()
+    restored = MobilintCache(backend.mxq_models)
+    _restore_from_file(restored, backend, "saved", tmp_path)
+    assert restored.is_resident
+
+    restored.offload()
+    backend.mxq_models[0].write(0, "scratch")  # e.g. an unrelated load into the slot
+
+    assert not restored.is_resident and restored.host_nbytes == len(b"saved")
+    _run(restored, backend, 0, "!")
+    assert _slot(backend) == "saved!"

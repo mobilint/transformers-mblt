@@ -45,8 +45,32 @@ _MODEL_RESIDENCY: "weakref.WeakKeyDictionary[Any, weakref.ref[MobilintKVResidenc
 _PENDING_OWNERS: dict[tuple[int, int], tuple[Any, Any]] = {}
 
 
+def pending_owner(mxq_model: Any, cache_id: int) -> Optional["MobilintLayer"]:
+    """The layer that loaded its KV into this slot before any owner table knew the Model, if still alive."""
+    entry = _PENDING_OWNERS.get((id(mxq_model), int(cache_id)))
+    if entry is None:
+        return None
+    model_ref, layer_ref = entry
+    layer = layer_ref()
+    if model_ref() is not mxq_model or layer is None or layer.mxq_model is not mxq_model:
+        _PENDING_OWNERS.pop((id(mxq_model), int(cache_id)), None)
+        return None
+    return layer
+
+
+def save_pending_owner(mxq_model: Any, cache_id: int) -> None:
+    """Save a pending owner's KV to its host copy and drop the claim, before something overwrites the slot."""
+    layer = pending_owner(mxq_model, cache_id)
+    if layer is not None:
+        layer._save_from_slot()
+        _PENDING_OWNERS.pop((id(mxq_model), int(cache_id)), None)
+
+
 def note_direct_load(layer: "MobilintLayer") -> None:
-    """Record that ``layer`` loaded its KV into its slot without an owner table."""
+    """Record that ``layer`` loaded its KV into its slot without an owner table.
+
+    Call :func:`save_pending_owner` for the slot before the load, so a previous pending owner is saved first.
+    """
     try:
         _PENDING_OWNERS[(id(layer.mxq_model), int(layer.cache_id))] = (weakref.ref(layer.mxq_model), weakref.ref(layer))
     except TypeError:  # Models without __weakref__ (test doubles)
@@ -141,14 +165,10 @@ class MobilintKVResidency:
         """Return the layer whose KV the slot holds, or ``None``."""
         entry = self._owners.get((id(mxq_model), int(cache_id)))
         if entry is None:
-            pending = _PENDING_OWNERS.pop((id(mxq_model), int(cache_id)), None)
-            if pending is not None:
-                model_ref, layer_ref = pending
-                layer = layer_ref()
-                if model_ref() is mxq_model and layer is not None and layer.mxq_model is mxq_model:
-                    self._record(mxq_model, cache_id, layer)
-                    return layer
-            return None
+            layer = pending_owner(mxq_model, cache_id)
+            if layer is not None:
+                self._record(mxq_model, cache_id, layer)
+            return layer
         model_ref, _, layer_ref = entry
         layer = layer_ref()
         if model_ref() is not mxq_model or layer is None:
@@ -303,6 +323,9 @@ __all__ = [
     "bind_cacheless",
     "kv_slot_models",
     "mxq_kv_signature",
+    "note_direct_load",
+    "pending_owner",
     "residency_for_model",
+    "save_pending_owner",
     "residency_of",
 ]
