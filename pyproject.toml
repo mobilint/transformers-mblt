@@ -20,7 +20,6 @@ dependencies = [
     "torchcodec",
     "numpy>=1.26.0",
     "huggingface-hub",
-    "datasets>=3.2.0,<=3.6.0",
     "sentencepiece",
     "pillow>=11.1.0",
     "opencv-python>=4.11.0.86",
@@ -71,6 +70,8 @@ dev = [
     "pytest>=8.4.2",
     "jiwer>=3.0.0",
     "librosa>=0.11.0, <=0.11.0",
+    # Only the ASR tests and benchmarks load datasets; 5.0.1 fixes GHSA-379c-qx7v-6h59.
+    "datasets>=5.0.1",
     "numba>=0.60.0, <=0.60.0",
     "hf_xet",
     "build",

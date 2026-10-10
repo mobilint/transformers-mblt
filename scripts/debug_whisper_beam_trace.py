@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import sys
 from pathlib import Path
 from typing import Any
 
+import soundfile as sf
 import torch
-from datasets import load_dataset
+from datasets import Audio, load_dataset
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -24,20 +26,22 @@ def _json_default(value: Any) -> Any:
     return str(value)
 
 
+def _decode_audio(raw_audio: dict[str, Any]) -> dict[str, Any]:
+    source = io.BytesIO(raw_audio["bytes"]) if raw_audio.get("bytes") else raw_audio["path"]
+    array, sampling_rate = sf.read(source, dtype="float32")
+    return {"array": array, "sampling_rate": int(sampling_rate)}
+
+
 def _load_sample(args: argparse.Namespace) -> dict[str, Any]:
-    dataset = load_dataset(
-        args.dataset,
-        args.dataset_config,
-        split=args.dataset_split,
-        streaming=True,
-        trust_remote_code=True,
-    )
+    dataset = load_dataset(args.dataset, args.dataset_config, split=args.dataset_split, streaming=True)
+    # Decode with soundfile instead of torchcodec, which needs a matching system FFmpeg (datasets >= 4).
+    dataset = dataset.cast_column("audio", Audio(decode=False))
     if args.seed is not None:
         dataset = dataset.shuffle(seed=int(args.seed), buffer_size=1000)
     for index, sample in enumerate(dataset):
         if index < int(args.sample_index):
             continue
-        audio = sample["audio"]
+        audio = _decode_audio(sample["audio"])
         return {
             "id": str(sample.get("id", index)),
             "audio": audio,
