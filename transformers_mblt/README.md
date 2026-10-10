@@ -419,8 +419,8 @@ token path, with the same one-time warning as last-only LLM builds.
 
 ### KV caches
 
-A `MobilintCache` holds one sequence's KV per row, and it can move. Each NPU backend records which cache's KV
-every slot `(qbruntime.Model, cache_id)` currently holds. Before an infer, the model makes the slots it uses hold
+A `MobilintCache` holds one sequence's KV per row, and it can move. One process-wide table records which cache's
+KV every NPU slot `(qbruntime.Model, cache_id)` currently holds; a slot's entry ends when its Model is disposed. Before an infer, the model makes the slots it uses hold
 the right cache. If another cache is there, that cache's KV is first dumped to host memory, and the incoming cache's
 KV is loaded back from host memory if it was moved out earlier. Everything stays in memory: no files are written.
 A cache that keeps decoding on its own slot never dumps.

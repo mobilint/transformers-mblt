@@ -325,9 +325,8 @@ class _SharedMxq:
 
 
 class _SlotBackend:
-    """Backend double with real shared-MXQ slots; borrows kv_slot_models/kv_owner from the NPU backend."""
+    """Backend double with real shared-MXQ slots; borrows kv_owner from the NPU backend."""
 
-    kv_slot_models = moe_utils.MobilintMixtureOfExpertsNPUBackend.kv_slot_models
     kv_owner = moe_utils.MobilintMixtureOfExpertsNPUBackend.kv_owner
 
     def __init__(self, num_shared: int) -> None:
@@ -347,7 +346,7 @@ class _Generator:
         self.npu_backend = _SlotBackend(num_shared)
 
     def get_shared_mxq_models(self) -> list:
-        return self.npu_backend.kv_slot_models
+        return [layer.shared for layer in self.npu_backend.layers]
 
     def run(self, cache, text: str) -> None:
         """Stand-in for one forward: bind, write every shared slot from the cache position, advance."""
@@ -432,9 +431,9 @@ def test_a_failed_forward_keeps_the_cache_on_its_slots(monkeypatch: pytest.Monke
     )
     for layer in backend.layers:
         layer.shared = _SharedMxq()
-    backend.kv_slot_models = [layer.shared for layer in backend.layers]
+    shared_models = [layer.shared for layer in backend.layers]
     model = _harness(config, backend)
-    cache = MobilintMixtureOfExpertsCache(backend.kv_slot_models)
+    cache = MobilintMixtureOfExpertsCache(shared_models)
     model.moe_forward(torch.zeros((1, 2, config.hidden_size)), cache, torch.arange(2))
     original = backend.shared_forward_token
 
@@ -450,7 +449,7 @@ def test_a_failed_forward_keeps_the_cache_on_its_slots(monkeypatch: pytest.Monke
     # Writes start at the cursor, so the 2-token prefix is intact: the cache keeps its slots and its length.
     assert cache.get_seq_length() == 2
     assert cache.is_resident
-    assert all(model.calls == [] for model in backend.kv_slot_models)
+    assert all(model.calls == [] for model in shared_models)
 
 def test_benchmark_fake_prefill_uses_the_model_cache_builder() -> None:
     from transformers_mblt.utils import benchmark_utils

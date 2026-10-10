@@ -288,7 +288,6 @@ class MultiSlotDispatcher:
             from .cache_residency import bind_cacheless
 
             bind_cacheless(
-                self.backend,
                 [
                     (mxq_models[m_idx], local_id)
                     for m_idx, _items, local_ids in groups

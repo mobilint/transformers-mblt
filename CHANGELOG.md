@@ -4,8 +4,8 @@
 
 ### Added
 
-- Portable caches, part 1 (dense LLMs). Each backend keeps an owner table of its KV slots
-  (`transformers_mblt.utils.cache_residency`). Before every infer, the single-row `llm_forward` and
+- Portable caches, part 1 (dense LLMs). One process-wide table records which cache's KV every NPU slot
+  `(qbruntime.Model, cache_id)` holds (`transformers_mblt.utils.cache_residency`). Before every infer, the single-row `llm_forward` and
   `MultiSlotDispatcher.dispatch` bind the cache rows they will use: if a slot holds another cache's KV, that cache is
   dumped to host memory first, and the incoming cache's KV is loaded back. A cache that keeps decoding on its own slot
   never dumps.
@@ -31,8 +31,8 @@
 ### Fixed
 
 - An explicit `load_cache_memory()` / `load_cache_memory_from()` on a cache that had never been bound wrote the NPU
-  slot without telling the owner table, which could later save the overwritten slot as the previous owner's KV. Such
-  loads now go through the owner table of the backend that runs the Model.
+  slot without telling the owner table, which could later save the overwritten slot as the previous owner's KV. Every
+  load, bind and file restore now goes through the one owner table, including restores before the first forward.
 - Reusing a dense-LLM cache after another cache, or a forward without a cache, had run on the same model no longer
   reads the other sequence's KV. Before, `generate(past_key_values=cache)` continued from the stale NPU state and
   produced wrong output silently.
