@@ -452,7 +452,11 @@ def tree_decoding(
     else:
         accepted_prefix_length = 0
 
-    position_ids = tree_position_ids + input_ids.shape[1] - accepted_prefix_length
+    # The first fed token (the pending accepted tokens, else the tree root) sits right after the cached base prefix.
+    # ``input_ids.shape[1] - accepted_prefix_length`` equals that only when ``input_ids`` is the whole conversation; a
+    # delta-only input would place the tree at the wrong RoPE positions.
+    del input_ids
+    position_ids = tree_position_ids + cache.get_base_seq_length()
     if position_ids.dim() == 1:
         position_ids = position_ids.unsqueeze(0)
 
@@ -673,6 +677,9 @@ def update_inference_inputs(
     else:
         token = torch.argmax(sample_p, dim=-1, keepdim=True)[None]
 
+    # The draft reads token t+1 with the base hidden state of token t: the accepted tokens shifted by one, then the
+    # sampled token. Passing it explicitly keeps it right when ``input_ids`` is a delta-only input.
+    draft_input_ids = torch.cat((accepted[:, 1:], token.to(accepted.device)), dim=1)
     draft_tokens, retrieve_indices, tree_mask, tree_position_ids = model.eagle3_draft_model.topk_generate(
         accepted_hidden_state,
         input_ids=torch.cat((input_ids, token.to(input_ids.device)), dim=1),
@@ -680,6 +687,7 @@ def update_inference_inputs(
         logits_processor=logits_processor,
         max_draft_tokens=None if remaining_tokens is None else max(1, remaining_tokens - int(accepted.shape[1]) - 1),
         count_npu_time=count_npu_time,
+        input_ids_delta=draft_input_ids,
     )
     cache.pending_draft_tokens = draft_tokens
     cache.retrieve_indices = retrieve_indices

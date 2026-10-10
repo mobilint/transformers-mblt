@@ -40,6 +40,10 @@
 
 ### Fixed
 
+- EAGLE-3 generation with a delta-only follow-up (only the new tokens as `input_ids`, with a reused cache) produced
+  garbage: tree decoding placed the tree at RoPE positions derived from the input length instead of the cached
+  prefix, and each decode step derived the draft's input from that short history. Positions now come from the cache,
+  and the draft gets its input explicitly. Full-sequence inputs are unchanged.
 - An explicit `load_cache_memory()` / `load_cache_memory_from()` on a cache that had never been bound wrote the NPU
   slot without telling the owner table, which could later save the overwritten slot as the previous owner's KV. Every
   load, bind and file restore now goes through the one owner table, including restores before the first forward.

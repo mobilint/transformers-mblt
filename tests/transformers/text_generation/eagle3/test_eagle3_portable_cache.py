@@ -87,6 +87,7 @@ def test_lost_draft_kv_is_tolerated_but_lost_base_kv_is_refused() -> None:
     with pytest.raises(MobilintCacheStateError):
         cache.bind_base(new_base)
 
+
 def test_copy_keeps_unfed_tokens_and_reset_clears_them() -> None:
     cache = MobilintEagle3Cache(_SlotMxq(), _SlotMxq())
     cache.accept_tokens = torch.tensor([[4, 5]])
@@ -225,3 +226,64 @@ def test_base_forward_binds_the_cache_before_inferring() -> None:
         base.forward(torch.tensor([[1, 2]]), cache=cache, requires_all_features_logits=False)
 
     assert calls[:2] == ["bind", "infer"]
+
+
+def test_tree_positions_follow_the_cache_not_the_input_length() -> None:
+    """A delta-only input is shorter than the conversation; the tree must still sit right after the cached prefix."""
+    from transformers_mblt.utils.eagle3.tree_decoding import tree_decoding
+
+    seen: dict[str, torch.Tensor] = {}
+    seq = {"base": 10}
+
+    def base_model(tree_candidates, *, position_ids, **_kwargs):
+        seen["positions"] = position_ids
+        n = tree_candidates.shape[1]
+        return {"hidden_states": [torch.zeros((1, n, 4))]}, torch.zeros((1, n, 8))
+
+    cache = SimpleNamespace(
+        accept_tokens=torch.tensor([[5, 6]]),
+        get_base_seq_length=lambda: seq["base"],
+        update_base_seen_tokens=lambda n: seq.__setitem__("base", seq["base"] + int(n)),
+    )
+    model = SimpleNamespace(eagle3_base_model=base_model)
+
+    tree_decoding(
+        model,
+        cache,
+        torch.tensor([[7, 8, 9]]),
+        torch.tensor([[1, 2, 3]]),  # delta-only: far shorter than the 10 cached tokens
+        torch.tensor([[0, 1]]),
+        torch.tensor([0, 1, 1]),
+    )
+
+    assert seen["positions"].tolist() == [[10, 11, 12, 13, 13]]
+    assert seq["base"] == 12  # the pending accepted tokens are now fed
+
+
+def test_decode_step_feeds_the_draft_the_accepted_tokens_shifted_by_one() -> None:
+    from transformers_mblt.utils.eagle3.tree_decoding import update_inference_inputs
+
+    draft = _RecordingDraft()
+    model = SimpleNamespace(eagle3_draft_model=draft)
+    cache = SimpleNamespace(
+        accept_tokens=None, pending_draft_tokens=None, retrieve_indices=None, tree_mask=None, tree_position_ids=None
+    )
+    candidates = torch.tensor([[4, 5, 6]])
+
+    update_inference_inputs(
+        torch.tensor([[1, 2]]),  # delta-only history
+        candidates,
+        torch.tensor(0),
+        torch.tensor(2),
+        torch.tensor([[0, 1, 2]]),
+        None,
+        0,
+        model,
+        cache,
+        torch.zeros((1, 3, 4)),
+        torch.zeros(8),
+        None,
+    )
+
+    assert draft.fed == [[5, 6, 0]]  # accepted [4, 5, 6] shifted by one, then the sampled token
+    assert torch.equal(cache.accept_tokens, torch.tensor([[4, 5, 6]]))
