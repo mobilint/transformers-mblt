@@ -1,6 +1,49 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
+
+### Added
+
+- Qwen3-MoE (`mobilint-qwen3_moe`, `MobilintQwen3MoEConfig` / `MobilintQwen3MoEForCausalLM`), ported from the
+  `mobilint/Qwen3-30B-A3B` remote code. The shared Mixture-of-Experts layer follows the EAGLE-3 layout:
+  `MobilintMixtureOfExpertsConfigMixin` (`shared_` / `expert_` / `lm_head_` role backends with fully qualified
+  `"d:c:k"` targets, `moe_shared_output_order`, `moe_mxq_pack_index`), `MobilintMixtureOfExpertsModelMixin`
+  (host routing and the chunked prefill / decode loop), `MobilintMixtureOfExpertsGenerationMixin`, and
+  `MobilintMixtureOfExpertsCache`, which keeps one `MobilintLayer` per shared MXQ so KV dumps and loads reach every
+  layer. The NPU side, `MobilintMixtureOfExpertsNPUBackend` in `transformers_mblt.utils.moe_utils`, loads every MXQ
+  against the role specs from `mblt_npu` and shares one `Accelerator` per device. Device-memory `BadAlloc` disposes
+  every loaded model and raises `MobilintBackendAllocError`. See
+  [Mixture-of-Experts release contract](transformers_mblt/README.md#mixture-of-experts-release-contract).
+- Packed MoE releases: one uncompressed `.mxqpack` per layer plus an index JSON, built with
+  `scripts/pack_moe_mxq.py`. Members are materialized only between `Model()` and `launch()`, through a `memfd` on
+  Linux and a short-lived temporary file elsewhere, so a release never keeps both forms on disk. Compared with the
+  individual MXQ files on 3 Aries devices, loading is about 20% faster, page-cache growth during load drops from
+  9-15 GiB to under 2 GiB, and the disk reads grow by 4%, because each member is copied in full.
+- When `/proc/self/fd` is not usable, Linux falls back to a temporary file in `/dev/shm`. `MBLT_MOE_MXQ_MATERIALIZE`
+  (`auto` / `memfd` / `tempfile`) forces the method and `MBLT_MOE_MXQ_TMPDIR` the directory.
+- `scripts/pack_moe_mxq.py --config` writes `moe_mxq_pack_index` and `moe_shared_output_order` into a release
+  `config.json`. The order is read from the MXQs (`qbruntime.Model` without a launch), and `--manifest`
+  cross-checks it against the compiler manifest. `--skip-pack` only derives the order.
+- MoE loading keeps every failure on one rollback path. A failure during the MXQ loads (including a non-qbruntime
+  error such as a full temp directory), during layer setup, or during buffer allocation disposes every loaded model.
+  A device-memory `BadAlloc` raises `MobilintBackendAllocError`.
+- The local-cache shortcut for MoE releases checks every pack (or MXQ) and its size, so an interrupted download
+  resumes instead of failing at load.
+- The NPU backend records which cache owns the shared MXQs' KV state (`kv_owner`). A forward without a cache now
+  invalidates the previous cache, and `load_cache_memory()` / `load_cache_memory_from()` make the restored cache
+  the owner, so `generate()` continues it instead of re-prefilling.
+- Only the two most recently used prefill chunk sizes keep their NPU buffers. `dispose()` waits for running expert
+  inferences, and the last-only check reads the token axis (`-2`) of the shared MXQ output.
+- `dispose()` releases every NPU buffer before destroying the accelerators. A loop variable used to keep the last
+  layer's buffers alive, which made qbruntime warn `Accelerator destroyed with N NPU-resident NPUData still alive`.
+  The same warning on exit or model unload is gone as well: an `atexit` hook and the backend finalizer release the
+  buffers first when a CLI run or `transformers serve` never calls `dispose()`.
+- `tps sweep` decode rows use fake prefill for MoE releases. A model can provide `build_mobilint_cache(batch_size)`
+  for the benchmark helpers instead of the single-MXQ `MobilintCache`; the MoE generation mixin returns a
+  `MobilintMixtureOfExpertsCache`, whose `fake_prefill()` now claims the NPU KV so `generate()` decodes on top of it.
+- `count_npu_time` on MoE releases counts only qbruntime calls (`infer_npu_data` and `copy_from`), taking the
+  union of overlapping expert calls across devices. Host routing, numpy conversion, the weighted expert sum, buffer
+  acquisition, and thread scheduling are no longer counted as NPU time (decode NPU share: 97.9% -> 70.7%).
 
 ### Changed
 
@@ -10,8 +53,8 @@
 - The ASR tests and `scripts/debug_whisper_beam_trace.py` read audio with `Audio(decode=False)` and decode it with
   soundfile, like the ASR benchmark already did. `datasets` 4.0 and later decode `Audio` columns through torchcodec,
   which needs a matching system FFmpeg.
-
-## 0.1.1
+- `MobilintModelMixin` resolves its backend through `_resolve_npu_backend()`, so a model can run on a backend
+  assembled from several config backends. The default still returns `config.<npu_backend_prefix>npu_backend`.
 
 ### Fixed
 

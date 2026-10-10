@@ -115,6 +115,23 @@ description: >-
   handling (including `MBLT_VISION_OUTPUT_ORDER` env override) live in
   `transformers_mblt/README.md`; per-artifact resolution and validation logic
   live in `transformers_mblt/models/qwen3_vl/modeling_qwen3_vl.py::_resolve_vision_output_order`.
+- Mixture-of-Experts contract (Qwen3-MoE): `MobilintMixtureOfExpertsConfigMixin` /
+  `MobilintMixtureOfExpertsModelMixin` / `MobilintMixtureOfExpertsGenerationMixin` /
+  `MobilintMixtureOfExpertsCache` pair like the EAGLE-3 mixins, and
+  `transformers_mblt/utils/moe_utils.py::MobilintMixtureOfExpertsNPUBackend` assembles the
+  `shared_` / `expert_` / `lm_head_` role backends instead of subclassing `MobilintNPUBackend`
+  (one MXQ file per backend does not fit thousands of MXQs). Roles are `single` core mode only,
+  placed round-robin over the devices their `"d:c:k"` targets cover, and unprefixed NPU kwargs are
+  deliberately not fanned out to the roles. `batch_size` stays `1`. Releases are packed
+  (`scripts/pack_moe_mxq.py`, `moe_mxq_pack_index`): qbruntime re-reads an MXQ during `launch()`,
+  so a member is materialized (Linux `memfd` when `/proc/self/fd` works, otherwise a short-lived
+  temp file in `/dev/shm` or the temp dir; `MBLT_MOE_MXQ_MATERIALIZE` / `MBLT_MOE_MXQ_TMPDIR`)
+  before `Model()` and released only after `launch()`; `release()` must never raise. Every launch
+  failure, including post-load layer setup and buffer allocation, goes through `_rollback()`.
+  `npu_backend.kv_owner` names the cache whose sequence is in the shared MXQs' KV; every forward
+  sets it (to `None` without a cache). Keep `moe_shared_output_order` authoritative; the
+  quantization-scale detection is the fallback and the cross-check, and
+  `scripts/pack_moe_mxq.py --config` derives it from the MXQs at packaging time.
 - Preserve local style in `transformers_mblt/models` and `transformers_mblt/utils`; they are
   excluded from repository-wide Ruff checks.
 

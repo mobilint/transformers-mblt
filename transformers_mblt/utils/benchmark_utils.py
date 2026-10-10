@@ -342,9 +342,21 @@ def _is_mobilint_npu_model(model: object) -> bool:
     return language_model is not None and hasattr(language_model, "npu_backend")
 
 
+def _resolve_cache_builder(model: object) -> Callable[[int], Any] | None:
+    """Return a model-provided ``build_mobilint_cache(batch_size)`` hook, if any.
+
+    Models whose KV state does not live in one cache MXQ (Mixture-of-Experts releases keep one KV cache per
+    shared MXQ) build their own cache instead of the single-MXQ :class:`MobilintCache`.
+    """
+    builder = getattr(model, "build_mobilint_cache", None)
+    return builder if callable(builder) else None
+
+
 def _supports_fake_decode_prefill(model: object) -> bool:
     """Return whether decode TPS can use fake prefilled Mobilint cache state."""
-    return _is_mobilint_npu_model(model) and _get_cache_mxq_model(model) is not None
+    if not _is_mobilint_npu_model(model):
+        return False
+    return _resolve_cache_builder(model) is not None or _get_cache_mxq_model(model) is not None
 
 
 def _resolve_multi_slot_backend(model: object) -> object | None:
@@ -427,6 +439,9 @@ def _build_batched_mobilint_cache(
     explicitly alongside ``cache_cls`` when the override needs specific
     side-input dimensions.
     """
+    builder = _resolve_cache_builder(model) if cache_cls is None and cache_kwargs is None else None
+    if builder is not None:
+        return builder(batch_size)
     resolved_cls = cache_cls if cache_cls is not None else _resolve_mobilint_cache_class(model)
     if cache_kwargs is not None:
         resolved_kwargs: dict[str, object] = cache_kwargs
@@ -1475,9 +1490,8 @@ class TPSMeasurer:
             assert num_decode > 0, "num_decode should be positive! num_decode: %d" % num_decode
             batch_size = _validate_batch_size(batch_size)
 
-            mxq_model = _get_cache_mxq_model(self.model)
-            if mxq_model is None:
-                raise RuntimeError("Fake decode prefill requires a Mobilint cache MXQ model.")
+            if not _supports_fake_decode_prefill(self.model):
+                raise RuntimeError("Fake decode prefill requires a Mobilint cache MXQ model or cache builder.")
 
             vocab_size = _resolve_config_vocab_size(self.model.config)
             low = 100 if vocab_size > 100 else 0

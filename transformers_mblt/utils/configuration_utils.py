@@ -32,6 +32,7 @@ __all__ = [
     "MobilintEncoderDecoderConfigMixin",
     "MobilintVisionTextConfigMixin",
     "MobilintEagle3ConfigMixin",
+    "MobilintMixtureOfExpertsConfigMixin",
     "NPUTargetSpec",
     "_normalize_npu_target_kwargs",
     "_migrate_target_cores",
@@ -1302,4 +1303,364 @@ class MobilintEagle3ConfigMixin(PretrainedConfig):
         output.update(self.base_npu_backend.to_dict(prefix="base_"))
         output.update(self.draft_npu_backend.to_dict(prefix="draft_"))
         output.update(self.fc_npu_backend.to_dict(prefix="fc_"))
+        return output
+
+
+class MobilintMixtureOfExpertsConfigMixin(PretrainedConfig):
+    """Config mixin for Mixture-of-Experts models split into shared/expert/lm_head MXQ roles.
+
+    A MoE release ships one ``shared`` MXQ per decoder layer (attention, router gate and residual), one MXQ per
+    ``(layer, expert)`` pair, and a single ``lm_head`` MXQ. Each role owns its own NPU target spec under the
+    ``shared_`` / ``expert_`` / ``lm_head_`` prefixes, following :class:`MobilintEagle3ConfigMixin`. The role
+    ``mxq_path`` fields are ``str.format`` templates: ``shared_mxq_path`` receives ``layer`` and
+    ``expert_mxq_path`` receives ``layer`` and ``expert``.
+
+    Placement is round-robin over the devices each role's ``target_cores`` cover: ``shared[layer]`` runs on the
+    ``layer % n``-th shared device, ``expert[layer][expert]`` on the ``expert % n``-th expert device, and the
+    ``lm_head`` on its single device. Only ``single`` core mode is supported; the cores listed for a device form
+    that device's ``ModelConfig``.
+
+    Unlike EAGLE-3, unprefixed NPU kwargs are **not** fanned out to every role: the roles need very different
+    core sets (one core per shared MXQ versus eight per expert MXQ), so an unprefixed ``dev_no`` would expand
+    every role to every core of the device and multiply the shared/lm_head footprint by eight.
+
+    ``moe_mxq_pack_index`` points at the index JSON of a packed release (see
+    :class:`~transformers_mblt.utils.moe_utils.MobilintMixtureOfExpertsPackIndex`); the shared and expert MXQs then
+    come from the per-layer packs and ``shared_mxq_path`` / ``expert_mxq_path`` are unused. Without it the role
+    templates name individual MXQ files.
+
+    ``moe_shared_output_order`` lists the role of each shared MXQ output (``residual``, ``expert_in``,
+    ``gate``). The ``"default"`` entry applies to every layer without a per-layer override keyed by the layer
+    index as a string. Like ``vision_output_order`` on Qwen3-VL, the order is a property of the compiled
+    artifact and travels with it in ``config.json``.
+    """
+
+    _MOE_BACKEND_PREFIXES = ("shared_", "expert_", "lm_head_")
+    _MOE_BACKEND_FIELDS = MobilintEagle3ConfigMixin._EAGLE3_BACKEND_FIELDS
+    MOE_SHARED_OUTPUT_ROLES = ("residual", "expert_in", "gate")
+    _MOE_DEFAULT_TARGET_CORES = {
+        "shared_": ["0:0:0"],
+        "expert_": [f"0:{cluster}:{core}" for cluster in range(2) for core in range(4)],
+        "lm_head_": ["0:0:0"],
+    }
+    _MOE_RUNTIME_FIELDS = (("num_expert_workers", 24, int),)
+
+    def _ensure_moe_npu_backends(self, kwargs: dict[str, Any]) -> None:
+        for prefix in self._MOE_BACKEND_PREFIXES:
+            if hasattr(self, f"{prefix}npu_backend"):
+                continue
+            backend_kwargs = {
+                f"{prefix}{field_name}": kwargs[f"{prefix}{field_name}"]
+                for field_name in self._MOE_BACKEND_FIELDS
+                if f"{prefix}{field_name}" in kwargs
+            }
+            backend_kwargs.setdefault(f"{prefix}core_mode", "single")
+            has_targets = any(
+                backend_kwargs.get(f"{prefix}{field_name}") is not None
+                for field_name in ("dev_no", "target_cores", "target_clusters")
+            )
+            if not has_targets:
+                backend_kwargs[f"{prefix}target_cores"] = list(self._MOE_DEFAULT_TARGET_CORES[prefix])
+            _normalize_npu_target_kwargs(backend_kwargs, prefix=prefix)
+            setattr(self, f"{prefix}npu_backend", MobilintNPUBackend.from_dict(backend_kwargs, prefix=prefix))
+        # Drop the role NPU keys from ``kwargs`` so ``PretrainedConfig.__init__`` does not re-apply them via
+        # setattr — see :func:`_pop_consumed_backend_kwargs`.
+        for prefix in self._MOE_BACKEND_PREFIXES:
+            _pop_consumed_backend_kwargs(kwargs, prefix=prefix)
+
+    def _ensure_moe_runtime_fields(self, kwargs: dict[str, Any]) -> None:
+        for field_name, default_value, _annotation in self._MOE_RUNTIME_FIELDS:
+            if hasattr(self, field_name):
+                continue
+            value = kwargs.pop(field_name, default_value)
+            self.__dict__[field_name] = MobilintEagle3ConfigMixin._coerce_positive_runtime_int(
+                field_name,
+                value,
+                default_value=default_value,
+            )
+        if "moe_mxq_pack_index" not in self.__dict__:
+            pack_index = kwargs.pop("moe_mxq_pack_index", None)
+            self.__dict__["moe_mxq_pack_index"] = str(pack_index) if pack_index else None
+        if "moe_shared_output_order" not in self.__dict__:
+            self.__dict__["moe_shared_output_order"] = self._coerce_moe_shared_output_order(
+                kwargs.pop("moe_shared_output_order", None)
+            )
+
+    @classmethod
+    def _coerce_moe_shared_output_order(cls, value: Any) -> Optional[dict[str, list[str]]]:
+        """Validate ``moe_shared_output_order`` and return a JSON-safe copy.
+
+        ``None`` means "not shipped"; the backend then detects the order from the MXQ quantization scales. A
+        malformed value raises: it is a packaging bug in a published artifact, and a wrong order corrupts the
+        output silently.
+        """
+        if value is None:
+            return None
+        if not isinstance(value, dict) or not value:
+            raise ValueError(f"moe_shared_output_order must be a non-empty dict of role lists, got {value!r}")
+        expected = sorted(cls.MOE_SHARED_OUTPUT_ROLES)
+        result: dict[str, list[str]] = {}
+        for key, roles in value.items():
+            key = str(key)
+            if key != "default" and not key.isdigit():
+                raise ValueError(f"moe_shared_output_order keys must be 'default' or a layer index, got {key!r}")
+            if not isinstance(roles, (list, tuple)) or sorted(roles) != expected:
+                raise ValueError(
+                    f"moe_shared_output_order[{key!r}] must be a permutation of "
+                    f"{list(cls.MOE_SHARED_OUTPUT_ROLES)}, got {roles!r}"
+                )
+            result[key] = list(roles)
+        return result
+
+    def get_moe_shared_output_indices(self, layer_idx: int) -> Optional[tuple[int, int, int]]:
+        """Return the ``(residual, expert_in, gate)`` output indices of ``shared[layer_idx]``.
+
+        Returns ``None`` when the config ships no ``moe_shared_output_order`` entry for this layer (neither a
+        per-layer override nor ``"default"``).
+        """
+        order = self.moe_shared_output_order
+        if not order:
+            return None
+        roles = order.get(str(layer_idx), order.get("default"))
+        if roles is None:
+            return None
+        residual, expert_in, gate = (roles.index(role) for role in self.MOE_SHARED_OUTPUT_ROLES)
+        return residual, expert_in, gate
+
+    @property
+    def max_batch_size(self) -> int:
+        """MoE releases run one sequence at a time: every shared MXQ holds a single KV cache entry."""
+        return 1
+
+    @max_batch_size.setter
+    def max_batch_size(self, value: int) -> None:
+        if int(value) > 1:
+            raise ValueError(f"Mixture-of-Experts releases support only max_batch_size=1, got {value}.")
+
+    def __init__(self, **kwargs):
+        self._ensure_moe_npu_backends(kwargs)
+        self._ensure_moe_runtime_fields(kwargs)
+        super().__init__(**kwargs)
+
+    def __post_init__(self, **kwargs: Any) -> None:
+        self._ensure_moe_npu_backends(kwargs)
+        self._ensure_moe_runtime_fields(kwargs)
+        super().__post_init__(**kwargs)
+
+    @property
+    def shared_mxq_path(self) -> str:
+        return self.shared_npu_backend.mxq_path
+
+    @shared_mxq_path.setter
+    def shared_mxq_path(self, value: str) -> None:
+        self.shared_npu_backend.mxq_path = value
+
+    @property
+    def shared_target_device(self) -> str:
+        return self.shared_npu_backend.target_device
+
+    @shared_target_device.setter
+    def shared_target_device(self, value: str) -> None:
+        self.shared_npu_backend = _rebuild_backend_for_target_device(
+            self.shared_npu_backend, value, prefix="shared_"
+        )
+
+    @property
+    def shared_dev_no(self) -> Union[int, list[int]]:
+        return self.shared_npu_backend.dev_no
+
+    @shared_dev_no.setter
+    def shared_dev_no(self, value: Union[int, list[int]]) -> None:
+        self.shared_npu_backend.dev_no = value
+
+    @property
+    def shared_core_mode(self) -> str:
+        return self.shared_npu_backend.core_mode
+
+    @shared_core_mode.setter
+    def shared_core_mode(self, value: str) -> None:
+        self.shared_npu_backend.core_mode = value
+
+    @property
+    def shared_max_batch_size(self) -> int:
+        return self.shared_npu_backend.max_batch_size
+
+    @shared_max_batch_size.setter
+    def shared_max_batch_size(self, value: int) -> None:
+        self.shared_npu_backend.max_batch_size = max(1, value)
+
+    @property
+    def shared_target_cores(self) -> list[str]:
+        return _serialized_target_cores(self.shared_npu_backend)
+
+    @shared_target_cores.setter
+    def shared_target_cores(self, values: list[str]) -> None:
+        self.shared_npu_backend.target_cores = values
+
+    @property
+    def shared_target_clusters(self) -> list[str]:
+        return _serialized_target_clusters(self.shared_npu_backend)
+
+    @shared_target_clusters.setter
+    def shared_target_clusters(self, values: list[str]) -> None:
+        self.shared_npu_backend.target_clusters = values
+
+    @property
+    def expert_mxq_path(self) -> str:
+        return self.expert_npu_backend.mxq_path
+
+    @expert_mxq_path.setter
+    def expert_mxq_path(self, value: str) -> None:
+        self.expert_npu_backend.mxq_path = value
+
+    @property
+    def expert_target_device(self) -> str:
+        return self.expert_npu_backend.target_device
+
+    @expert_target_device.setter
+    def expert_target_device(self, value: str) -> None:
+        self.expert_npu_backend = _rebuild_backend_for_target_device(
+            self.expert_npu_backend, value, prefix="expert_"
+        )
+
+    @property
+    def expert_dev_no(self) -> Union[int, list[int]]:
+        return self.expert_npu_backend.dev_no
+
+    @expert_dev_no.setter
+    def expert_dev_no(self, value: Union[int, list[int]]) -> None:
+        self.expert_npu_backend.dev_no = value
+
+    @property
+    def expert_core_mode(self) -> str:
+        return self.expert_npu_backend.core_mode
+
+    @expert_core_mode.setter
+    def expert_core_mode(self, value: str) -> None:
+        self.expert_npu_backend.core_mode = value
+
+    @property
+    def expert_max_batch_size(self) -> int:
+        return self.expert_npu_backend.max_batch_size
+
+    @expert_max_batch_size.setter
+    def expert_max_batch_size(self, value: int) -> None:
+        self.expert_npu_backend.max_batch_size = max(1, value)
+
+    @property
+    def expert_target_cores(self) -> list[str]:
+        return _serialized_target_cores(self.expert_npu_backend)
+
+    @expert_target_cores.setter
+    def expert_target_cores(self, values: list[str]) -> None:
+        self.expert_npu_backend.target_cores = values
+
+    @property
+    def expert_target_clusters(self) -> list[str]:
+        return _serialized_target_clusters(self.expert_npu_backend)
+
+    @expert_target_clusters.setter
+    def expert_target_clusters(self, values: list[str]) -> None:
+        self.expert_npu_backend.target_clusters = values
+
+    @property
+    def lm_head_mxq_path(self) -> str:
+        return self.lm_head_npu_backend.mxq_path
+
+    @lm_head_mxq_path.setter
+    def lm_head_mxq_path(self, value: str) -> None:
+        self.lm_head_npu_backend.mxq_path = value
+
+    @property
+    def lm_head_target_device(self) -> str:
+        return self.lm_head_npu_backend.target_device
+
+    @lm_head_target_device.setter
+    def lm_head_target_device(self, value: str) -> None:
+        self.lm_head_npu_backend = _rebuild_backend_for_target_device(
+            self.lm_head_npu_backend, value, prefix="lm_head_"
+        )
+
+    @property
+    def lm_head_dev_no(self) -> Union[int, list[int]]:
+        return self.lm_head_npu_backend.dev_no
+
+    @lm_head_dev_no.setter
+    def lm_head_dev_no(self, value: Union[int, list[int]]) -> None:
+        self.lm_head_npu_backend.dev_no = value
+
+    @property
+    def lm_head_core_mode(self) -> str:
+        return self.lm_head_npu_backend.core_mode
+
+    @lm_head_core_mode.setter
+    def lm_head_core_mode(self, value: str) -> None:
+        self.lm_head_npu_backend.core_mode = value
+
+    @property
+    def lm_head_max_batch_size(self) -> int:
+        return self.lm_head_npu_backend.max_batch_size
+
+    @lm_head_max_batch_size.setter
+    def lm_head_max_batch_size(self, value: int) -> None:
+        self.lm_head_npu_backend.max_batch_size = max(1, value)
+
+    @property
+    def lm_head_target_cores(self) -> list[str]:
+        return _serialized_target_cores(self.lm_head_npu_backend)
+
+    @lm_head_target_cores.setter
+    def lm_head_target_cores(self, values: list[str]) -> None:
+        self.lm_head_npu_backend.target_cores = values
+
+    @property
+    def lm_head_target_clusters(self) -> list[str]:
+        return _serialized_target_clusters(self.lm_head_npu_backend)
+
+    @lm_head_target_clusters.setter
+    def lm_head_target_clusters(self, values: list[str]) -> None:
+        self.lm_head_npu_backend.target_clusters = values
+
+    @classmethod
+    def from_dict(
+        cls: type[SpecificPretrainedConfigType], config_dict: dict[str, Any], **kwargs
+    ) -> Union[
+        "MobilintMixtureOfExpertsConfigMixin",
+        tuple["MobilintMixtureOfExpertsConfigMixin", dict[str, Any]],
+    ]:
+        """Buffer ``shared_*`` / ``expert_*`` / ``lm_head_*`` NPU kwargs across HF's ``from_dict``.
+
+        Mirrors :meth:`MobilintEagle3ConfigMixin.from_dict` for the three MoE role backends.
+        """
+        return_unused_kwargs = kwargs.pop("return_unused_kwargs", False)
+        role_subs = {
+            prefix: _split_npu_backend_kwargs(kwargs, prefix=prefix)
+            for prefix in MobilintMixtureOfExpertsConfigMixin._MOE_BACKEND_PREFIXES
+        }
+
+        config, unused_kwargs = super().from_dict(
+            config_dict, return_unused_kwargs=True, **kwargs
+        )  # type: ignore[misc]
+
+        for prefix, sub in role_subs.items():
+            _apply_npu_backend_kwargs(
+                config,
+                sub,
+                prefix=prefix,
+                resolve_backend=lambda c, p=prefix: getattr(c, f"{p}npu_backend"),
+            )
+
+        if return_unused_kwargs:
+            return config, unused_kwargs
+        return config
+
+    def _remove_keys_not_serialized(self, d: dict[str, Any]) -> None:
+        for prefix in self._MOE_BACKEND_PREFIXES:
+            _ = d.pop(f"{prefix}npu_backend", None)
+        super()._remove_keys_not_serialized(d)
+
+    def to_dict(self):
+        output = super().to_dict()
+        for prefix in self._MOE_BACKEND_PREFIXES:
+            output.update(getattr(self, f"{prefix}npu_backend").to_dict(prefix=prefix))
         return output
