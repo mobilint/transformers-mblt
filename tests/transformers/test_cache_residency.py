@@ -513,3 +513,14 @@ def test_cache_on_chosen_slots_refuses_to_grow() -> None:
 
     with pytest.raises(ValueError, match="chosen slots"):
         cache.ensure_batch_size(2)
+
+
+def test_move_is_refused_when_the_target_kv_layout_cannot_be_read() -> None:
+    source = _Backend()
+    target = _Backend()
+    target.mxq_models[0].get_cache_infos = lambda: (_ for _ in ()).throw(RuntimeError("query failed"))
+    cache = MobilintCache(source.mxq_models)
+    _run(cache, source, 0, "hello")
+
+    with pytest.raises(MobilintCacheStateError, match="KV layout"):
+        _run(cache, target, 0, "!")

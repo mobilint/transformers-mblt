@@ -42,18 +42,26 @@ class MobilintCacheStateError(RuntimeError):
     """A cache's KV cannot be restored: it was never saved, or it belongs to an incompatible MXQ."""
 
 
+_SIGNATURE_QUERIES = ("get_core_mode", "get_cache_infos", "get_model_input_shape", "get_input_buffer_info")
+
+
 def mxq_kv_signature(mxq_model: Any) -> Optional[tuple]:
-    """Return what must match for one MXQ's KV dump to load into another, or ``None`` if unknown.
+    """Return what must match for one MXQ's KV dump to load into another.
 
     Built from the compiled KV buffers (name, size, batches, type and ``layer_hash`` of each), the core mode,
     the input shapes and the KV capacity. ``Model.get_identifier()`` is a per-handle counter and
-    ``get_model_path()`` can be a transient ``/proc/self/fd`` path, so neither is used. Handles that do not
-    expose these queries (test doubles) return ``None``, which never blocks a move.
+    ``get_model_path()`` can be a transient ``/proc/self/fd`` path, so neither is used.
+
+    Returns ``None`` only for objects that do not expose these queries at all (test doubles). When a query fails
+    on a handle that does expose them, raises :class:`MobilintCacheStateError`: a move must not proceed on an
+    unverified KV layout.
     """
     try:
         return _SIGNATURES[mxq_model]
     except (KeyError, TypeError):
         pass
+    if not all(callable(getattr(mxq_model, name, None)) for name in _SIGNATURE_QUERIES):
+        return None
     try:
         signature: Optional[tuple] = (
             str(mxq_model.get_core_mode()),
@@ -64,8 +72,10 @@ def mxq_kv_signature(mxq_model: Any) -> Optional[tuple]:
             tuple(tuple(shape) for shape in mxq_model.get_model_input_shape()),
             int(mxq_model.get_input_buffer_info()[0].max_cache_size),
         )
-    except Exception:
-        signature = None
+    except Exception as exc:
+        raise MobilintCacheStateError(
+            "Cannot read the MXQ's KV layout to check that a cache can move to it; refusing to load unverified KV."
+        ) from exc
     try:
         _SIGNATURES[mxq_model] = signature
     except TypeError:
