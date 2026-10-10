@@ -549,3 +549,22 @@ def test_batched_request_larger_than_the_chosen_slots_is_rejected_up_front() -> 
     MobilintModelMixin._validate_batch_cache(cache, 2)
     with pytest.raises(ValueError, match="cache rows=2, input batch_size=3"):
         MobilintModelMixin._validate_batch_cache(cache, 3)
+
+
+def test_snapshots_after_dispose_never_touch_the_dead_model() -> None:
+    backend = _Backend()
+    saved = MobilintCache(backend.mxq_models)
+    lost = MobilintCache(backend.mxq_models, per_model_batch=1)
+    _run(saved, backend, 0, "kept")
+    saved.dump_cache_memory()
+    _run(lost, backend, 0, "gone")  # saved is evicted (dumped), lost is resident
+    dead = backend.mxq_models[0]
+    dead.dump_cache_memory = lambda cache_id=0: (_ for _ in ()).throw(AssertionError("dumped a disposed Model"))
+    backend.mxq_models = []  # dispose
+
+    assert not lost.is_resident
+    copied = saved.copy()  # uses the host copy
+    saved.dump_cache_memory()
+    assert saved.layers[0].buffer == [b"kept"] and copied.get_seq_length() == 4
+    with pytest.raises(MobilintCacheStateError):
+        lost.dump_cache_memory()  # its KV was never saved

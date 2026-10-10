@@ -135,6 +135,8 @@ class MobilintKVResidency:
         layer._residency_hint = weakref.ref(self)
 
     def is_resident(self, layer: "MobilintLayer") -> bool:
+        # Refresh first: a slot on a disposed backend or a replaced Model must not count as live.
+        self.refresh()
         return self.owner(layer.mxq_model, layer.cache_id) is layer
 
     def forget_stale_models(self, live_models: Iterable[Any]) -> None:
