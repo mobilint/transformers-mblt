@@ -1763,6 +1763,7 @@ class MobilintModelMixin(PretrainedOnlyMixin, PreTrainedModel):
         hidden_states_numpy = hidden_states.type(torch.float32).cpu().numpy()
         encoder_hidden_states_numpy = encoder_hidden_states.type(torch.float32).cpu().numpy()
 
+        self._bind_single_slot_cache(past_key_values)
         mxq_model = self.npu_backend.mxq_models[0]
 
         cache_size = 0 if past_key_values is None else past_key_values.get_seq_length()

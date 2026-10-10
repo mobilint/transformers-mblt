@@ -30,6 +30,13 @@
   still hold the final tree's nodes. They are no longer counted as cached: `MobilintEagle3Cache.unfed_tokens` keeps
   them, and the next `generate()` (full-sequence or delta-only input) or `forward()` feeds them first. `copy()` keeps
   them; `reset()` clears them.
+- Portable caches, part 4 (ASR and encoder-decoder). The Whisper and Qwen3-ASR beam decoders take the decoder slot
+  through the owner table (`MobilintBeamCache.bind_active()`). A beam cache stores token histories, not KV, so when
+  another cache or a forward without a cache used the slot, or the cache moved to another instance, it forgets what
+  the slot held and replays its history from the start. Before, two Whisper caches decoding in turn read each
+  other's KV. A replay that fails midway keeps only the shared prefix as the slot's history. The Whisper cacheless
+  chunked prefill and the shared encoder-decoder `decoder_forward` (BLIP text) also go through the owner table.
+  `MobilintBeamCache` gains `offload()`, `is_resident` and `host_nbytes` (always 0).
 
 ### Changed
 

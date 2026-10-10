@@ -22,6 +22,10 @@ KV only moves between compatible MXQs: see :func:`mxq_kv_signature`.
 A slot is live while its Model is alive and not disposed (qbruntime's ``Model.dispose()`` drops ``_acc``). The KV
 of a disposed slot is gone: its owner can only be restored from a host copy saved earlier.
 
+Beam caches (Whisper, Qwen3-ASR) put a :class:`~transformers_mblt.utils.cache_utils.MobilintReplaySlot` in the
+table instead of a layer. It saves and loads nothing: losing or regaining the slot makes the beam cache replay its
+token history from the start.
+
 Layers that the table never tracked keep the pre-residency behavior of :class:`MobilintLayer`
 (``dump_cache_memory`` reads the slot directly), so code paths that do not bind yet are unaffected.
 

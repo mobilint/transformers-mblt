@@ -449,11 +449,16 @@ model.generate(continuation_a, past_key_values=a, max_new_tokens=32)  # b is sav
 - `dump_cache_memory()` / `load_cache_memory()` keep their meaning: an explicit snapshot that `load_cache_memory()`
   restores, kept apart from the host copy used for moves. `fake_prefill()` caches are never moved or loaded.
 
-This applies to the dense LLM, Qwen3-VL text, Mixture-of-Experts and EAGLE-3 paths. A
+This applies to the dense LLM, Qwen3-VL text, Mixture-of-Experts, EAGLE-3 and encoder-decoder (BLIP text) paths. A
 `MobilintMixtureOfExpertsCache` binds all of its shared-MXQ layers together, and a `MobilintEagle3Cache` binds its
 base and draft layers. When EAGLE-3 generation stops, the last accepted tokens are kept in
-`MobilintEagle3Cache.unfed_tokens` and fed at the start of the next call. Whisper and Qwen3-ASR caches keep their
-previous behavior for now.
+`MobilintEagle3Cache.unfed_tokens` and fed at the start of the next call.
+
+Whisper and Qwen3-ASR beam caches (`MobilintBeamCache`, `MobilintWhisperCache`) keep no KV in host memory: they
+record which token history the decoder slot holds and replay what is missing. They take part in the same owner table.
+When another cache or a forward without a cache uses the decoder slot, or the cache moves to another instance, the
+beam cache forgets that history and replays it from the start on its next forward. `offload()` frees the slot,
+`is_resident` reports whether the slot still holds the history, and `host_nbytes` is always 0.
 
 ## Listing Available Models
 

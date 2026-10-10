@@ -742,6 +742,39 @@ def cache_matches_backend_topology(cache: Any, model: Any) -> bool:
     return True
 
 
+class MobilintReplaySlot:
+    """Owner-table entry for a cache that rebuilds its slot by replaying tokens instead of moving KV.
+
+    :class:`MobilintBeamCache` keeps no KV of its own: it records which token history the slot holds and replays
+    whatever is missing. When another cache (or a forward without a cache) takes the slot, or the beam cache moves
+    to another slot, that record no longer describes the slot, so it is forgotten and the next forward replays the
+    full history. Nothing is dumped or loaded.
+    """
+
+    speculative = False
+
+    def __init__(self, cache: "MobilintBeamCache", mxq_model: Any, cache_id: int = 0) -> None:
+        self._cache_ref = weakref.ref(cache)
+        self.mxq_model = mxq_model
+        self.cache_id = int(cache_id)
+        self._tracked = False
+
+    def _forget(self) -> None:
+        cache = self._cache_ref()
+        if cache is not None:
+            cache.forget_active_tokens()
+
+    def _save_from_slot(self) -> None:
+        self._forget()  # the slot is about to hold something else
+
+    def _load_into_slot(self) -> None:
+        self._forget()  # whatever the slot holds now is not this cache's history
+
+    def _retarget(self, mxq_model: Any, cache_id: int) -> None:
+        self.mxq_model = mxq_model
+        self.cache_id = int(cache_id)
+
+
 class MobilintBeamCache(MobilintCache):
     """Mobilint beam cache tracked by token histories instead of KV snapshots.
 
@@ -789,6 +822,38 @@ class MobilintBeamCache(MobilintCache):
         self._active_token_history: list[int] = []
         self._active_source_index: int | None = None
         self._beam_seq_lengths: list[int] = [0 for _ in range(self.batch_size)]
+        self._replay_slot = MobilintReplaySlot(self, self.mxq_model, 0)
+
+    def bind_active(self, mxq_model: Any) -> None:
+        """Take slot ``(mxq_model, 0)`` before replaying on it.
+
+        If the slot held another cache, or this cache comes from another slot, the active history is forgotten
+        and the next forward replays every beam from the start.
+        """
+        residency.acquire(self._replay_slot, mxq_model, 0)
+
+    def truncate_active_tokens(self, length: int) -> None:
+        """Keep only the first ``length`` tokens of the active history (a replay is about to overwrite the rest)."""
+        del self._active_token_history[int(length) :]
+
+    def forget_active_tokens(self) -> None:
+        """Forget which history the slot holds; the next forward replays from the start."""
+        self._active_token_history = []
+        self._active_source_index = None
+
+    @property
+    def is_resident(self) -> bool:
+        """Whether the slot still holds the active token history."""
+        return residency.is_resident(self._replay_slot)
+
+    @property
+    def host_nbytes(self) -> int:
+        """Beam caches replay tokens instead of saving KV, so they keep none in host memory."""
+        return 0
+
+    def offload(self) -> None:
+        """Free the slot for other caches; the next forward replays the full history."""
+        residency.release(self._replay_slot)
 
     def reset(self) -> None:
         """Reset active qbruntime cache bookkeeping and clear beam token histories."""
