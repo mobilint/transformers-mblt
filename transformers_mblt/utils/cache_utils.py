@@ -10,7 +10,7 @@ import qbruntime
 import torch
 from transformers.cache_utils import Cache
 
-from .cache_residency import MobilintCacheStateError, mxq_kv_signature, residency_for_model
+from .cache_residency import MobilintCacheStateError, mxq_kv_signature, note_direct_load, residency_for_model
 
 try:
     from transformers.cache_utils import CacheLayerMixin
@@ -255,6 +255,7 @@ class MobilintLayer(CacheLayerMixin):
             return
         if self.get_seq_length() > 0:
             self.mxq_model.load_cache_memory(self.buffer, self.cache_id)
+            note_direct_load(self)
 
     def dump_cache_memory_to(self, cache_dir: str):
         residency = self._residency()
@@ -280,6 +281,8 @@ class MobilintLayer(CacheLayerMixin):
         self.mxq_model.load_cache_memory_from(cache_dir, self.cache_id)
         if residency is not None:
             residency._record(self.mxq_model, self.cache_id, self)
+        elif self._seen_tokens > 0:
+            note_direct_load(self)
 
     def copy(self) -> "MobilintLayer":
         """Return an independent snapshot of this sequence's KV.

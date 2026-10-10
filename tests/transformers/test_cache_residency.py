@@ -594,3 +594,34 @@ def test_explicit_load_on_a_never_bound_cache_saves_the_slot_owner_first() -> No
     assert restored.is_resident and not a.is_resident
     _run(a, backend, 0, "!")  # A was saved before the load overwrote the slot
     assert _slot(backend) == "aaa!"
+
+
+def _restore_from_file(cache: MobilintCache, backend: _Backend, content: str, tmp_path) -> None:
+    """A file restore right after loading the model: the backend has no owner table yet."""
+    mxq = backend.mxq_models[0]
+    mxq.load_cache_memory_from = lambda cache_dir, cache_id=0: mxq.write(cache_id, content)
+    (tmp_path / "seq_length.txt").write_text(f"{len(content)}\n")
+    cache.load_cache_memory_from(str(tmp_path))
+
+
+def test_file_restore_before_any_forward_continues_on_first_use(tmp_path) -> None:
+    backend = _Backend()
+    cache = MobilintCache(backend.mxq_models)
+    _restore_from_file(cache, backend, "saved", tmp_path)
+
+    _run(cache, backend, 0, "!")
+
+    assert _slot(backend) == "saved!"
+    assert backend.mxq_models[0].calls == []  # adopted as the owner: no reload
+
+
+def test_file_restore_before_any_forward_survives_another_cache_running_first(tmp_path) -> None:
+    backend = _Backend()
+    restored = MobilintCache(backend.mxq_models)
+    _restore_from_file(restored, backend, "saved", tmp_path)
+
+    other = MobilintCache(backend.mxq_models)
+    _run(other, backend, 0, "x")  # saves the restored KV before overwriting the slot
+    _run(restored, backend, 0, "!")
+
+    assert _slot(backend) == "saved!"

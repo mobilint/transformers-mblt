@@ -683,3 +683,29 @@ def test_cache_from_a_release_with_another_kv_layout_is_refused_unless_empty() -
     model_kwargs = {"past_key_values": empty}
     other_release._prepare_cache_for_generation(None, model_kwargs, None, 1, 0)
     assert model_kwargs["past_key_values"] is not empty
+
+
+def _file_io(generator: _Generator) -> None:
+    for model in generator.get_shared_mxq_models():
+        model.dump_cache_memory_to = lambda cache_dir, cache_id=0, m=model: Path(cache_dir, "kv").write_text(m.kv)
+        model.load_cache_memory_from = lambda cache_dir, cache_id=0, m=model: setattr(
+            m, "kv", Path(cache_dir, "kv").read_text()
+        )
+
+
+def test_moe_cache_restored_from_files_before_any_forward_continues(tmp_path) -> None:
+    generator = _Generator()
+    _file_io(generator)
+    saved = generator._new_moe_cache()
+    generator.run(saved, "prompt")
+    saved.dump_cache_memory_to(str(tmp_path))
+
+    fresh = _Generator()  # a new process: new model, no owner table yet
+    _file_io(fresh)
+    restored = fresh._new_moe_cache()
+    restored.load_cache_memory_from(str(tmp_path))
+
+    fresh.run(restored, "!")
+
+    assert [model.kv for model in fresh.get_shared_mxq_models()] == ["prompt!", "prompt!"]
+    assert all(model.calls == [] for model in fresh.get_shared_mxq_models())

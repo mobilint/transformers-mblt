@@ -39,6 +39,18 @@ _SIGNATURES: "weakref.WeakKeyDictionary[Any, Optional[tuple]]" = weakref.WeakKey
 # Every live Model a residency has seen -> that residency, so an explicit load on a cache that was never bound still
 # goes through the owner table of the backend that runs the Model.
 _MODEL_RESIDENCY: "weakref.WeakKeyDictionary[Any, weakref.ref[MobilintKVResidency]]" = weakref.WeakKeyDictionary()
+# Slots a layer loaded directly before any owner table knew its Model (e.g. a file restore right after loading the
+# model): (id(model), cache_id) -> (weakref(model), weakref(layer)). The first owner table that looks at the slot
+# adopts that layer as the owner, so its KV is neither reloaded nor lost.
+_PENDING_OWNERS: dict[tuple[int, int], tuple[Any, Any]] = {}
+
+
+def note_direct_load(layer: "MobilintLayer") -> None:
+    """Record that ``layer`` loaded its KV into its slot without an owner table."""
+    try:
+        _PENDING_OWNERS[(id(layer.mxq_model), int(layer.cache_id))] = (weakref.ref(layer.mxq_model), weakref.ref(layer))
+    except TypeError:  # Models without __weakref__ (test doubles)
+        pass
 
 
 class MobilintCacheStateError(RuntimeError):
@@ -129,6 +141,13 @@ class MobilintKVResidency:
         """Return the layer whose KV the slot holds, or ``None``."""
         entry = self._owners.get((id(mxq_model), int(cache_id)))
         if entry is None:
+            pending = _PENDING_OWNERS.pop((id(mxq_model), int(cache_id)), None)
+            if pending is not None:
+                model_ref, layer_ref = pending
+                layer = layer_ref()
+                if model_ref() is mxq_model and layer is not None and layer.mxq_model is mxq_model:
+                    self._record(mxq_model, cache_id, layer)
+                    return layer
             return None
         model_ref, _, layer_ref = entry
         layer = layer_ref()
@@ -139,6 +158,7 @@ class MobilintKVResidency:
 
     def _record(self, mxq_model: Any, cache_id: int, layer: Optional["MobilintLayer"]) -> None:
         key = (id(mxq_model), int(cache_id))
+        _PENDING_OWNERS.pop(key, None)
         if layer is None:
             self._owners.pop(key, None)
             return
