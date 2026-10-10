@@ -396,13 +396,18 @@ def initialize_tree(
             "When reusing `past_key_values`, provide at least one new input token."
         )
 
-    outputs, logits = model.eagle3_base_model(
-        prompt_delta_input_ids,
-        cache=cache,
-        output_orig=True,
-        requires_all_features_logits=False,
-        count_npu_time=count_npu_time,
-    )
+    try:
+        outputs, logits = model.eagle3_base_model(
+            prompt_delta_input_ids,
+            cache=cache,
+            output_orig=True,
+            requires_all_features_logits=False,
+            count_npu_time=count_npu_time,
+        )
+    except BaseException:
+        if unfed is not None:
+            cache.unfed_tokens = unfed  # not fed: keep them for a retry
+        raise
     cache.update_base_seen_tokens(prompt_delta_input_ids.shape[1])
 
     if logits_processor is not None:

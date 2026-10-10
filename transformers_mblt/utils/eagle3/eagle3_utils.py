@@ -1069,7 +1069,9 @@ class MobilintEagle3DraftModelMixin:
         tree_mask = self.tree_mask_init.to(hidden_states.device)
         topk_cs_index = torch.arange(top_k, device=hidden_states.device)
         add_cache_position = 0
-        length_position = input_ids.shape[1] - 1
+        # Absolute position of the token being expanded: the draft cache now holds every position before it.
+        # (``input_ids.shape[1] - 1`` equals this only when ``input_ids`` is the whole conversation.)
+        length_position = cache.get_draft_seq_length()
 
         # The first draft depth level is already created above from
         # `last_hidden_logits` via initial top-k selection, so this loop should

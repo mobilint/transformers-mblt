@@ -84,16 +84,21 @@ def llm_eagle3_forward(
             "forward without explicit position_ids/attention_mask, or pass the full sequence to generate()."
         )
 
-    outputs, logits = model.eagle3_base_model(
-        input_ids=input_ids,
-        cache=past_key_values,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        inputs_embeds=inputs_embeds,
-        output_orig=True,
-        requires_all_features_logits=False,
-        count_npu_time=count_npu_time,
-    )
+    try:
+        outputs, logits = model.eagle3_base_model(
+            input_ids=input_ids,
+            cache=past_key_values,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            output_orig=True,
+            requires_all_features_logits=False,
+            count_npu_time=count_npu_time,
+        )
+    except BaseException:
+        if unfed is not None:
+            past_key_values.unfed_tokens = unfed  # not fed: keep them for a retry
+        raise
 
     consumed_tokens = 0
     if input_ids is not None:
@@ -1170,6 +1175,8 @@ class MobilintEagle3GenerationMixin(ABC, GenerationMixin):
                 # The accepted tokens were returned but never fed: keep them for the next call (see
                 # MobilintEagle3Cache.unfed_tokens) instead of counting their stale KV positions as cached.
                 defer_eagle3_accept_tokens(cache)
+                # A non-final step already fed the accepted tokens to the draft; the base has not seen them.
+                cache.sync_draft_seq_length_to_base()
                 break
             if should_stop:
                 break

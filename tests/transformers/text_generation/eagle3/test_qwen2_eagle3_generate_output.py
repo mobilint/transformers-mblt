@@ -657,12 +657,13 @@ def test_qwen2_eagle3_generate_defers_pending_accept_tokens_on_stopping_criteria
     )
     _attach_minimal_eagle3_modules(model)
 
+    syncs: list[int] = []
     cache = SimpleNamespace(
         _base_seq=2,
         accept_tokens=None,
         reset=lambda: None,
         clear_tree_state=lambda: None,
-        sync_draft_seq_length_to_base=lambda: None,
+        sync_draft_seq_length_to_base=lambda: syncs.append(cache._base_seq),
         update_base_seen_tokens=lambda n: setattr(cache, "_base_seq", cache._base_seq + int(n)),
         get_base_seq_length=lambda: cache._base_seq,
     )
@@ -708,6 +709,8 @@ def test_qwen2_eagle3_generate_defers_pending_accept_tokens_on_stopping_criteria
     assert cache.get_base_seq_length() == 2
     assert cache.accept_tokens is None
     assert torch.equal(cache.unfed_tokens, torch.tensor([[4]], dtype=torch.long))
+    # The draft is realigned to the base on the stop path itself, not only at the end of generate().
+    assert syncs[-2:] == [2, 2]
 
 
 def test_qwen2_eagle3_generation_config_updates_max_draft_tokens() -> None:

@@ -330,3 +330,76 @@ def test_snapshots_keep_the_unfed_tokens(tmp_path) -> None:
     restored = MobilintEagle3Cache(_FileMxq(), _FileMxq())
     restored.load_cache_memory_from(str(tmp_path))
     assert torch.equal(restored.unfed_tokens, torch.tensor([[4, 5]]))
+
+
+def test_draft_expansion_positions_follow_the_draft_cache() -> None:
+    from transformers_mblt.utils.eagle3.eagle3_utils import MobilintEagle3DraftModelMixin
+
+    class _Draft(MobilintEagle3DraftModelMixin):
+        def __init__(self) -> None:
+            self.max_draft_tokens = 1
+            self.depth = 3
+            self.top_k = 1
+            self.draft_config = SimpleNamespace(vocab_size=8, draft_vocab_size=8)
+            self.logsoftmax = lambda x: x
+            self.tree_mask_init = torch.ones((1, 1, 1, 1))
+            self.position_ids = torch.tensor([0])
+            self.d2t = torch.zeros(8, dtype=torch.long)
+            self.expansion_positions: list[int] = []
+
+        def __call__(self, hidden_states, *, position_ids=None, requires_all_features=False, **_kwargs):
+            if requires_all_features:
+                self.expansion_positions.append(int(position_ids.reshape(-1)[0]))
+                return torch.zeros((1, 1, 1)), torch.zeros((1, 1, 8))
+            return torch.zeros((1, 1)), torch.zeros((1, 8))
+
+    seq = {"draft": 40}  # a long conversation already in the draft cache
+    cache = SimpleNamespace(
+        get_draft_seq_length=lambda: seq["draft"],
+        update_draft_seen_tokens=lambda n: seq.__setitem__("draft", seq["draft"] + int(n)),
+    )
+    draft = _Draft()
+
+    # Delta-only history: input_ids holds 3 tokens, the draft feeds 2 of them.
+    draft.topk_generate(
+        torch.zeros((1, 2, 1)),
+        input_ids=torch.tensor([[1, 2, 3]]),
+        cache=cache,
+        logits_processor=None,
+        input_ids_delta=torch.tensor([[2, 3]]),
+    )
+
+    assert draft.expansion_positions == [42, 43]  # after the 40 cached + 2 fed tokens, not after the 3-token input
+
+
+def test_failed_base_feed_keeps_the_unfed_tokens() -> None:
+    def failing_base(*_args, **_kwargs):
+        raise RuntimeError("NPU fault")
+
+    model = SimpleNamespace(eagle3_base_model=failing_base, eagle3_draft_model=_RecordingDraft())
+    cache = _cache_after_stop(committed=3, unfed=[7, 8])
+
+    with pytest.raises(RuntimeError, match="NPU fault"):
+        initialize_tree(torch.tensor([[9]]), model, cache, logits_processor=None)
+
+    assert torch.equal(cache.unfed_tokens, torch.tensor([[7, 8]]))
+    assert cache.get_base_seq_length() == 3
+
+
+def test_failed_forward_keeps_the_unfed_tokens() -> None:
+    def failing_base(*_args, **_kwargs):
+        raise RuntimeError("NPU fault")
+
+    model = SimpleNamespace(eagle3_base_model=failing_base, config=SimpleNamespace(vocab_size=8))
+
+    class _Cache(MobilintEagle3Cache):
+        pass
+
+    cache = object.__new__(_Cache)
+    cache.unfed_tokens = torch.tensor([[7, 8]])
+    cache.base_layer = SimpleNamespace(update_seen_tokens=lambda n: None)
+
+    with pytest.raises(RuntimeError, match="NPU fault"):
+        llm_eagle3_forward(model, input_ids=torch.tensor([[9]]), past_key_values=cache)
+
+    assert torch.equal(cache.unfed_tokens, torch.tensor([[7, 8]]))
