@@ -21,6 +21,16 @@
   instance of the same release, and gains `offload()`, `is_resident` and `host_nbytes`. Binding all 48 layers of
   Qwen3-30B-A3B when the cache is already resident costs about 0.05 ms per forward.
 
+- Portable caches, part 3 (EAGLE-3). The base and draft forwards bind the base and draft layers of a
+  `MobilintEagle3Cache`, so an EAGLE-3 conversation continues correctly after another cache ran on the same model
+  (before, it decoded on the other sequence's KV) and can move to another instance of the same release.
+  `MobilintEagle3Cache` gains `offload()`, `is_resident` and `host_nbytes`. The draft layer is speculative: if its KV
+  was lost, it restores what it has instead of raising, because the base model verifies every drafted token.
+- When EAGLE-3 generation stops, the last accepted tokens are returned without another forward, so their KV positions
+  still hold the final tree's nodes. They are no longer counted as cached: `MobilintEagle3Cache.unfed_tokens` keeps
+  them, and the next `generate()` (full-sequence or delta-only input) or `forward()` feeds them first. `copy()` keeps
+  them; `reset()` clears them.
+
 ### Changed
 
 - `MobilintMixtureOfExpertsNPUBackend.kv_owner` is now read-only and derived from the owner table: the cache whose
@@ -30,6 +40,10 @@
 
 ### Fixed
 
+- EAGLE-3 generation with a delta-only follow-up (only the new tokens as `input_ids`, with a reused cache) produced
+  garbage: tree decoding placed the tree at RoPE positions derived from the input length instead of the cached
+  prefix, and each decode step derived the draft's input from that short history. Positions now come from the cache,
+  and the draft gets its input explicitly. Full-sequence inputs are unchanged.
 - An explicit `load_cache_memory()` / `load_cache_memory_from()` on a cache that had never been bound wrote the NPU
   slot without telling the owner table, which could later save the overwritten slot as the previous owner's KV. Every
   load, bind and file restore now goes through the one owner table, including restores before the first forward.

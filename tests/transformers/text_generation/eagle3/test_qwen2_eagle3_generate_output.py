@@ -633,8 +633,11 @@ def test_qwen2_eagle3_generate_calls_stopping_criteria(monkeypatch) -> None:
     assert criteria.score_shapes == [(1, 16)]
 
 
-def test_qwen2_eagle3_generate_commits_pending_accept_tokens_on_stopping_criteria(monkeypatch) -> None:
-    """Commit pending accepted tokens before breaking on custom stopping criteria."""
+def test_qwen2_eagle3_generate_defers_pending_accept_tokens_on_stopping_criteria(monkeypatch) -> None:
+    """Keep accepted-but-unfed tokens for the next call when breaking on custom stopping criteria.
+
+    Their KV positions still hold the last tree's nodes, so they must not count as cached.
+    """
 
     class StopNowCriteria(StoppingCriteria):
         def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs: object) -> bool:
@@ -654,12 +657,13 @@ def test_qwen2_eagle3_generate_commits_pending_accept_tokens_on_stopping_criteri
     )
     _attach_minimal_eagle3_modules(model)
 
+    syncs: list[int] = []
     cache = SimpleNamespace(
         _base_seq=2,
         accept_tokens=None,
         reset=lambda: None,
         clear_tree_state=lambda: None,
-        sync_draft_seq_length_to_base=lambda: None,
+        sync_draft_seq_length_to_base=lambda: syncs.append(cache._base_seq),
         update_base_seen_tokens=lambda n: setattr(cache, "_base_seq", cache._base_seq + int(n)),
         get_base_seq_length=lambda: cache._base_seq,
     )
@@ -702,8 +706,11 @@ def test_qwen2_eagle3_generate_commits_pending_accept_tokens_on_stopping_criteri
     )
 
     assert torch.equal(output.sequences, torch.tensor([[1, 2, 4]], dtype=torch.long))
-    assert cache.get_base_seq_length() == 3
+    assert cache.get_base_seq_length() == 2
     assert cache.accept_tokens is None
+    assert torch.equal(cache.unfed_tokens, torch.tensor([[4]], dtype=torch.long))
+    # The draft is realigned to the base on the stop path itself, not only at the end of generate().
+    assert syncs[-2:] == [2, 2]
 
 
 def test_qwen2_eagle3_generation_config_updates_max_draft_tokens() -> None:
@@ -830,7 +837,9 @@ def test_qwen2_eagle3_update_inference_inputs_caps_remaining_tokens() -> None:
 
     assert torch.equal(output, torch.tensor([[1, 2, 4, 5]], dtype=torch.long))
     assert cache.accept_tokens is None
-    assert base_seen_tokens["count"] == 2
+    # Stopping does not feed the accepted tokens: they wait in unfed_tokens instead of counting as cached.
+    assert base_seen_tokens["count"] == 0
+    assert torch.equal(cache.unfed_tokens, torch.tensor([[4, 5]], dtype=torch.long))
     assert new_token_count == 2
     assert should_stop is True
 
@@ -866,7 +875,9 @@ def test_qwen2_eagle3_update_inference_inputs_stops_at_mid_block_eos() -> None:
 
     assert torch.equal(output, torch.tensor([[1, 2, 4, 5]], dtype=torch.long))
     assert cache.accept_tokens is None
-    assert base_seen_tokens["count"] == 2
+    # Stopping does not feed the accepted tokens: they wait in unfed_tokens instead of counting as cached.
+    assert base_seen_tokens["count"] == 0
+    assert torch.equal(cache.unfed_tokens, torch.tensor([[4, 5]], dtype=torch.long))
     assert new_token_count == 2
     assert should_stop is True
 
@@ -1156,7 +1167,10 @@ def test_llm_eagle3_forward_accepts_dict_hidden_states() -> None:
 
     model = _DummyModel()
     cache = object.__new__(_FakeEagle3Cache)
-    cache.base_layer = SimpleNamespace(update_seen_tokens=lambda _n: None)
+    seen = {"n": 0}
+    cache.base_layer = SimpleNamespace(
+        update_seen_tokens=lambda n: seen.__setitem__("n", seen["n"] + n), get_seq_length=lambda: seen["n"]
+    )
 
     output = llm_eagle3_forward(model, input_ids=torch.tensor([[1]], dtype=torch.long), past_key_values=cache)
 
@@ -1195,7 +1209,10 @@ def test_llm_eagle3_forward_accepts_object_hidden_states_and_missing_hidden_stat
         """Type-check compatible cache stub for llm_eagle3_forward tests."""
 
     cache = object.__new__(_FakeEagle3Cache)
-    cache.base_layer = SimpleNamespace(update_seen_tokens=lambda _n: None)
+    seen = {"n": 0}
+    cache.base_layer = SimpleNamespace(
+        update_seen_tokens=lambda n: seen.__setitem__("n", seen["n"] + n), get_seq_length=lambda: seen["n"]
+    )
     with_hidden = llm_eagle3_forward(
         _DummyModel(with_hidden_states=True),
         input_ids=torch.tensor([[1]], dtype=torch.long),

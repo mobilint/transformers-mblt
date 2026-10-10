@@ -78,6 +78,9 @@ class MobilintLayer(CacheLayerMixin):
         self._host_kv: list[bytes] = []
         self._host_valid_len = 0
         self._tracked = False  # whether the owner table has managed this layer's KV
+        # A speculative layer (the EAGLE-3 draft) only proposes tokens that the base model verifies, so its KV may
+        # be partly stale: restoring it loads whatever host copy exists instead of refusing a short one.
+        self.speculative = False
         self._kv_signature: Optional[tuple] = None
         self._owner_cache: Optional[Any] = None  # weakref to the multi-layer cache this layer belongs to, if any
 
@@ -188,6 +191,10 @@ class MobilintLayer(CacheLayerMixin):
         if self._seen_tokens <= 0 or not self.kv_valid:
             return
         if self._host_valid_len < self._seen_tokens:
+            if self.speculative:
+                if self._host_kv:
+                    self.mxq_model.load_cache_memory(self._host_kv, self.cache_id)
+                return
             raise MobilintCacheStateError(
                 f"Cannot restore {self._seen_tokens} cached tokens: the host copy holds only "
                 f"{self._host_valid_len}. The KV was on an NPU slot that was released (for example the backend "
@@ -274,6 +281,7 @@ class MobilintLayer(CacheLayerMixin):
         copied.buffer = copy.deepcopy(self.buffer)
         copied.buffer_seq_length = self.buffer_seq_length
         copied.kv_valid = self.kv_valid
+        copied.speculative = self.speculative
         copied.buffer_kv_valid = self.buffer_kv_valid
         copied._host_kv = self._host_kv
         copied._host_valid_len = self._host_valid_len
@@ -1155,6 +1163,57 @@ class MobilintDeepStackCache(MobilintCache):
         return copied
 
 
+def defer_eagle3_accept_tokens(cache: Any) -> None:
+    """Move an EAGLE-3 cache's accepted-but-unfed tokens to ``unfed_tokens`` (see :class:`MobilintEagle3Cache`)."""
+    accepted = getattr(cache, "accept_tokens", None)
+    if accepted is None:
+        return
+    if accepted.shape[1] > 0:
+        unfed = getattr(cache, "unfed_tokens", None)
+        cache.unfed_tokens = accepted if unfed is None else torch.cat((unfed, accepted.to(unfed.device)), dim=1)
+    cache.accept_tokens = None
+
+
+def take_eagle3_unfed_tokens(cache: Any) -> Optional[torch.LongTensor]:
+    """Return and clear the tokens an EAGLE-3 cache still has to feed before the next input."""
+    tokens = getattr(cache, "unfed_tokens", None)
+    if tokens is not None:
+        cache.unfed_tokens = None
+    return tokens
+
+
+def note_eagle3_fed_tokens(cache: Any, token_ids: Optional[torch.LongTensor]) -> None:
+    """Record ids just fed to the base MXQ (after its length advanced), or ``None`` when they are unknown.
+
+    ``fed_token_ids`` lets the next call tell a full-sequence input (it starts with exactly these ids) from a
+    delta-only one. A gap in the record (ids fed somewhere that did not note them) makes it unknown.
+    """
+    if token_ids is None:
+        cache.fed_token_ids = None
+        return
+    token_ids = token_ids.detach().to("cpu", dtype=torch.long)
+    base_len = int(cache.get_base_seq_length())
+    previous_len = base_len - int(token_ids.shape[1])
+    known = eagle3_fed_tokens(cache, length=previous_len)
+    if known is not None:
+        cache.fed_token_ids = torch.cat((known, token_ids), dim=1)
+    elif previous_len == 0:
+        cache.fed_token_ids = token_ids.clone()
+    else:
+        cache.fed_token_ids = None
+
+
+def eagle3_fed_tokens(cache: Any, length: Optional[int] = None) -> Optional[torch.LongTensor]:
+    """The ids of the first ``length`` (default: all cached) base tokens, if the cache knows them."""
+    length = int(cache.get_base_seq_length()) if length is None else int(length)
+    if length == 0:
+        return torch.empty((1, 0), dtype=torch.long)
+    known = getattr(cache, "fed_token_ids", None)
+    if known is None or known.shape[1] < length:
+        return None
+    return known[:, :length]
+
+
 class MobilintEagle3Cache(Cache):
     """Mobilint cache for EAGLE-3 speculative decoding.
 
@@ -1171,6 +1230,7 @@ class MobilintEagle3Cache(Cache):
         self.draft_mxq_model = draft_mxq_model
         self.base_layer = MobilintLayer(base_mxq_model, 0)
         self.draft_layer = MobilintLayer(draft_mxq_model, 0)
+        self.draft_layer.speculative = True
         self.layers = [self.base_layer]
         self.layer_classes = MobilintLayer
         self.num_hidden_layers = 1
@@ -1180,6 +1240,33 @@ class MobilintEagle3Cache(Cache):
         self.retrieve_indices: Optional[torch.LongTensor] = None
         self.tree_position_ids: Optional[torch.LongTensor] = None
         self.pending_draft_tokens: Optional[torch.LongTensor] = None
+        # Tokens already returned to the caller whose KV the base and draft MXQs do not hold yet: generation stops
+        # without feeding the last accepted tokens, and the next generate() or forward feeds them first.
+        self.unfed_tokens: Optional[torch.LongTensor] = None
+        # Ids of the tokens the base MXQ holds, when every feed recorded them (see note_eagle3_fed_tokens).
+        self.fed_token_ids: Optional[torch.LongTensor] = torch.empty((1, 0), dtype=torch.long)
+
+    @property
+    def is_resident(self) -> bool:
+        """Whether the base and draft MXQs hold this cache's KV."""
+        return self.base_layer.is_resident and self.draft_layer.is_resident
+
+    @property
+    def host_nbytes(self) -> int:
+        return self.base_layer.host_nbytes + self.draft_layer.host_nbytes
+
+    def offload(self) -> None:
+        """Save the base and draft KV to host memory and free both MXQ slots for other caches."""
+        self.base_layer.offload()
+        self.draft_layer.offload()
+
+    def defer_accept_tokens(self) -> None:
+        """Keep accepted tokens that were not fed for the next call instead of counting them as cached."""
+        defer_eagle3_accept_tokens(self)
+
+    def take_unfed_tokens(self) -> Optional[torch.LongTensor]:
+        """Return and clear the tokens the next call must feed before its own input."""
+        return take_eagle3_unfed_tokens(self)
 
     def get_seq_length(self, index: int = 0) -> int:
         del index
@@ -1193,10 +1280,11 @@ class MobilintEagle3Cache(Cache):
 
     def set_seq_length(self, sequence_length: int, index: int = 0) -> None:
         del index
-        self.base_layer.set_seq_length(sequence_length)
+        self.set_base_seq_length(sequence_length)
 
     def set_base_seq_length(self, sequence_length: int) -> None:
         self.base_layer.set_seq_length(sequence_length)
+        self.fed_token_ids = eagle3_fed_tokens(self)  # keep only the ids of the tokens still cached
 
     def set_draft_seq_length(self, sequence_length: int) -> None:
         self.draft_layer.set_seq_length(sequence_length)
@@ -1220,6 +1308,8 @@ class MobilintEagle3Cache(Cache):
         self.base_layer.fake_prefill(sequence_length)
         self.draft_layer.fake_prefill(sequence_length)
         self.clear_tree_state()
+        self.unfed_tokens = None
+        self.fed_token_ids = None
 
     def clear_tree_state(self) -> None:
         """Drop speculative decoding metadata while preserving KV cache state."""
@@ -1233,14 +1323,39 @@ class MobilintEagle3Cache(Cache):
         self.base_layer.reset()
         self.draft_layer.reset()
         self.clear_tree_state()
+        self.unfed_tokens = None
+        self._snapshot_unfed_tokens = None
+        self.fed_token_ids = torch.empty((1, 0), dtype=torch.long)
+
+    def bind_base(self, base_mxq_model: Any) -> None:
+        """Make ``base_mxq_model`` hold this cache's base KV before a base infer (moving it there if needed)."""
+        residency.acquire(self.base_layer, base_mxq_model, 0)
+        self.base_mxq_model = base_mxq_model
+
+    def bind_draft(self, draft_mxq_model: Any) -> None:
+        """Make ``draft_mxq_model`` hold this cache's draft KV before a draft infer (moving it there if needed)."""
+        residency.acquire(self.draft_layer, draft_mxq_model, 0)
+        self.draft_mxq_model = draft_mxq_model
+
+    # A snapshot is the base/draft KV plus the tokens still to be fed: their KV is not in the snapshot, so restoring
+    # without them would let a delta-only continuation skip tokens the caller already received.
+    _UNFED_TOKENS_FILE = "unfed_tokens.json"
 
     def dump_cache_memory(self) -> None:
         self.base_layer.dump_cache_memory()
         self.draft_layer.dump_cache_memory()
+        unfed = getattr(self, "unfed_tokens", None)
+        self._snapshot_unfed_tokens = None if unfed is None else unfed.clone()
+        fed = eagle3_fed_tokens(self)
+        self._snapshot_fed_token_ids = None if fed is None else fed.clone()
 
     def load_cache_memory(self) -> None:
         self.base_layer.load_cache_memory()
         self.draft_layer.load_cache_memory()
+        snapshot = getattr(self, "_snapshot_unfed_tokens", None)
+        self.unfed_tokens = None if snapshot is None else snapshot.clone()
+        fed = getattr(self, "_snapshot_fed_token_ids", None)
+        self.fed_token_ids = None if fed is None else fed.clone()
 
     def dump_cache_memory_to(self, cache_dir: str, index: int = 0) -> None:
         del index
@@ -1250,25 +1365,53 @@ class MobilintEagle3Cache(Cache):
         draft_dir.mkdir(parents=True, exist_ok=True)
         self.base_layer.dump_cache_memory_to(str(base_dir))
         self.draft_layer.dump_cache_memory_to(str(draft_dir))
+        unfed = getattr(self, "unfed_tokens", None)
+        unfed_path = Path(cache_dir) / self._UNFED_TOKENS_FILE
+        fed = eagle3_fed_tokens(self)
+        unfed_path.write_text(
+            json.dumps(
+                {
+                    "unfed_tokens": None if unfed is None else unfed.tolist(),
+                    "fed_token_ids": None if fed is None else fed.tolist(),
+                }
+            ),
+            encoding="utf-8",
+        )
 
     def load_cache_memory_from(self, cache_dir: str, index: int = 0) -> None:
         del index
         self.reset()
         self.base_layer.load_cache_memory_from(str(Path(cache_dir) / "base"))
         self.draft_layer.load_cache_memory_from(str(Path(cache_dir) / "draft"))
+        unfed_path = Path(cache_dir) / self._UNFED_TOKENS_FILE
+        self.fed_token_ids = None  # unknown unless the snapshot recorded them
+        if unfed_path.exists():
+            state = json.loads(unfed_path.read_text(encoding="utf-8"))
+            if state.get("unfed_tokens") is not None:
+                self.unfed_tokens = torch.tensor(state["unfed_tokens"], dtype=torch.long)
+            if state.get("fed_token_ids") is not None:
+                self.fed_token_ids = torch.tensor(state["fed_token_ids"], dtype=torch.long)
 
     def copy(self) -> "MobilintEagle3Cache":
-        """Return a copy preserving committed KV cache state only.
+        """Return a snapshot of the committed KV state and the tokens still to be fed.
 
         Speculative tree metadata is intentionally not copied because it is
         per-generation-call transient state and should be reconstructed by
-        ``initialize_tree``.
+        ``initialize_tree``. Resident layers save their KV first.
         """
         copied = MobilintEagle3Cache(self.base_mxq_model, self.draft_mxq_model)
         copied.base_layer = self.base_layer.copy()
         copied.draft_layer = self.draft_layer.copy()
         copied.layers = [copied.base_layer]
         copied.clear_tree_state()
+        unfed = getattr(self, "unfed_tokens", None)
+        copied.unfed_tokens = None if unfed is None else unfed.clone()
+        snapshot = getattr(self, "_snapshot_unfed_tokens", None)
+        copied._snapshot_unfed_tokens = None if snapshot is None else snapshot.clone()
+        fed = getattr(self, "fed_token_ids", None)
+        copied.fed_token_ids = None if fed is None else fed.clone()
+        fed_snapshot = getattr(self, "_snapshot_fed_token_ids", None)
+        copied._snapshot_fed_token_ids = None if fed_snapshot is None else fed_snapshot.clone()
         return copied
 
 

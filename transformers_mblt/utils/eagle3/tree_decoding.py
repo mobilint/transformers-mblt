@@ -15,7 +15,13 @@ from transformers.generation.logits_process import (
 )
 from transformers.utils import logging
 
-from ..cache_utils import MobilintEagle3Cache
+from ..cache_utils import (
+    MobilintEagle3Cache,
+    defer_eagle3_accept_tokens,
+    eagle3_fed_tokens,
+    note_eagle3_fed_tokens,
+    take_eagle3_unfed_tokens,
+)
 
 logger = logging.get_logger(__name__)
 
@@ -151,6 +157,7 @@ def _commit_accept_tokens_to_base(cache: MobilintEagle3Cache) -> None:
     accepted_prefix_length = int(cache.accept_tokens.shape[1])
     if accepted_prefix_length > 0:
         cache.update_base_seen_tokens(accepted_prefix_length)
+        note_eagle3_fed_tokens(cache, cache.accept_tokens)
     cache.accept_tokens = None
 
 
@@ -375,9 +382,30 @@ def initialize_tree(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Prefill base model once and initialize the first draft tree."""
     base_seq_length = cache.get_base_seq_length()
-    # Support both HF-style delta-only inputs and full-sequence inputs when cache is reused.
-    if input_ids.shape[1] > base_seq_length:
+    unfed = take_eagle3_unfed_tokens(cache)
+    if unfed is not None:
+        unfed = unfed.to(input_ids.device)
+    # A reused cache accepts the full sequence (HF style) or only the new tokens. The input is the full sequence
+    # when it starts with exactly the ids the base already holds; when the cache does not know them (fed as
+    # embeddings, restored from an older snapshot) only the length can tell.
+    known_ids = eagle3_fed_tokens(cache)
+    if known_ids is not None:
+        full_sequence = input_ids.shape[1] > base_seq_length and torch.equal(
+            input_ids[:, :base_seq_length], known_ids.to(input_ids.device)
+        )
+    elif unfed is not None:
+        fed_end = base_seq_length + unfed.shape[1]
+        full_sequence = input_ids.shape[1] >= fed_end and torch.equal(input_ids[:, base_seq_length:fed_end], unfed)
+    else:
+        full_sequence = input_ids.shape[1] > base_seq_length
+    if full_sequence:
+        # The full sequence carries the tokens a previous call returned without feeding (or the caller's edit
+        # of them), so it is fed as given.
         prompt_delta_input_ids = input_ids[:, base_seq_length:]
+    elif unfed is not None:
+        # A delta-only input does not repeat the tokens the previous call returned without feeding them.
+        input_ids = torch.cat((unfed, input_ids), dim=1)
+        prompt_delta_input_ids = input_ids
     else:
         prompt_delta_input_ids = input_ids
     if prompt_delta_input_ids.shape[1] == 0:
@@ -386,14 +414,20 @@ def initialize_tree(
             "When reusing `past_key_values`, provide at least one new input token."
         )
 
-    outputs, logits = model.eagle3_base_model(
-        prompt_delta_input_ids,
-        cache=cache,
-        output_orig=True,
-        requires_all_features_logits=False,
-        count_npu_time=count_npu_time,
-    )
+    try:
+        outputs, logits = model.eagle3_base_model(
+            prompt_delta_input_ids,
+            cache=cache,
+            output_orig=True,
+            requires_all_features_logits=False,
+            count_npu_time=count_npu_time,
+        )
+    except BaseException:
+        if unfed is not None:
+            cache.unfed_tokens = unfed  # not fed: keep them for a retry
+        raise
     cache.update_base_seen_tokens(prompt_delta_input_ids.shape[1])
+    note_eagle3_fed_tokens(cache, prompt_delta_input_ids)
 
     if logits_processor is not None:
         token = _sample_next_token_from_processor(logits, logits_processor)
@@ -402,6 +436,9 @@ def initialize_tree(
 
     input_ids = torch.cat((input_ids, token.to(input_ids.device)), dim=1)
     hidden_states = outputs["hidden_states"][0].contiguous()
+    # The draft reads token t+1 with the base hidden state of token t: the fed tokens shifted by one, then the
+    # sampled token. Passing it explicitly keeps it right when unfed tokens were prepended to a delta-only input.
+    draft_input_ids = torch.cat((prompt_delta_input_ids[:, 1:], token.to(prompt_delta_input_ids.device)), dim=1)
     draft_tokens, retrieve_indices, tree_mask, tree_position_ids = model.eagle3_draft_model.topk_generate(
         hidden_states,
         input_ids=input_ids,
@@ -409,6 +446,7 @@ def initialize_tree(
         logits_processor=logits_processor,
         max_draft_tokens=None if remaining_tokens is None else max(1, remaining_tokens - 1),
         count_npu_time=count_npu_time,
+        input_ids_delta=draft_input_ids,
     )
     cache.pending_draft_tokens = draft_tokens
     cache.retrieve_indices = retrieve_indices
@@ -438,7 +476,11 @@ def tree_decoding(
     else:
         accepted_prefix_length = 0
 
-    position_ids = tree_position_ids + input_ids.shape[1] - accepted_prefix_length
+    # The first fed token (the pending accepted tokens, else the tree root) sits right after the cached base prefix.
+    # ``input_ids.shape[1] - accepted_prefix_length`` equals that only when ``input_ids`` is the whole conversation; a
+    # delta-only input would place the tree at the wrong RoPE positions.
+    del input_ids
+    position_ids = tree_position_ids + cache.get_base_seq_length()
     if position_ids.dim() == 1:
         position_ids = position_ids.unsqueeze(0)
 
@@ -628,7 +670,10 @@ def update_inference_inputs(
     cache.accept_tokens = accepted
     new_token_count += int(accepted.shape[1])
     if should_stop or (remaining_tokens is not None and int(accepted.shape[1]) >= remaining_tokens):
-        _commit_accept_tokens_to_base(cache)
+        # Generation ends without another forward, so the accepted tokens were never fed: their KV positions still
+        # hold this step's tree nodes. Keep them as unfed instead of counting them as cached; the next call feeds
+        # them first.
+        defer_eagle3_accept_tokens(cache)
         return (
             input_ids,
             torch.empty(0, dtype=torch.long, device=input_ids.device),
@@ -656,6 +701,9 @@ def update_inference_inputs(
     else:
         token = torch.argmax(sample_p, dim=-1, keepdim=True)[None]
 
+    # The draft reads token t+1 with the base hidden state of token t: the accepted tokens shifted by one, then the
+    # sampled token. Passing it explicitly keeps it right when ``input_ids`` is a delta-only input.
+    draft_input_ids = torch.cat((accepted[:, 1:], token.to(accepted.device)), dim=1)
     draft_tokens, retrieve_indices, tree_mask, tree_position_ids = model.eagle3_draft_model.topk_generate(
         accepted_hidden_state,
         input_ids=torch.cat((input_ids, token.to(input_ids.device)), dim=1),
@@ -663,6 +711,7 @@ def update_inference_inputs(
         logits_processor=logits_processor,
         max_draft_tokens=None if remaining_tokens is None else max(1, remaining_tokens - int(accepted.shape[1]) - 1),
         count_npu_time=count_npu_time,
+        input_ids_delta=draft_input_ids,
     )
     cache.pending_draft_tokens = draft_tokens
     cache.retrieve_indices = retrieve_indices
