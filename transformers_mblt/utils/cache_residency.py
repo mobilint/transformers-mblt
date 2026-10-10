@@ -45,14 +45,28 @@ _MODEL_RESIDENCY: "weakref.WeakKeyDictionary[Any, weakref.ref[MobilintKVResidenc
 _PENDING_OWNERS: dict[tuple[int, int], tuple[Any, Any]] = {}
 
 
+def _is_disposed(mxq_model: Any) -> bool:
+    """Whether a qbruntime ``Model`` was disposed: ``dispose()`` drops its accelerator (``_acc``)."""
+    return hasattr(mxq_model, "_acc") and getattr(mxq_model, "_acc") is None
+
+
 def pending_owner(mxq_model: Any, cache_id: int) -> Optional["MobilintLayer"]:
-    """The layer that loaded its KV into this slot before any owner table knew the Model, if still alive."""
+    """The layer that loaded its KV into this slot before any owner table knew the Model, if still alive.
+
+    A claim on a disposed Model is dropped: that KV memory is gone, so the layer can only be restored from a
+    valid host copy.
+    """
     entry = _PENDING_OWNERS.get((id(mxq_model), int(cache_id)))
     if entry is None:
         return None
     model_ref, layer_ref = entry
     layer = layer_ref()
-    if model_ref() is not mxq_model or layer is None or layer.mxq_model is not mxq_model:
+    if (
+        model_ref() is not mxq_model
+        or layer is None
+        or layer.mxq_model is not mxq_model
+        or _is_disposed(mxq_model)
+    ):
         _PENDING_OWNERS.pop((id(mxq_model), int(cache_id)), None)
         return None
     return layer

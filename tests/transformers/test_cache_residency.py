@@ -665,3 +665,35 @@ def test_cache_restored_before_any_forward_moves_to_another_instance(tmp_path) -
 
     assert _slot(target) == "saved!"
     assert source.mxq_models[0].calls == [("dump", 0)]
+
+
+def _dispose(backend: _Backend) -> None:
+    """Like qbruntime Model.dispose(): the accelerator is dropped and the KV memory is gone."""
+    for mxq in backend.mxq_models:
+        mxq._acc = None
+        mxq.dump_cache_memory = lambda cache_id=0: (_ for _ in ()).throw(AssertionError("dumped a disposed Model"))
+    backend.mxq_models = []
+
+
+def test_restored_cache_on_a_disposed_backend_uses_its_host_snapshot_or_reports_lost_kv(tmp_path) -> None:
+    source, target = _Backend(), _Backend()
+    for mxq in source.mxq_models:
+        mxq._acc = object()  # launched
+    from_file = MobilintCache(source.mxq_models)
+    _restore_from_file(from_file, source, "lost", tmp_path)  # only on the NPU
+    _dispose(source)
+
+    with pytest.raises(MobilintCacheStateError, match="dump_cache_memory"):
+        _run(from_file, target, 0, "!")
+
+    source = _Backend()
+    for mxq in source.mxq_models:
+        mxq._acc = object()
+    from_snapshot = MobilintCache(source.mxq_models)
+    from_snapshot.layers[0].buffer = [b"kept"]
+    from_snapshot.layers[0].buffer_seq_length = 4
+    from_snapshot.load_cache_memory()  # direct load, and the snapshot stays on the host
+    _dispose(source)
+
+    _run(from_snapshot, target, 0, "!")
+    assert _slot(target) == "kept!"
