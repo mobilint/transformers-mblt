@@ -215,9 +215,9 @@ def main() -> int:
     assert d2t.dtype == torch.int64, f"d2t expected int64, got {d2t.dtype}"
     assert t2d.dim() == 1, f"t2d must be rank-1; got shape {tuple(t2d.shape)}"
     assert t2d.dtype == torch.bool, f"t2d expected bool, got {t2d.dtype}"
-    assert (
-        t2d.shape[0] == vocab_size
-    ), f"t2d length {t2d.shape[0]} != target vocab {vocab_size}; t2d must be a per-target-token mask."
+    assert t2d.shape[0] == vocab_size, (
+        f"t2d length {t2d.shape[0]} != target vocab {vocab_size}; t2d must be a per-target-token mask."
+    )
     draft_vocab = int(d2t.shape[0])
     assert draft_vocab <= vocab_size, (
         f"draft vocab (d2t length) {draft_vocab} exceeds target vocab {vocab_size}; "

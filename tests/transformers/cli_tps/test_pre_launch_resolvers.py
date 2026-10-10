@@ -25,6 +25,8 @@ import ast
 import importlib
 from pathlib import Path
 
+import pytest
+
 from transformers_mblt.cli import tps as tps_cli
 from transformers_mblt.cli.main import build_parser
 
@@ -41,6 +43,12 @@ class _StubConfig:
             self.text_config = text_config
         if vision_config is not None:
             self.vision_config = vision_config
+
+
+@pytest.fixture(autouse=True)
+def _no_hub_config(monkeypatch):
+    """Keep config probes off the Hub: the real release ``config.json`` would override the stubbed ``AutoConfig``."""
+    monkeypatch.setattr(tps_cli, "_read_raw_config_payload", lambda *a, **kw: None)
 
 
 def _stub_autoconfig(monkeypatch, config) -> None:
