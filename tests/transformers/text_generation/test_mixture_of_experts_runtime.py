@@ -17,6 +17,7 @@ import torch
 from transformers_mblt._npu import MobilintBackendAllocError
 from transformers_mblt.models.qwen3_moe.configuration_qwen3_moe import MobilintQwen3MoEConfig
 from transformers_mblt.utils import moe_utils
+from transformers_mblt.utils.cache_residency import MobilintCacheStateError
 from transformers_mblt.utils.cache_utils import MobilintMixtureOfExpertsCache
 from transformers_mblt.utils.generation_utils import MobilintMixtureOfExpertsGenerationMixin
 from transformers_mblt.utils.modeling_utils import MobilintMixtureOfExpertsModelMixin
@@ -401,7 +402,7 @@ def test_fake_prefilled_cache_is_never_dumped_or_loaded() -> None:
     assert generator.npu_backend.kv_owner is cache
 
 
-def test_cache_from_another_instance_moves_and_a_different_release_is_replaced() -> None:
+def test_cache_from_another_instance_moves_and_another_release_is_refused() -> None:
     source, target = _Generator(), _Generator()
     cache = source._new_moe_cache()
     source.run(cache, "hello")
@@ -414,9 +415,12 @@ def test_cache_from_another_instance_moves_and_a_different_release_is_replaced()
     assert source.npu_backend.kv_owner is None and target.npu_backend.kv_owner is cache
 
     other_release = _Generator(num_shared=3)
-    model_kwargs = {"past_key_values": cache}
+    with pytest.raises(MobilintCacheStateError):
+        other_release._prepare_cache_for_generation(None, {"past_key_values": cache}, None, 1, 0)
+    empty = source._new_moe_cache()
+    model_kwargs = {"past_key_values": empty}
     other_release._prepare_cache_for_generation(None, model_kwargs, None, 1, 0)
-    assert model_kwargs["past_key_values"] is not cache
+    assert model_kwargs["past_key_values"] is not empty
 
 
 def test_a_failed_forward_keeps_the_cache_on_its_slots(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -651,7 +655,7 @@ def test_ambiguous_scales_need_the_manifest_to_derive_the_order(
     assert orders[0] == ["residual", "expert_in", "gate"]
 
 
-def test_cache_from_a_release_with_the_same_depth_but_another_kv_layout_is_replaced() -> None:
+def test_cache_from_a_release_with_another_kv_layout_is_refused_unless_empty() -> None:
     def with_layout(generator: _Generator, layer_hash: str) -> _Generator:
         for model in generator.get_shared_mxq_models():
             model.get_core_mode = lambda: "single"
@@ -672,6 +676,10 @@ def test_cache_from_a_release_with_the_same_depth_but_another_kv_layout_is_repla
     assert model_kwargs["past_key_values"] is cache
 
     other_release = with_layout(_Generator(), "w4")
-    model_kwargs = {"past_key_values": cache}
+    with pytest.raises(MobilintCacheStateError, match="another KV layout"):
+        other_release._prepare_cache_for_generation(None, {"past_key_values": cache}, None, 1, 0)
+
+    empty = source._new_moe_cache()  # nothing to lose: replaced instead
+    model_kwargs = {"past_key_values": empty}
     other_release._prepare_cache_for_generation(None, model_kwargs, None, 1, 0)
-    assert model_kwargs["past_key_values"] is not cache
+    assert model_kwargs["past_key_values"] is not empty

@@ -564,8 +564,17 @@ class MobilintMixtureOfExpertsGenerationMixin(MobilintGenerationMixin):
         if not isinstance(current, MobilintMixtureOfExpertsCache):
             model_kwargs[cache_name] = self._get_cache("mobilint", batch_size, max_cache_length)
         elif not self._cache_layout_matches(current):
-            # A different release: its KV cannot move onto this model's shared MXQs.
-            logger.warning("Replacing a MobilintMixtureOfExpertsCache built for a release with another KV layout.")
+            # Built for a release with another KV layout: its KV cannot move onto this model's shared MXQs. An empty
+            # cache loses nothing and is replaced; replacing a filled one would silently drop the prefix a
+            # continuation relies on, so that is an error.
+            if current.get_seq_length() > 0:
+                from .cache_residency import MobilintCacheStateError
+
+                raise MobilintCacheStateError(
+                    "This MobilintMixtureOfExpertsCache holds KV from a release with another KV layout (or one whose "
+                    "layout cannot be read) and cannot continue on this model. Pass the full prompt without "
+                    "past_key_values, or a cache built for this model."
+                )
             model_kwargs[cache_name] = self._get_cache("mobilint", batch_size, max_cache_length)
         # Any other cache is used as is: the forward binds it, restoring KV another sequence displaced and moving a
         # cache built on another instance of the same release.
