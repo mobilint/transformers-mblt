@@ -36,6 +36,8 @@
   inferences, and the last-only check reads the token axis (`-2`) of the shared MXQ output.
 - `dispose()` releases every NPU buffer before destroying the accelerators. A loop variable used to keep the last
   layer's buffers alive, which made qbruntime warn `Accelerator destroyed with N NPU-resident NPUData still alive`.
+  The same warning on exit or model unload is gone as well: an `atexit` hook and the backend finalizer release the
+  buffers first when a CLI run or `transformers serve` never calls `dispose()`.
 
 ### Changed
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import importlib.util
 import json
 import os
@@ -174,6 +175,33 @@ def test_launch_detects_output_order_and_disposes_everything(fake_runtime, tmp_p
     assert all(model.disposed for model in fake_runtime.created)
     assert backend.layers == [] and backend.accs == {}
     # Every buffer is released before its accelerator goes away (qbruntime warns otherwise).
+    assert BUFFERS_AT_ACCELERATOR_DESTRUCTION == [0, 0]
+
+
+def test_exit_hook_releases_buffers_when_dispose_is_never_called(
+    fake_runtime, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hooks: list = []
+    monkeypatch.setattr(moe_utils.atexit, "register", hooks.append)
+    monkeypatch.setattr(moe_utils.atexit, "unregister", hooks.remove)
+    backend = _backend(_release_dir(tmp_path))
+    backend.launch()
+    assert len(hooks) == 1 and len(LIVE_BUFFERS) > 0
+
+    hooks[0]()  # what the interpreter runs at exit, before tearing down modules
+    assert len(LIVE_BUFFERS) == 0 and backend.layers == []
+    backend.dispose()
+    assert hooks == []  # dispose() unregisters the hook
+
+
+def test_dropping_an_undisposed_backend_releases_buffers_before_accelerators(
+    fake_runtime, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(moe_utils.atexit, "register", lambda hook: None)
+    backend = _backend(_release_dir(tmp_path))
+    backend.launch()
+    del backend  # what a server does when it unloads the model without dispose()
+    gc.collect()
     assert BUFFERS_AT_ACCELERATOR_DESTRUCTION == [0, 0]
 
 

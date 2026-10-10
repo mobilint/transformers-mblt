@@ -22,6 +22,7 @@ right after ``launch()`` (see :class:`_MxqPackReader`).
 
 from __future__ import annotations
 
+import atexit
 import errno
 import gc
 import json
@@ -33,6 +34,7 @@ import sys
 import tempfile
 import threading
 import uuid
+import weakref
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -479,6 +481,7 @@ class MobilintMixtureOfExpertsNPUBackend:
         self._chunk_buffers: OrderedDict[int, _ChunkBuffers] = OrderedDict()
         # The cache whose sequence currently lives in the shared MXQs' KV state (``None`` after a cache-less forward).
         self.kv_owner: Any = None
+        self._exit_hook: Optional[Callable[[], None]] = None
         self._expert_out_pool: dict[int, list[Any]] = {}
         self._expert_out_pool_scale: dict[int, Any] = {}
         self._expert_corr: dict[tuple[int, int], Any] = {}
@@ -798,6 +801,7 @@ class MobilintMixtureOfExpertsNPUBackend:
                 self.layers.append(self._build_layer(layer_idx, shared[layer_idx], experts[layer_idx]))  # type: ignore[arg-type]
             self._allocate_shared_buffers()
             self._expert_pool = ThreadPoolExecutor(max_workers=self.num_expert_workers)
+            self._register_exit_hook()
         except BaseException as exc:
             self._rollback(loaded)
             self._raise_load_failure(exc, phase="allocate", slot=len(plan), dev=-1, launched=launched[0], total=len(plan))
@@ -843,8 +847,38 @@ class MobilintMixtureOfExpertsNPUBackend:
         self._host_lm_head_out = None
         self.kv_owner = None
 
+    def _register_exit_hook(self) -> None:
+        """Release the NPU buffers at interpreter exit when :meth:`dispose` was never called.
+
+        A CLI or server usually exits without disposing the model. Interpreter teardown then frees objects in an
+        arbitrary order, so an ``Accelerator`` can go before the buffers on it and qbruntime warns about live NPUData.
+        ``atexit`` runs before that teardown. The hook holds the backend weakly, so it never keeps a model alive.
+        """
+        backend_ref = weakref.ref(self)
+
+        def _release_at_exit() -> None:
+            backend = backend_ref()
+            if backend is not None:
+                backend._release_buffers()
+                gc.collect()
+
+        self._exit_hook = _release_at_exit
+        atexit.register(_release_at_exit)
+
+    def __del__(self) -> None:
+        # A server that unloads the model drops the backend without dispose(); the instance dict is then cleared in
+        # an arbitrary order, so release the buffers first and the accelerators last.
+        try:
+            self._release_buffers()
+            self.accs = {}
+        except Exception:  # noqa: BLE001 - finalizers must not raise.
+            pass
+
     def dispose(self) -> None:
         """Release every model and accelerator handle held by this backend. Safe to call multiple times."""
+        if self._exit_hook is not None:
+            atexit.unregister(self._exit_hook)
+            self._exit_hook = None
         # A comprehension keeps no loop variable alive: a ``for layer in self.layers`` loop here would pin the last
         # layer (and its NPU buffers) in this frame until the accelerators below are destroyed.
         models: list[Model] = [model for layer in self.layers for model in (layer.shared, *layer.experts)]
