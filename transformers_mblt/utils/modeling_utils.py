@@ -1906,8 +1906,10 @@ class MobilintMixtureOfExpertsModelMixin(MobilintModelMixin):
         last_only = any(layer.last_only for layer in self.npu_backend.layers)
         past_seen = 0 if past_key_values is None else past_key_values.get_seq_length()
         timing_phase: Literal["prefill", "decode"] = "prefill" if past_seen == 0 else "decode"
-        # Every forward overwrites the shared MXQs' KV state, including one without a cache object.
-        self.npu_backend.kv_owner = past_key_values
+        # Every forward overwrites the shared MXQs' KV state, including one without a cache object. Nobody owns it
+        # while the forward runs; ``past_key_values`` claims it only once every layer has advanced, so a forward that
+        # fails halfway leaves no cache that ``generate()`` would continue on partially overwritten KV.
+        self.npu_backend.kv_owner = None
 
         embeds = inputs_embeds.detach().to(device="cpu", dtype=torch.float32).numpy()
         logits_by_position: dict[int, np.ndarray] = {}
@@ -1937,6 +1939,7 @@ class MobilintMixtureOfExpertsModelMixin(MobilintModelMixin):
 
         if past_key_values is not None:
             past_key_values.update_cache_position(cache_position)
+        self.npu_backend.kv_owner = past_key_values
         npu_seconds = self.npu_backend.npu_clock.pop_seconds()
         if count_npu_time:
             self.npu_time = npu_seconds

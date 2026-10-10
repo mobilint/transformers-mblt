@@ -12,6 +12,7 @@ from typing import Any
 
 import pytest
 import qbruntime
+import torch
 
 from transformers_mblt._npu import MobilintBackendAllocError
 from transformers_mblt.models.qwen3_moe.configuration_qwen3_moe import MobilintQwen3MoEConfig
@@ -120,7 +121,7 @@ class _FakeModelConfig:
 
 
 def _release_dir(tmp_path: Path) -> Path:
-    (tmp_path / "mxq").mkdir()
+    (tmp_path / "mxq").mkdir(parents=True)
     (tmp_path / "mxq/lm_head.mxq").write_bytes(b"lm")
     for layer in range(NUM_LAYERS):
         (tmp_path / f"mxq/block_{layer}_shared.mxq").write_bytes(b"s")
@@ -129,7 +130,7 @@ def _release_dir(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def _backend(release: Path) -> MobilintMixtureOfExpertsNPUBackend:
+def _backend(release: Path, pack_index: str | None = None) -> MobilintMixtureOfExpertsNPUBackend:
     config = MobilintQwen3MoEConfig(
         vocab_size=7,
         hidden_size=HIDDEN,
@@ -157,9 +158,28 @@ def _backend(release: Path) -> MobilintMixtureOfExpertsNPUBackend:
         num_expert_workers=2,
         shared_output_indices=[None] * NUM_LAYERS,
         name_or_path=str(release),
+        mxq_pack_index=pack_index,
     )
     backend.create()
     return backend
+
+
+def _packed_release_dir(tmp_path: Path) -> Path:
+    """Pack the fake per-layer MXQs of :func:`_release_dir` into ``mxq/block_{layer}.mxqpack`` + ``mxq/index.json``."""
+    script = _pack_script()
+    src = _release_dir(tmp_path / "src")
+    release = tmp_path / "release"
+    (release / "mxq").mkdir(parents=True)
+    (release / "mxq/lm_head.mxq").write_bytes(b"lm")
+    sizes = []
+    for layer in range(NUM_LAYERS):
+        paths = [str(src / f"mxq/block_{layer}_shared.mxq")] + [
+            str(src / f"mxq/block_{layer}_expert_{expert}.mxq") for expert in range(NUM_EXPERTS)
+        ]
+        sizes.append(tuple(script.pack_layer(paths, str(release / f"mxq/block_{layer}.mxqpack"), 4096)))
+    index = MobilintMixtureOfExpertsPackIndex(pack="block_{layer}.mxqpack", alignment=4096, sizes=tuple(sizes))
+    (release / "mxq/index.json").write_text(index.to_json())
+    return release
 
 
 # ---- Launch rollback ------------------------------------------------------------------------------------------
@@ -289,14 +309,21 @@ def test_chunk_buffers_keep_only_recent_sizes(fake_runtime, tmp_path: Path) -> N
 class _Generator:
     _require_single_batch = staticmethod(MobilintMixtureOfExpertsGenerationMixin._require_single_batch)
     _prepare_cache_for_generation = MobilintMixtureOfExpertsGenerationMixin._prepare_cache_for_generation
+    _cache_matches_backend = MobilintMixtureOfExpertsGenerationMixin._cache_matches_backend
+    _get_cache = MobilintMixtureOfExpertsGenerationMixin._get_cache
+    _new_moe_cache = MobilintMixtureOfExpertsGenerationMixin._new_moe_cache
 
-    def __init__(self) -> None:
+    def __init__(self, num_shared: int = 1) -> None:
         self.npu_backend = type("Backend", (), {"kv_owner": None})()
+        self.shared = [object() for _ in range(num_shared)]
+
+    def get_shared_mxq_models(self) -> list:
+        return self.shared
 
 
 def test_generate_resets_a_cache_whose_kv_was_overwritten_by_a_cacheless_forward() -> None:
     generator = _Generator()
-    cache = MobilintMixtureOfExpertsCache([object()], owner=generator.npu_backend)
+    cache = MobilintMixtureOfExpertsCache(generator.shared, owner=generator.npu_backend)
     cache.set_seq_length(12)
     generator.npu_backend.kv_owner = cache
 
@@ -310,7 +337,7 @@ def test_generate_resets_a_cache_whose_kv_was_overwritten_by_a_cacheless_forward
 
 def test_restored_kv_is_reused_instead_of_reset() -> None:
     generator = _Generator()
-    cache = MobilintMixtureOfExpertsCache([object()], owner=generator.npu_backend)
+    cache = MobilintMixtureOfExpertsCache(generator.shared, owner=generator.npu_backend)
     generator.npu_backend.kv_owner = object()  # another sequence ran on the NPU
 
     cache.load_cache_memory()  # nothing dumped; restoring still claims the NPU KV
@@ -322,8 +349,8 @@ def test_restored_kv_is_reused_instead_of_reset() -> None:
 
 
 def test_fake_prefilled_cache_is_decoded_on_instead_of_reset() -> None:
-    generator = _Generator()
-    cache = MobilintMixtureOfExpertsCache([object(), object()], owner=generator.npu_backend)
+    generator = _Generator(num_shared=2)
+    cache = MobilintMixtureOfExpertsCache(generator.shared, owner=generator.npu_backend)
     generator.npu_backend.kv_owner = object()  # some earlier sequence
 
     cache.fake_prefill(512)
@@ -373,6 +400,70 @@ def test_npu_clock_counts_overlapping_calls_once(monkeypatch: pytest.MonkeyPatch
 
     assert clock.pop_seconds() == pytest.approx(2.5)
     assert clock.pop_seconds() == 0.0  # popping clears the recorded calls
+
+
+def test_generate_replaces_a_cache_built_for_other_shared_models() -> None:
+    generator = _Generator()
+    foreign = MobilintMixtureOfExpertsCache([object()], owner=generator.npu_backend)  # e.g. an earlier launch
+    foreign.set_seq_length(8)
+    generator.npu_backend.kv_owner = foreign
+    model_kwargs = {"past_key_values": foreign}
+
+    generator._prepare_cache_for_generation(None, model_kwargs, None, 1, 0)
+
+    replacement = model_kwargs["past_key_values"]
+    assert replacement is not foreign and replacement.shared_mxq_models == generator.shared
+    assert replacement.get_seq_length() == 0 and generator.npu_backend.kv_owner is replacement
+
+
+def test_a_failed_forward_leaves_no_kv_owner(monkeypatch: pytest.MonkeyPatch) -> None:
+    from tests.transformers.text_generation.test_mixture_of_experts import _FakeMoEBackend, _harness, _small_config
+
+    config = _small_config()
+    backend = _FakeMoEBackend(
+        config.num_hidden_layers, config.hidden_size, config.num_experts, config.vocab_size, False
+    )
+    model = _harness(config, backend)
+    cache = MobilintMixtureOfExpertsCache([object()] * config.num_hidden_layers, owner=backend)
+    backend.kv_owner = cache
+    original = backend.shared_forward_token
+
+    def fail_on_second_layer(layer_idx, *args):
+        if layer_idx == 1:
+            raise RuntimeError("NPU fault")
+        return original(layer_idx, *args)
+
+    monkeypatch.setattr(backend, "shared_forward_token", fail_on_second_layer)
+    with pytest.raises(RuntimeError, match="NPU fault"):
+        model.moe_forward(torch.zeros((1, 1, config.hidden_size)), cache, torch.arange(1))
+    # Layer 0 already advanced on the NPU, so the cache must not look like the owner of a consistent sequence.
+    assert backend.kv_owner is None
+
+
+def test_failed_packed_load_deletes_materialized_files_held_by_failed_models(
+    fake_runtime, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(moe_utils.MXQ_MATERIALIZE_ENV, "tempfile")
+    monkeypatch.setenv(moe_utils.MXQ_TMPDIR_ENV, str(tmp_path / "tmp"))
+    (tmp_path / "tmp").mkdir()
+    backend = _backend(_packed_release_dir(tmp_path), pack_index="mxq/index.json")
+    real_remove, real_launch = os.remove, FakeModel.launch
+
+    def remove(path):  # Windows: a file still open in an undisposed Model cannot be deleted
+        if any(model.path == path and not model.disposed for model in FakeModel.created):
+            raise PermissionError("in use")
+        real_remove(path)
+
+    def launch(self, acc):
+        if "block_1_expert_2" in self.path:
+            raise OSError("launch failed")
+        real_launch(self, acc)
+
+    monkeypatch.setattr(moe_utils.os, "remove", remove)
+    monkeypatch.setattr(FakeModel, "launch", launch)
+    with pytest.raises(OSError, match="launch failed"):
+        backend.launch()
+    assert list((tmp_path / "tmp").iterdir()) == []
 
 
 # ---- Pack reader fallbacks ------------------------------------------------------------------------------------

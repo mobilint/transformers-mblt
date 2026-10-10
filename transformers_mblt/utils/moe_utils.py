@@ -845,15 +845,21 @@ class MobilintMixtureOfExpertsNPUBackend:
             with ThreadPoolExecutor(max_workers=len(devices)) as executor:
                 for future in as_completed([executor.submit(_load_queue, queue) for queue in queues.values()]):
                     future.result()
+        except BaseException:
+            failures.append(("create", -1, -1, sys.exc_info()[1]))  # e.g. KeyboardInterrupt while waiting
+            raise
         finally:
             if progress is not None:
                 progress.close()
+            if failures:
+                # Dispose the loaded models first: a failed Model may still hold its materialized file open, and the
+                # reader's final deletion retry in close() only succeeds once that handle is gone.
+                self._rollback(loaded)
             if reader is not None:
                 reader.close()
 
         if failures:
             phase, slot_idx, dev, exc = failures[0]
-            self._rollback(loaded)
             self._raise_load_failure(exc, phase=phase, slot=slot_idx, dev=dev, launched=launched[0], total=len(plan))
 
         # Layer setup and buffer allocation can still fail (an unresolvable output order, a buffer BadAlloc); the

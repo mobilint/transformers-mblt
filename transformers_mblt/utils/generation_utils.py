@@ -502,6 +502,13 @@ class MobilintMixtureOfExpertsGenerationMixin(MobilintGenerationMixin):
     def _new_moe_cache(self) -> MobilintMixtureOfExpertsCache:
         return MobilintMixtureOfExpertsCache(cast(Any, self).get_shared_mxq_models(), owner=cast(Any, self).npu_backend)
 
+    def _cache_matches_backend(self, cache: MobilintMixtureOfExpertsCache) -> bool:
+        """Return True when ``cache`` was built for this model's live shared MXQs (not another model or launch)."""
+        shared_models = cast(Any, self).get_shared_mxq_models()
+        return len(cache.shared_mxq_models) == len(shared_models) and all(
+            cached is live for cached, live in zip(cache.shared_mxq_models, shared_models)
+        )
+
     def build_mobilint_cache(self, batch_size: int = 1) -> MobilintMixtureOfExpertsCache:
         """Return a fresh cache for callers that drive generation themselves (the TPS fake-prefill decode sweep)."""
         self._require_single_batch(batch_size)
@@ -513,10 +520,9 @@ class MobilintMixtureOfExpertsGenerationMixin(MobilintGenerationMixin):
     ) -> MobilintMixtureOfExpertsCache:
         self._require_single_batch(batch_size)
         existing_cache = getattr(self, "_cache", None)
-        shared_models = cast(Any, self).get_shared_mxq_models()
-        if not isinstance(existing_cache, MobilintMixtureOfExpertsCache) or any(
-            cached is not live for cached, live in zip(existing_cache.shared_mxq_models, shared_models)
-        ) or len(existing_cache.shared_mxq_models) != len(shared_models):
+        if not isinstance(existing_cache, MobilintMixtureOfExpertsCache) or not self._cache_matches_backend(
+            existing_cache
+        ):
             self._cache = self._new_moe_cache()
         else:
             self._cache.reset()
@@ -537,6 +543,11 @@ class MobilintMixtureOfExpertsGenerationMixin(MobilintGenerationMixin):
         cache_name = "past_key_values"
         current = model_kwargs.get(cache_name)
         if not isinstance(current, MobilintMixtureOfExpertsCache):
+            model_kwargs[cache_name] = self._get_cache("mobilint", batch_size, max_cache_length)
+        elif not self._cache_matches_backend(current):
+            # Built for another model instance or an earlier launch: its layers point at other shared MXQs, so KV
+            # dumps and restores through it would miss this model's KV state.
+            logger.warning("Replacing a MobilintMixtureOfExpertsCache built for different shared MXQs.")
             model_kwargs[cache_name] = self._get_cache("mobilint", batch_size, max_cache_length)
         elif current is not cast(Any, self).npu_backend.kv_owner and current.get_seq_length() > 0:
             # Another cache ran on the NPU since this one was filled; its KV prefix is gone.
