@@ -13,7 +13,12 @@ import torch
 
 from transformers_mblt.models.qwen2_vl.modeling_qwen2_vl import MobilintQwen2VLForConditionalGeneration
 from transformers_mblt.models.qwen3_vl.modeling_qwen3_vl import MobilintQwen3VLForConditionalGeneration
-from transformers_mblt.utils.cache_utils import MobilintCache, MobilintDeepStackCache, MobilintWhisperCache
+from transformers_mblt.utils.cache_utils import (
+    MobilintCache,
+    MobilintDeepStackCache,
+    MobilintWhisperCache,
+    use_cache_rope_deltas,
+)
 
 _PROMPT_DELTAS = {5: -3, 7: -11}  # prompt length -> offset its image layout produces
 
@@ -114,6 +119,17 @@ def test_a_filled_cache_without_an_offset_does_not_borrow_another_one() -> None:
     wrapper.forward(input_ids=_ids(1), past_key_values=restored)
 
     assert wrapper.model.seen == [None]
+
+
+def test_a_later_filled_row_without_an_offset_does_not_borrow_another_one() -> None:
+    wrapper = _wrapper(MobilintQwen2VLForConditionalGeneration)
+    wrapper.model.rope_deltas = torch.tensor([[-11], [-11]])  # left by another conversation
+    restored = MobilintCache(object(), per_model_batch=2)
+    restored.update_seen_tokens({1: 5})  # row 0 empty, row 1 filled with no recorded offset
+
+    use_cache_rope_deltas(wrapper.model, restored)
+
+    assert wrapper.model.rope_deltas is None
 
 
 @pytest.mark.parametrize(

@@ -626,8 +626,16 @@ def use_cache_rope_deltas(holder: Any, cache: Any) -> None:
     if cache is None or not hasattr(cache, "get_seq_length"):
         return
     stored = getattr(cache, "rope_deltas", None)
-    if stored is not None or cache.get_seq_length() > 0:
+    if stored is not None or _cache_holds_tokens(cache):
         holder.rope_deltas = stored
+
+
+def _cache_holds_tokens(cache: Any) -> bool:
+    """Whether any row of ``cache`` holds tokens (``get_seq_length()`` alone reads row 0)."""
+    layers = getattr(cache, "layers", None)
+    if layers:
+        return any(layer.get_seq_length() > 0 for layer in layers)
+    return cache.get_seq_length() > 0
 
 
 def keep_cache_rope_deltas(holder: Any, cache: Any) -> None:
