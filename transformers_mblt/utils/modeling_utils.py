@@ -1326,9 +1326,8 @@ class MobilintModelMixin(PretrainedOnlyMixin, PreTrainedModel):
                 for j, prefill_mask in enumerate(prefill_masks):
                     if prefill_mask is False:
                         if logits is None:
-                            logits = torch.empty(
-                                (batch_size, 1, vocab), dtype=inputs_embeds.dtype, device=inputs_embeds.device
-                            )
+                            # Filled on the host, where the MXQ output is, and moved to the input device once.
+                            logits = torch.empty((batch_size, 1, vocab), dtype=inputs_embeds.dtype)
                         logits[cache_ids[j]] = output_rows[last_row_of[j]]
                         finished.add(cache_ids[j])
 
@@ -1346,7 +1345,7 @@ class MobilintModelMixin(PretrainedOnlyMixin, PreTrainedModel):
                 raise RuntimeError(f"Batched infer produced no last-token logits for rows {missing_ids}.")
             if debug_enabled:
                 logger.debug("[BATCH-LLM][END] output_shape=%s", tuple(logits.shape))
-            return cast(torch.FloatTensor, logits)
+            return cast(torch.FloatTensor, logits.to(inputs_embeds.device))
 
         # ------------------------------------------------------------------
         # Path 2: dynamic-output MXQ. The compiled model already produces
