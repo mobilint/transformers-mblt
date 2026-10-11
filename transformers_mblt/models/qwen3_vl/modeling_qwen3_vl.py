@@ -1005,6 +1005,28 @@ class MobilintQwen3VLRotaryEmbedding(nn.Module):
         return result
 
 
+
+def _row_text_position_ids(
+    cache: Optional[MobilintDeepStackCache], attention_mask: Optional[torch.Tensor], inputs_embeds: torch.Tensor
+) -> Optional[torch.Tensor]:
+    """Text positions ``(batch, seq)`` continuing each row from its own cache length, or ``None`` if they all agree.
+
+    ``cache_position`` follows row 0, which is right only while every row holds the same number of tokens. A batch
+    of requests joined with ``MobilintCache.from_rows`` does not. Padding (where ``attention_mask`` is 0) takes no
+    position. Image tokens need the M-RoPE positions the caller computed: pass ``position_ids`` for those.
+    """
+    batch, length = int(inputs_embeds.shape[0]), int(inputs_embeds.shape[1])
+    if cache is None or batch <= 1 or len(getattr(cache, "layers", ())) < batch:
+        return None
+    starts = [int(cache.get_seq_length(row)) for row in range(batch)]
+    if len(set(starts)) == 1:
+        return None
+    if attention_mask is not None and tuple(attention_mask.shape) == (batch, length):
+        offsets = (attention_mask.to(torch.long).cumsum(dim=-1) - 1).clamp(min=0)
+    else:
+        offsets = torch.arange(length).expand(batch, -1)
+    return torch.tensor(starts).view(batch, 1) + offsets.to("cpu")
+
 class MobilintQwen3VLTextModel(MobilintModelMixin, MobilintGenerationMixin, MobilintQwen3VLPreTrainedModel):
     config: MobilintQwen3VLTextConfig
     input_modalities = ("text",)
@@ -1293,6 +1315,8 @@ class MobilintQwen3VLTextModel(MobilintModelMixin, MobilintGenerationMixin, Mobi
 
         if self._uses_rope_input:
             # the hard coded `3` is for temporal, height and width.
+            if position_ids is None:
+                position_ids = _row_text_position_ids(past_key_values, effective_attention_mask, inputs_embeds)
             if position_ids is None:
                 position_ids = cache_position.view(1, 1, -1).expand(3, inputs_embeds.shape[0], -1)
             elif position_ids.ndim == 2:

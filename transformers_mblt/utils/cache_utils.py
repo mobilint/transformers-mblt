@@ -625,6 +625,49 @@ class MobilintCache(Cache):
         self.batch_size = batch_size
         self.k_per_model = batch_size
 
+    @classmethod
+    def from_rows(cls, caches: Sequence["MobilintCache"]) -> "MobilintCache":
+        """Return a batch cache whose row ``i`` is ``caches[i]``'s only row, shared rather than copied.
+
+        A serving engine keeps one cache per request and runs the requests of a step together: pass the view to a
+        batched forward (with an ``attention_mask``) and every request's cache advances by its own row, each from its
+        own length. The rows keep their slots, so the requests must sit on distinct slots of the same backend.
+
+        ``rope_deltas`` is gathered when every row has one. An offset the forward computes for a prompt stays on the
+        view: run prompts that need one on the request's own cache, or pass ``position_ids``.
+        """
+        caches = list(caches)
+        if not caches:
+            raise ValueError("from_rows needs at least one cache")
+        first = caches[0]
+        if not isinstance(first, cls):
+            raise TypeError(f"{cls.__name__}.from_rows got a {type(first).__name__}")
+        for cache in caches:
+            if type(cache) is not type(first) or isinstance(cache, MobilintBeamCache):
+                raise TypeError(
+                    f"from_rows joins caches of one type that move KV through the owner table; got "
+                    f"{type(first).__name__} and {type(cache).__name__}"
+                )
+            if len(cache.layers) != 1:
+                raise ValueError(f"from_rows joins one-row caches; got a cache with {len(cache.layers)} rows")
+            if (
+                cache.k_per_model != first.k_per_model
+                or len(cache.mxq_models) != len(first.mxq_models)
+                or any(mine is not theirs for mine, theirs in zip(cache.mxq_models, first.mxq_models))
+            ):
+                raise ValueError(
+                    "from_rows joins caches of one backend; move the others first with adopt_backend(backend)"
+                )
+        view = first._empty_like([cache.slot_of(0) for cache in caches])
+        view.layers = [cache.layers[0] for cache in caches]
+        deltas = [cache.rope_deltas for cache in caches]
+        view.rope_deltas = None if any(delta is None for delta in deltas) else torch.cat(deltas, dim=0)
+        return view
+
+    def _empty_like(self, slots: Sequence[Tuple[int, int]]) -> "MobilintCache":
+        """An empty cache of this type on the same backend, with rows on ``slots``."""
+        return MobilintCache(list(self.mxq_models), per_model_batch=self.k_per_model, slots=slots)
+
     def copy(self):
         """Return an independent snapshot; resident rows save their KV first (see :meth:`MobilintLayer.copy`)."""
         copied = MobilintCache(list(self.mxq_models), per_model_batch=self.k_per_model)
@@ -1322,6 +1365,15 @@ class MobilintDeepStackCache(MobilintCache):
             (self.num_deepstack_layers, chunk_len, self.hidden_size),
             dtype=dtype,
             device=device,
+        )
+
+    def _empty_like(self, slots: Sequence[Tuple[int, int]]) -> "MobilintDeepStackCache":
+        return MobilintDeepStackCache(
+            list(self.mxq_models),
+            per_model_batch=self.k_per_model,
+            num_deepstack_layers=self.num_deepstack_layers,
+            hidden_size=self.hidden_size,
+            slots=slots,
         )
 
     def copy(self) -> "MobilintDeepStackCache":

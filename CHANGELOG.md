@@ -2,7 +2,19 @@
 
 ## Unreleased
 
+### Added
+
+- `MobilintCache.from_rows(caches)` joins one-row request caches into a batch cache whose rows are the requests'
+  own rows, shared rather than copied. A serving engine that keeps one cache per request can run a step's requests
+  through the standard batched forward (`attention_mask` plus `past_key_values=MobilintCache.from_rows(...)`); each
+  request continues from its own length on its own slot, and its cache advances with the forward. Subclasses such as
+  `MobilintDeepStackCache` keep their type.
+
 ### Changed
+
+- Qwen3-VL text forward without `position_ids` gives each row text positions from its own cache length when the rows
+  hold different numbers of tokens, instead of row 0's. Padding takes no position. Image tokens still need the
+  caller's M-RoPE `position_ids`.
 
 - A cache that loses its NPU slot is no longer dumped again when its host copy already matches every cached position
   (it was just `copy()`-ed or `dump_cache_memory()`-ed and no infer wrote since). Snapshotting a cache and then
