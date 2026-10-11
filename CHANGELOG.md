@@ -55,6 +55,9 @@
 
 ### Fixed
 
+- Whisper speech recognition through `pipeline()` failed on transformers 5.0-5.2 with `TokenizersBackend has no
+  attribute _decode_asr`: those releases load a model type they do not list with the generic tokenizer, ignoring
+  the Hub's `tokenizer_class`. `mobilint-whisper` now maps to the upstream Whisper tokenizer.
 - Qwen3-VL (and dynamic Qwen2-VL) `generate()` continuing from a filled cache raised `IndexError` in the external
   RoPE: upstream passes `(1, batch, seq)` text positions there, which the text model now expands to the three M-RoPE
   axes.
