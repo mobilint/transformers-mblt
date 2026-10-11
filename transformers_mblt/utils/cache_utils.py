@@ -408,6 +408,8 @@ class MobilintCache(Cache):
         # M-RoPE offset per row (Qwen2-VL, Qwen3-VL, Qwen3-ASR): text position minus cache position after the
         # prompt. It belongs to the sequence in this cache, not to the model, so two conversations can alternate.
         self.rope_deltas: Optional[torch.Tensor] = None
+        # Set on a from_rows batch whose rows mix known M-RoPE offsets with unknown ones.
+        self.rope_deltas_unknown = False
 
     @property
     def batch_size(self) -> int:
@@ -633,9 +635,11 @@ class MobilintCache(Cache):
         batched forward (with an ``attention_mask``) and every request's cache advances by its own row, each from its
         own length. The rows keep their slots, so the requests must sit on distinct slots of the same backend.
 
-        ``rope_deltas`` (the M-RoPE offset a prompt with images leaves) is gathered row by row, 0 for a row without
-        one, as long as any row has one. An offset the forward computes for a prompt stays on the view: run prompts
-        that need one on the request's own cache, or pass ``position_ids``.
+        ``rope_deltas`` (the M-RoPE offset a prompt with images leaves) is gathered row by row when some row has one;
+        an empty row counts as 0. A row that holds tokens without an offset has an unknown one (a cache restored from
+        files saved without it), so a batch mixing it with known offsets keeps none and asks the forward for
+        ``position_ids`` instead of guessing. An offset the forward computes for a prompt stays on the view: run
+        prompts that need one on the request's own cache, or pass ``position_ids``.
         """
         caches = list(caches)
         if not caches:
@@ -664,9 +668,13 @@ class MobilintCache(Cache):
         deltas = [cache.rope_deltas for cache in caches]
         known = next((delta for delta in deltas if delta is not None), None)
         if known is not None:
-            view.rope_deltas = torch.cat(
-                [torch.zeros_like(known[:1]) if delta is None else delta.reshape(1, -1) for delta in deltas], dim=0
-            )
+            if any(delta is None and cache.get_seq_length() > 0 for delta, cache in zip(deltas, caches)):
+                view.rope_deltas_unknown = True
+            else:
+                view.rope_deltas = torch.cat(
+                    [torch.zeros_like(known[:1]) if delta is None else delta.reshape(1, -1) for delta in deltas],
+                    dim=0,
+                )
         return view
 
     def _empty_like(self, slots: Sequence[Tuple[int, int]]) -> "MobilintCache":

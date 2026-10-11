@@ -42,6 +42,7 @@ def test_qwen3_vl_text_positions_continue_each_row_from_its_own_length() -> None
     a.set_seq_length(10)
     b.set_seq_length(4)
     a.rope_deltas = torch.tensor([[-6]])  # a's prompt had an image
+    b.rope_deltas = torch.tensor([[0]])  # b's had none
     batch = MobilintCache.from_rows([a, b])
 
     right_padded = _row_text_position_ids(batch, torch.tensor([[1, 0, 0], [1, 1, 1]]), 2, 3)
@@ -84,6 +85,7 @@ def test_qwen3_vl_model_gives_mixed_length_rows_their_own_positions() -> None:
     a.set_seq_length(10)
     b.set_seq_length(4)
     a.rope_deltas = torch.tensor([[-6]])
+    b.rope_deltas = torch.tensor([[0]])
     wrapper, calls = _qwen3_vl_wrapper()
 
     wrapper(
@@ -110,3 +112,20 @@ def test_qwen3_vl_model_asks_for_positions_when_mixed_rows_carry_images() -> Non
             past_key_values=MobilintCache.from_rows([a, b]),
             image_grid_thw=torch.tensor([[1, 2, 2]]),
         )
+
+
+def test_qwen3_vl_model_asks_for_positions_when_a_row_offset_is_unknown() -> None:
+    backend = _Backend(k=2)
+    a, restored = _request(backend, (0, 0)), _request(backend, (0, 1))
+    a.set_seq_length(10)
+    a.rope_deltas = torch.tensor([[-6]])
+    restored.set_seq_length(10)  # same length, offset lost: guessing 0 or -6 would both be wrong
+    batch = MobilintCache.from_rows([a, restored])
+    wrapper, calls = _qwen3_vl_wrapper()
+
+    with pytest.raises(ValueError, match="offset is unknown"):
+        wrapper(inputs_embeds=torch.zeros(2, 1, 1), past_key_values=batch)
+
+    explicit = torch.tensor([[[4], [7]]] * 3)
+    wrapper(inputs_embeds=torch.zeros(2, 1, 1), past_key_values=batch, position_ids=explicit)
+    assert calls[-1]["position_ids"] is explicit

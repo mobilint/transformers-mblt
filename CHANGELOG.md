@@ -14,7 +14,8 @@
 
 - Qwen3-VL without `position_ids` gives each row of a batch whose rows hold different numbers of tokens its own text
   positions: its cache length plus its `rope_deltas`, with padding taking no position. Upstream gave every row row
-  0's start. Such a batch that carries images or videos raises and asks for the caller's M-RoPE `position_ids`.
+  0's start. Such a batch that carries images or videos, or mixes rows whose offset is unknown (restored from files
+  without `rope_deltas.json`) with rows that have one, raises and asks for the caller's M-RoPE `position_ids`.
 
 - A cache that loses its NPU slot is no longer dumped again when its host copy already matches every cached position
   (it was just `copy()`-ed or `dump_cache_memory()`-ed and no infer wrote since). Snapshotting a cache and then

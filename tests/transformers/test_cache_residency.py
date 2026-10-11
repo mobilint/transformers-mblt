@@ -835,7 +835,21 @@ def test_from_rows_gathers_rope_deltas_row_by_row() -> None:
     assert MobilintCache.from_rows([a, b]).rope_deltas is None
 
     a.rope_deltas = torch.tensor([[-182]])
-    assert MobilintCache.from_rows([a, b]).rope_deltas.tolist() == [[-182], [0]]  # b had no image: offset 0
+    batch = MobilintCache.from_rows([a, b])
+    assert batch.rope_deltas.tolist() == [[-182], [0]]  # b is empty: its prompt will start at 0
+    assert not batch.rope_deltas_unknown
+
+
+def test_from_rows_keeps_an_unknown_offset_unknown() -> None:
+    backend = _Backend(k=2)
+    a, restored = _request(backend, (0, 0)), _request(backend, (0, 1))
+    a.rope_deltas = torch.tensor([[-182]])
+    restored.set_seq_length(5)  # holds tokens, but its files carried no rope_deltas.json
+
+    batch = MobilintCache.from_rows([a, restored])
+
+    assert batch.rope_deltas is None
+    assert batch.rope_deltas_unknown
 
 
 def test_from_rows_keeps_the_deepstack_cache_type() -> None:
