@@ -5,11 +5,15 @@ For each target version this script:
   2. Recreates a fresh venv with `uv venv --python <PY>`.
   3. Installs the project with `-e . --group dev "transformers==<V>"`.
   4. Runs `pytest tests/transformers` in three phases:
-     - Phase A (parallel): every test file except batch and eagle3 suites,
-       split round-robin across N workers. Each worker pins its NPU backend
-       to a distinct core via `--core-mode single --target-cores <cluster>:<core>`
-       (and the encoder / decoder / vision / text variants) so workers do
-       not contend on the same NPU core.
+     - Phase A (parallel): every test file except batch and eagle3 suites.
+       Files that load no model are split round-robin across N workers. Files
+       that load models (`NPU_MEMORY_MB`) run one pytest process each, largest
+       first, and start only while the models already running on that board
+       fit under `NPU_MEMORY_BUDGET_MB`, so the default never overcommits a
+       board. Every process is pinned to one core with `--core-mode single
+       --target-cores <cluster>:<core>` (and the encoder / decoder / vision /
+       text variants); with several /dev/aries* boards the core map spreads
+       processes across boards and adds `--dev-no`.
      - Phase B (serial): batch tests (text-generation and image-text-to-text)
        run alone with all 8 NPU cores. Their conftests already validate
        `--core-mode` == single and pop `target_cores` unless the user provided one.
@@ -25,7 +29,8 @@ release of `transformers` on PyPI within the supported range declared in
 
 Logs land under `logs/tx-matrix/<timestamp>/`:
   - install-<V>.log
-  - pytest-<V>-w<i>.log + junit-<V>-w<i>.xml     (Phase A, one per worker)
+  - pytest-<V>-w<i>.log + junit-<V>-w<i>.xml     (Phase A, host-only shards)
+  - pytest-<V>-npu-<file>.log + junit-...xml      (Phase A, one per model test file)
   - pytest-<V>-batch.log + junit-<V>-batch.xml   (Phase B)
   - pytest-<V>-eagle3.log + junit-<V>-eagle3.xml (Phase C)
   - summary.txt (tab-separated: version, status, counts, elapsed [, note])
@@ -86,12 +91,61 @@ BATCH_DIRS = (
     TESTS_ROOT / "image_text_to_text" / "batch",
 )
 EAGLE3_DIR = TESTS_ROOT / "text_generation" / "eagle3"
-DEFAULT_CORE_MAP = ("0:0", "0:1", "0:2", "0:3", "1:0", "1:1", "1:2", "1:3")
-MAX_WORKERS = len(DEFAULT_CORE_MAP)
+_CORES_PER_DEVICE = ("0:0", "0:1", "0:2", "0:3", "1:0", "1:1", "1:2", "1:3")
+MAX_WORKERS = len(_CORES_PER_DEVICE)
+
+
+def default_core_map() -> tuple[str, ...]:
+    """Spread workers over every Aries board found, else keep them on device 0's eight cores.
+
+    Each worker loads its own models, so eight workers on one board share that board's memory and the larger
+    models (Aya-8B, Qwen-VL) hit BadAlloc. Workers go to boards in turn, on different cores of each board.
+    """
+    devices = sorted(
+        int(path.name.removeprefix("aries"))
+        for path in Path("/dev").glob("aries*")
+        if path.name.removeprefix("aries").isdigit()
+    )
+    if len(devices) <= 1:
+        return _CORES_PER_DEVICE
+    return tuple(f"{devices[i % len(devices)]}:{_CORES_PER_DEVICE[i // len(devices)]}" for i in range(MAX_WORKERS))
+
+
+def split_core_entry(entry: str) -> tuple[str | None, str]:
+    """``[dev:]cluster:core`` -> (dev or None, ``cluster:core``)."""
+    parts = entry.split(":")
+    if len(parts) == 3:
+        return parts[0], f"{parts[1]}:{parts[2]}"
+    return None, entry
+
+
 # Sentinel for the venv reset path; kept out of the signal range (-1..-255) so
 # `status_str` can distinguish a reset failure from a subprocess killed by a
 # signal (`subprocess.Popen.returncode` returns `-signal_number` in that case).
 _RESET_FAIL_SENTINEL = -1000
+# Peak NPU memory of each phase-A test file that loads models, measured alone on an Aries board (MB, rounded up).
+# Phase A packs these per board under NPU_MEMORY_BUDGET_MB; a file missing here is treated as host-only, so add new
+# model tests (peak from `mobilint-cli status` while the file runs alone).
+NPU_MEMORY_MB = {
+    "tests/transformers/image_text_to_text/non_batch/test_aya.py": 5200,
+    "tests/transformers/text_generation/non_batch/test_exaone_deep.py": 4100,
+    "tests/transformers/image_text_to_text/non_batch/test_qwen2_vl.py": 3400,
+    "tests/transformers/image_text_to_text/non_batch/test_qwen3_vl.py": 2900,
+    "tests/transformers/image_text_to_text/non_batch/test_qwen3_vl_multi_image.py": 2900,
+    "tests/transformers/image_text_to_text/non_batch/test_qwen3_vl_video.py": 2900,
+    "tests/transformers/text_generation/non_batch/test_exaone.py": 2900,
+    "tests/transformers/text_generation/non_batch/test_exaone4.py": 2300,
+    "tests/transformers/text_generation/test_cache.py": 2000,
+    "tests/transformers/text_generation/non_batch/test_clova.py": 2000,
+    "tests/transformers/text_generation/non_batch/test_llama.py": 1900,
+    "tests/transformers/text_generation/non_batch/test_qwen3.py": 1900,
+    "tests/transformers/text_generation/non_batch/test_qwen2.py": 800,
+    "tests/transformers/image_to_text/test_blip.py": 600,
+    "tests/transformers/automatic_speech_recognition/test_whisper.py": 600,
+    "tests/transformers/fill_mask/test_bert.py": 200,
+}
+# An Aries board has 16 GiB; leave room for runtime allocations outside the model weights.
+NPU_MEMORY_BUDGET_MB = 14 * 1024
 _BAD_ALLOC_RE = re.compile(r"BadAlloc|out of memory", re.IGNORECASE)
 _COUNT_LETTER_ORDER = ("p", "F", "E", "s", "d", "xF", "xP", "w")
 _COUNT_TOKEN_RE = re.compile(r"^(\d+)(p|F|E|s|d|xF|xP|w)$")
@@ -235,54 +289,107 @@ def spawn_pytest_process(cmd: list[str], log_path: Path) -> tuple[subprocess.Pop
     return proc, fh
 
 
+def worker_flags(entry: str) -> list[str]:
+    """Pin a pytest process to one ``[dev:]cluster:core`` for every backend prefix the conftest knows."""
+    dev, core = split_core_entry(entry)
+    flags = ["--core-mode=single"]
+    for prefix in ("", "vision-", "text-", "encoder-", "decoder-"):
+        flags.append(f"--{prefix}target-cores={core}")
+        if dev is not None:
+            flags.append(f"--{prefix}dev-no={dev}")
+    return flags
+
+
+def _wait_one(running: dict[subprocess.Popen, tuple]) -> tuple[subprocess.Popen, tuple]:
+    """Block until one of ``running`` exits; return it with its bookkeeping and close its log."""
+    while True:
+        for proc, info in running.items():
+            if proc.poll() is not None:
+                del running[proc]
+                try:
+                    info[-1].close()
+                except Exception:
+                    pass
+                return proc, info
+        time.sleep(0.2)
+
+
 def run_phase_parallel(
     version: str,
     log_dir: Path,
     extra_args: list[str],
     workers: int,
     core_map: tuple[str, ...],
-) -> dict[int, int]:
-    """Launch `workers` pytest processes on non-batch tests, one per core in core_map."""
+) -> dict[str, int]:
+    """Run phase A: host-only test files in `workers` round-robin shards, NPU test files packed by memory.
+
+    Each file in ``NPU_MEMORY_MB`` runs in its own pytest process on a free core, and only once the models already
+    running on that board leave room for it under ``NPU_MEMORY_BUDGET_MB``, largest first. Every other file loads
+    no model and goes to the shards. Runner-owned flags come after `extra_args` so a forwarded `-- --core-mode ...`
+    or `-- --target-cores ...` cannot silently reroute a process off its assigned core.
+    """
     files = collect_phase_a_test_files()
     if not files:
         return {}
-    buckets = partition_round_robin(files, workers)
+    npu_files = sorted((f for f in files if f.as_posix() in NPU_MEMORY_MB), key=lambda f: -NPU_MEMORY_MB[f.as_posix()])
+    host_files = [f for f in files if f.as_posix() not in NPU_MEMORY_MB]
+    slots = list(core_map[:workers])
 
-    procs: list[tuple[int, subprocess.Popen, object]] = []
-    for i, bucket in enumerate(buckets):
-        if not bucket:
-            continue
-        core = core_map[i]
-        log_path = log_dir / f"pytest-{version}-w{i}.log"
-        junit_path = log_dir / f"junit-{version}-w{i}.xml"
-        # Runner-owned flags come after `extra_args` so a forwarded `-- --core-mode ...`
-        # or `-- --target-cores ...` cannot silently reroute a worker off its assigned core.
+    def launch(name: str, paths: list[Path], slot: str) -> tuple[subprocess.Popen, object]:
         cmd = [
             str(venv_python()),
             "-m",
             "pytest",
-            *(str(f) for f in bucket),
+            *(str(f) for f in paths),
             *extra_args,
-            "--core-mode=single",
-            f"--target-cores={core}",
-            f"--vision-target-cores={core}",
-            f"--text-target-cores={core}",
-            f"--encoder-target-cores={core}",
-            f"--decoder-target-cores={core}",
-            f"--junit-xml={junit_path}",
+            *worker_flags(slot),
+            f"--junit-xml={log_dir / f'junit-{version}-{name}.xml'}",
         ]
-        proc, fh = spawn_pytest_process(cmd, log_path)
-        procs.append((i, proc, fh))
+        return spawn_pytest_process(cmd, log_dir / f"pytest-{version}-{name}.log")
 
-    rcs: dict[int, int] = {}
-    for i, proc, fh in procs:
+    rcs: dict[str, int] = {}
+    host_procs = []
+    for i, bucket in enumerate(partition_round_robin(host_files, workers)):
+        if bucket:
+            proc, fh = launch(f"w{i}", bucket, slots[i])
+            host_procs.append((f"w{i}", proc, fh))
+
+    board_of = {slot: split_core_entry(slot)[0] for slot in slots}
+    used_mb: dict[str | None, int] = {}
+    free_slots = list(slots)
+    pending = list(npu_files)
+    running: dict[subprocess.Popen, tuple] = {}
+    while pending or running:
+        started = False
+        for f in list(pending):
+            need = NPU_MEMORY_MB[f.as_posix()]
+            for slot in free_slots:
+                board = board_of[slot]
+                # A file larger than the budget still runs, alone on its board.
+                if used_mb.get(board, 0) + need <= NPU_MEMORY_BUDGET_MB or used_mb.get(board, 0) == 0:
+                    name = f"npu-{f.stem}"
+                    proc, fh = launch(name, [f], slot)
+                    running[proc] = (name, slot, need, fh)
+                    free_slots.remove(slot)
+                    used_mb[board] = used_mb.get(board, 0) + need
+                    pending.remove(f)
+                    started = True
+                    break
+        if running and not started:
+            proc, (name, slot, need, _) = _wait_one(running)
+            free_slots.append(slot)
+            used_mb[board_of[slot]] -= need
+            rcs[name] = proc.returncode
+            print(f"  [phase A {name}] rc={proc.returncode}", flush=True)
+
+    for name, proc, fh in host_procs:
         rc = proc.wait()
         try:
             fh.close()
         except Exception:
             pass
-        rcs[i] = rc
-        print(f"  [phase A worker {i}] rc={rc}", flush=True)
+        rcs[name] = rc
+        print(f"  [phase A {name}] rc={rc}", flush=True)
     return rcs
 
 
@@ -414,7 +521,7 @@ def _log_group_for_version(name: str) -> str | None:
     if not name.startswith("pytest-") or not name.endswith(".log"):
         return None
     stem = name[len("pytest-") : -len(".log")]
-    m = re.match(r"^(?P<v>.+?)(?:-(?:w\d+|batch|eagle3))?$", stem)
+    m = re.match(r"^(?P<v>.+?)(?:-(?:w\d+|npu-.+|batch|eagle3))?$", stem)
     if not m:
         return None
     return m.group("v")
@@ -506,8 +613,11 @@ def main() -> int:
     )
     ap.add_argument(
         "--core-map",
-        default=",".join(DEFAULT_CORE_MAP),
-        help=(f"Comma-separated cluster:core assignments for phase A workers (default: {','.join(DEFAULT_CORE_MAP)})."),
+        default=None,
+        help=(
+            "Comma-separated [dev:]cluster:core assignments for phase A workers (default: spread over every "
+            f"/dev/aries* board, or {','.join(_CORES_PER_DEVICE)} on device 0 when there is one)."
+        ),
     )
     ap.add_argument(
         "pytest_args",
@@ -552,9 +662,12 @@ def main() -> int:
     if extra and extra[0] == "--":
         extra = extra[1:]
 
-    core_map = tuple(item.strip() for item in args.core_map.split(",") if item.strip())
+    if args.core_map is None:
+        core_map = default_core_map()
+    else:
+        core_map = tuple(item.strip() for item in args.core_map.split(",") if item.strip())
     if not core_map:
-        print("ERROR: --core-map must list at least one cluster:core.", file=sys.stderr)
+        print("ERROR: --core-map must list at least one [dev:]cluster:core.", file=sys.stderr)
         return 2
 
     workers = 1 if args.no_parallel else args.workers
