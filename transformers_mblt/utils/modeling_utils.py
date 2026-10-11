@@ -1124,7 +1124,11 @@ class MobilintModelMixin(PretrainedOnlyMixin, PreTrainedModel):
         # ------------------------------------------------------------------
         if is_default_keep:
             num_of_chunks = math.ceil(max_sequence_length / npu_prefill_chunk_size)
-            logits_dict: dict[int, torch.Tensor] = {}
+            # Each row's last-token logits are copied here once, as its final chunk finishes. Converting the whole
+            # MXQ output, cloning each row and stacking them allocated and copied the full logits three more times,
+            # which cost a 16-row decode step about 4 ms.
+            logits: Optional[torch.Tensor] = None
+            finished: set[int] = set()
 
             for i in range(num_of_chunks):
                 start_index = i * npu_prefill_chunk_size
@@ -1195,11 +1199,10 @@ class MobilintModelMixin(PretrainedOnlyMixin, PreTrainedModel):
                     # Layout A (per-item last row) — includes the
                     # active == total_tokens decode case where both
                     # layouts coincide.
+                    # A view of the MXQ output; the rows it finishes are copied into ``logits`` below.
                     logits_chunks = cast(
                         torch.FloatTensor,
-                        torch.tensor(
-                            raw_arr, dtype=inputs_embeds.dtype, device=inputs_embeds.device
-                        ).reshape([active, 1, vocab]),
+                        torch.from_numpy(np.ascontiguousarray(raw_arr)).reshape([active, 1, vocab]),
                     )
                 elif n_rows == total_tokens:
                     # Layout B (per-token flat): pick each item's last
@@ -1212,12 +1215,7 @@ class MobilintModelMixin(PretrainedOnlyMixin, PreTrainedModel):
                     for k, len_k in enumerate(sequence_lengths_chunks):
                         last_rows[k] = flat[offset + len_k - 1]
                         offset += len_k
-                    logits_chunks = cast(
-                        torch.FloatTensor,
-                        torch.tensor(
-                            last_rows, dtype=inputs_embeds.dtype, device=inputs_embeds.device
-                        ).reshape([active, 1, vocab]),
-                    )
+                    logits_chunks = cast(torch.FloatTensor, torch.from_numpy(last_rows).reshape([active, 1, vocab]))
                 else:
                     hint = ""
                     if n_rows == 1 and active > 1:
@@ -1334,25 +1332,28 @@ class MobilintModelMixin(PretrainedOnlyMixin, PreTrainedModel):
 
                 for j, prefill_mask in enumerate(prefill_masks):
                     if prefill_mask is False:
-                        cache_id = cache_ids[j]
-                        logits_dict[cache_id] = logits_chunks[j, :, :].clone()
+                        if logits is None:
+                            logits = torch.empty(
+                                (batch_size, 1, vocab), dtype=inputs_embeds.dtype, device=inputs_embeds.device
+                            )
+                        logits[cache_ids[j]] = logits_chunks[j, :, :]
+                        finished.add(cache_ids[j])
 
                 if past_key_values is not None:
                     past_key_values.update_seen_tokens(seen_tokens)
 
+            missing_ids = [cache_id for cache_id in range(batch_size) if cache_id not in finished]
             if debug_enabled:
-                missing_ids = [cache_id for cache_id in range(batch_size) if cache_id not in logits_dict]
                 logger.debug(
-                    "[BATCH-LLM][END] logits_dict_keys=%s missing_ids=%s",
-                    sorted(list(logits_dict.keys())),
+                    "[BATCH-LLM][END] finished_ids=%s missing_ids=%s",
+                    sorted(finished),
                     missing_ids,
                 )
-
-            logits_list = [logits_dict[cache_id] for cache_id in range(batch_size)]
-            stacked = cast(torch.FloatTensor, torch.stack(logits_list, dim=0))
+            if logits is None or missing_ids:
+                raise RuntimeError(f"Batched infer produced no last-token logits for rows {missing_ids}.")
             if debug_enabled:
-                logger.debug("[BATCH-LLM][END] output_shape=%s", tuple(stacked.shape))
-            return stacked
+                logger.debug("[BATCH-LLM][END] output_shape=%s", tuple(logits.shape))
+            return cast(torch.FloatTensor, logits)
 
         # ------------------------------------------------------------------
         # Path 2: dynamic-output MXQ. The compiled model already produces
