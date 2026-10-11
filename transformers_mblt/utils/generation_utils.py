@@ -420,6 +420,21 @@ def with_mobilint_generation_signature(wrapped: Callable, *extra_keyword_names: 
     return decorator
 
 
+@lru_cache(maxsize=None)
+def _cached_signature(function: Callable[..., Any]) -> inspect.Signature:
+    return inspect.signature(function)
+
+
+def _bound_argument(function: Callable[..., Any], name: str, args: tuple, kwargs: Mapping[str, Any]) -> Any:
+    """Return argument ``name`` of a call to ``function``, whether it was passed by keyword or by position."""
+    if name in kwargs:
+        return kwargs[name]
+    try:
+        return _cached_signature(function).bind_partial(*args, **kwargs).arguments.get(name)
+    except TypeError:
+        return None
+
+
 class MobilintCacheRopeDeltasMixin:
     """Keep upstream Qwen-VL ``rope_deltas`` with the cache passed to ``generate()``, not on ``self.model``.
 
@@ -441,6 +456,18 @@ class MobilintCacheRopeDeltasMixin:
         # through the shared model attribute another request may change in between.
         self._pending_rope_deltas().value = prompt_rope_deltas if cache is None else None
         return position_ids
+
+    def prepare_inputs_for_generation(self, *args, **kwargs):
+        # Before transformers 5.2, each step's positions are built here from ``self.model.rope_deltas``.
+        cache = _bound_argument(type(self).prepare_inputs_for_generation, "past_key_values", (self, *args), kwargs)
+        if cache is None:  # no offset to load, and none to keep
+            return super().prepare_inputs_for_generation(*args, **kwargs)  # type: ignore[misc]
+        with cache_rope_deltas(self.model, cache) as keep:
+            used = self.model.rope_deltas
+            model_inputs = super().prepare_inputs_for_generation(*args, **kwargs)  # type: ignore[misc]
+            if self.model.rope_deltas is not used:  # a prompt step computed its offset
+                keep(cache)
+        return model_inputs
 
     def _prepare_cache_for_generation(self, generation_config, model_kwargs, *args, **kwargs):
         result = super()._prepare_cache_for_generation(generation_config, model_kwargs, *args, **kwargs)  # type: ignore[misc]

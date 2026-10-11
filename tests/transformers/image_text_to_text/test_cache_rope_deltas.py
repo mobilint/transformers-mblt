@@ -10,14 +10,29 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from transformers import GenerationMixin
 
+from tests.transformers.image_text_to_text.qwen3_vl_compat import transformers_supports_qwen3_vl
 from transformers_mblt.models.qwen2_vl.modeling_qwen2_vl import MobilintQwen2VLForConditionalGeneration
-from transformers_mblt.models.qwen3_vl.modeling_qwen3_vl import MobilintQwen3VLForConditionalGeneration
 from transformers_mblt.utils.cache_utils import (
     MobilintCache,
     MobilintDeepStackCache,
     MobilintWhisperCache,
     use_cache_rope_deltas,
+)
+
+if transformers_supports_qwen3_vl():
+    from transformers_mblt.models.qwen3_vl.modeling_qwen3_vl import MobilintQwen3VLForConditionalGeneration
+
+    _QWEN3_VL = pytest.param(MobilintQwen3VLForConditionalGeneration, id="qwen3_vl")
+else:
+    _QWEN3_VL = pytest.param(None, id="qwen3_vl", marks=pytest.mark.skip(reason="transformers lacks Qwen3-VL"))
+_VL_CLASSES = [pytest.param(MobilintQwen2VLForConditionalGeneration, id="qwen2_vl"), _QWEN3_VL]
+
+# transformers 5.2 moved the generation positions out of prepare_inputs_for_generation into this hook.
+needs_position_ids_hook = pytest.mark.skipif(
+    not hasattr(GenerationMixin, "_prepare_position_ids_for_generation"),
+    reason="transformers builds generation positions in prepare_inputs_for_generation",
 )
 
 _PROMPT_DELTAS = {5: -3, 7: -11}  # prompt length -> offset its image layout produces
@@ -66,7 +81,7 @@ def _ids(length: int) -> torch.Tensor:
     return torch.arange(length).unsqueeze(0)
 
 
-@pytest.mark.parametrize("cls", [MobilintQwen2VLForConditionalGeneration, MobilintQwen3VLForConditionalGeneration])
+@pytest.mark.parametrize("cls", _VL_CLASSES)
 def test_forward_resumes_a_cache_with_its_own_offset(cls) -> None:
     wrapper = _wrapper(cls)
     a, b = MobilintCache(object()), MobilintCache(object())
@@ -80,7 +95,8 @@ def test_forward_resumes_a_cache_with_its_own_offset(cls) -> None:
     assert a.rope_deltas.tolist() == [[-3]] and b.rope_deltas.tolist() == [[-11]]
 
 
-@pytest.mark.parametrize("cls", [MobilintQwen2VLForConditionalGeneration, MobilintQwen3VLForConditionalGeneration])
+@needs_position_ids_hook
+@pytest.mark.parametrize("cls", _VL_CLASSES)
 def test_generate_continues_a_cache_with_its_own_offset(cls) -> None:
     wrapper = _wrapper(cls)
     multimodal = {"mm_token_type_ids": torch.zeros(1, 1), "image_grid_thw": torch.ones(1, 3)}
@@ -94,11 +110,54 @@ def test_generate_continues_a_cache_with_its_own_offset(cls) -> None:
     # Second turn on a: the full conversation is passed again, the cache already holds the first 5 tokens.
     position_ids = wrapper._prepare_position_ids_for_generation(_ids(6), {"past_key_values": a})
 
-    text_positions = torch.arange(6 + 5)  # upstream counts the cache length on top
-    assert position_ids[0, 0].tolist() == (text_positions - 3).tolist()  # a's offset, not b's -11
+    # Text positions before the offset. Releases differ in whether they cover the cached prefix and in whether the
+    # continuation is (batch, seq) or (1, batch, seq), so compare the first row of each.
+    text_positions = GenerationMixin._prepare_position_ids_for_generation(wrapper, _ids(6), {"past_key_values": a})
+    first_row = position_ids.reshape(-1, position_ids.shape[-1])[0]
+    assert first_row.tolist() == (text_positions[0] - 3).tolist()  # a's offset, not b's -11
     assert a.rope_deltas.tolist() == [[-3]] and b.rope_deltas.tolist() == [[-11]]
 
 
+@pytest.mark.parametrize("cache_by", ["keyword", "position"])
+def test_steps_built_in_prepare_inputs_use_their_cache_offset(monkeypatch, cache_by) -> None:
+    """transformers < 5.2: each decode step adds ``self.model.rope_deltas`` in ``prepare_inputs_for_generation``."""
+    import inspect
+
+    from transformers_mblt.utils.generation_utils import MobilintGenerationMixin
+
+    def upstream_prepare(self, input_ids, *args, cache_position=None, **kwargs):
+        del args, kwargs
+        if cache_position[0] == 0 or self.model.rope_deltas is None:
+            _, self.model.rope_deltas = self.model.get_rope_index(input_ids)
+            return {"delta": None}
+        return {"delta": int(self.model.rope_deltas)}
+
+    monkeypatch.setattr(MobilintGenerationMixin, "prepare_inputs_for_generation", upstream_prepare)
+    wrapper = _wrapper(MobilintQwen2VLForConditionalGeneration)
+    a, b = MobilintCache(object()), MobilintCache(object())
+
+    def step(cache, length):
+        start = cache.get_seq_length()
+        cache_position = torch.arange(start, start + length)
+        if cache_by == "keyword":
+            inputs = wrapper.prepare_inputs_for_generation(
+                _ids(length), past_key_values=cache, cache_position=cache_position
+            )
+        else:  # the upstream signature of the installed release decides where the cache goes
+            parameters = list(inspect.signature(wrapper.prepare_inputs_for_generation).parameters)
+            before = [None] * (parameters.index("past_key_values") - 1)
+            inputs = wrapper.prepare_inputs_for_generation(_ids(length), *before, cache, cache_position=cache_position)
+        cache.update_seen_tokens(start + length)
+        return inputs["delta"]
+
+    step(a, 5)
+    step(b, 7)
+    assert step(a, 1) == -3  # upstream alone would add b's -11
+    assert step(b, 1) == -11
+    assert a.rope_deltas.tolist() == [[-3]] and b.rope_deltas.tolist() == [[-11]]
+
+
+@needs_position_ids_hook
 def test_generate_without_a_cache_hands_the_prompt_offset_to_the_cache_it_builds() -> None:
     wrapper = _wrapper(MobilintQwen2VLForConditionalGeneration)
     multimodal = {"mm_token_type_ids": torch.zeros(1, 1), "image_grid_thw": torch.ones(1, 3)}
@@ -160,7 +219,7 @@ class _FileMxq:
         del cache_dir, cache_id
 
 
-@pytest.mark.parametrize("cls", [MobilintQwen2VLForConditionalGeneration, MobilintQwen3VLForConditionalGeneration])
+@pytest.mark.parametrize("cls", _VL_CLASSES)
 def test_a_forward_without_a_cache_keeps_the_offset_on_the_cache_it_returns(cls) -> None:
     wrapper = _wrapper(cls)
 
@@ -246,6 +305,7 @@ def test_files_keep_the_offset(tmp_path) -> None:
     assert restored.get_seq_length() == 5 and restored.rope_deltas.tolist() == [[-3]]
 
 
+@needs_position_ids_hook
 def test_generate_hands_the_prompt_offset_to_its_cache_even_if_another_request_ran_in_between(monkeypatch) -> None:
     from transformers_mblt.utils.generation_utils import MobilintGenerationMixin
 
@@ -304,6 +364,7 @@ def test_fake_prefill_drops_the_offset_of_the_prompt_the_row_held() -> None:
     assert batched.rope_deltas.tolist() == [[-3], [0]]
 
 
+@needs_position_ids_hook
 def test_a_restored_offset_follows_the_input_device() -> None:
     wrapper = _wrapper(MobilintQwen2VLForConditionalGeneration)
     cache = MobilintCache(object())

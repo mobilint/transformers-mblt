@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
 
 ### Added
 
@@ -42,7 +42,9 @@
   continues from a filled cache, and that attribute holds the offset of whichever conversation ran last, so an image
   conversation resumed after another conversation got the wrong text positions. `copy()` and
   `dump_cache_memory_to()` keep the offset; `reset()` clears it. A filled cache without one (older files) recomputes
-  it from the full input instead of borrowing another conversation's.
+  it from the full input instead of borrowing another conversation's. This covers both places upstream adds the
+  offset: `_prepare_position_ids_for_generation` (transformers 5.2 and later) and each step's
+  `prepare_inputs_for_generation` (earlier releases).
 
 ### Changed
 
@@ -53,6 +55,9 @@
 
 ### Fixed
 
+- Whisper speech recognition through `pipeline()` failed on transformers 5.0-5.2 with `TokenizersBackend has no
+  attribute _decode_asr`: those releases load a model type they do not list with the generic tokenizer, ignoring
+  the Hub's `tokenizer_class`. `mobilint-whisper` now maps to the upstream Whisper tokenizer.
 - Qwen3-VL (and dynamic Qwen2-VL) `generate()` continuing from a filled cache raised `IndexError` in the external
   RoPE: upstream passes `(1, batch, seq)` text positions there, which the text model now expands to the three M-RoPE
   axes.

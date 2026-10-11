@@ -39,3 +39,26 @@ def test_whisper_feature_extractor_and_processor_load_without_remote_code() -> N
 
     processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=False)
     assert isinstance(processor.feature_extractor, WhisperFeatureExtractor)
+
+
+def test_mobilint_whisper_uses_the_upstream_whisper_tokenizer_mapping() -> None:
+    """transformers 5.0-5.2 give a model type absent from this table the generic TokenizersBackend (no _decode_asr)."""
+    from transformers.models.auto.tokenization_auto import TOKENIZER_MAPPING_NAMES
+
+    import transformers_mblt
+
+    transformers_mblt.register()
+
+    assert TOKENIZER_MAPPING_NAMES["mobilint-whisper"] == TOKENIZER_MAPPING_NAMES["whisper"]
+
+
+@pytest.mark.requires_network
+def test_whisper_processor_loads_the_whisper_tokenizer() -> None:
+    from transformers import AutoProcessor
+
+    import transformers_mblt
+
+    transformers_mblt.register()
+
+    processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
+    assert hasattr(processor.tokenizer, "_decode_asr")  # the ASR pipeline's postprocess calls it
