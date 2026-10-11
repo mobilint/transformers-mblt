@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- A cache that loses its NPU slot is no longer dumped again when its host copy already matches every cached position
+  (it was just `copy()`-ed or `dump_cache_memory()`-ed and no infer wrote since). Snapshotting a cache and then
+  letting another cache take its slot costs one dump instead of two.
+
 ## 0.3.0
 
 ### Added

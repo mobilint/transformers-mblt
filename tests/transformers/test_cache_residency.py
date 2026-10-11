@@ -177,6 +177,64 @@ def test_copy_is_a_snapshot_that_restores_on_first_use() -> None:
     assert _slot(backend) == "prefix-a!"
 
 
+def test_evicting_a_just_copied_cache_does_not_dump_again() -> None:
+    backend = _Backend()
+    a = MobilintCache(backend.mxq_models)
+    _run(a, backend, 0, "prefix")
+
+    snapshot = a.copy()  # saves A's slot once
+    b = MobilintCache(backend.mxq_models)
+    _run(b, backend, 0, "b")  # evicts A: its host copy is already current
+
+    assert backend.mxq_models[0].calls == [("dump", 0)]
+    _run(a, backend, 0, "!")
+    assert _slot(backend) == "prefix!"
+    _run(snapshot, backend, 0, "?")
+    assert _slot(backend) == "prefix?"
+
+
+def test_eviction_dumps_again_after_an_infer_writes() -> None:
+    backend = _Backend()
+    a = MobilintCache(backend.mxq_models)
+    _run(a, backend, 0, "prefix")
+    a.copy()
+    _run(a, backend, 0, "-more")  # writes after the copy: the host copy is stale
+
+    _run(MobilintCache(backend.mxq_models), backend, 0, "b")
+
+    assert backend.mxq_models[0].calls == [("dump", 0), ("dump", 0)]
+    _run(a, backend, 0, "!")
+    assert _slot(backend) == "prefix-more!"
+
+
+def test_raising_a_resident_cursor_by_hand_dumps_on_eviction() -> None:
+    backend = _Backend()
+    a = MobilintCache(backend.mxq_models)
+    _run(a, backend, 0, "abcdef")
+    a.copy()
+    a.set_seq_length(3)
+    backend.mxq_models[0].write(0, "abcXYZ")  # an infer that wrote past the cursor without advancing it
+    a.set_seq_length(6)
+
+    _run(MobilintCache(backend.mxq_models), backend, 0, "b")
+    _run(a, backend, 0, "!")
+
+    assert _slot(backend) == "abcXYZ!"
+
+
+def test_evicted_cache_can_rewind_and_raise_its_cursor_again() -> None:
+    backend = _Backend()
+    a = MobilintCache(backend.mxq_models)
+    _run(a, backend, 0, "abcdef")
+    _run(MobilintCache(backend.mxq_models), backend, 0, "b")  # A is saved with 6 positions
+
+    a.set_seq_length(3)
+    a.set_seq_length(6)  # nothing wrote A's KV while it was off the slot
+    _run(a, backend, 0, "!")
+
+    assert _slot(backend) == "abcdef!"
+
+
 def test_offload_frees_the_slot_ahead_of_time() -> None:
     backend = _Backend()
     a = MobilintCache(backend.mxq_models)
