@@ -115,12 +115,15 @@ def test_generate_continues_a_cache_with_its_own_offset(cls) -> None:
     assert a.rope_deltas.tolist() == [[-3]] and b.rope_deltas.tolist() == [[-11]]
 
 
-def test_steps_built_in_prepare_inputs_use_their_cache_offset(monkeypatch) -> None:
+@pytest.mark.parametrize("cache_by", ["keyword", "position"])
+def test_steps_built_in_prepare_inputs_use_their_cache_offset(monkeypatch, cache_by) -> None:
     """transformers < 5.2: each decode step adds ``self.model.rope_deltas`` in ``prepare_inputs_for_generation``."""
+    import inspect
+
     from transformers_mblt.utils.generation_utils import MobilintGenerationMixin
 
-    def upstream_prepare(self, input_ids, past_key_values=None, cache_position=None, **kwargs):
-        del kwargs
+    def upstream_prepare(self, input_ids, *args, cache_position=None, **kwargs):
+        del args, kwargs
         if cache_position[0] == 0 or self.model.rope_deltas is None:
             _, self.model.rope_deltas = self.model.get_rope_index(input_ids)
             return {"delta": None}
@@ -132,9 +135,15 @@ def test_steps_built_in_prepare_inputs_use_their_cache_offset(monkeypatch) -> No
 
     def step(cache, length):
         start = cache.get_seq_length()
-        inputs = wrapper.prepare_inputs_for_generation(
-            _ids(length), past_key_values=cache, cache_position=torch.arange(start, start + length)
-        )
+        cache_position = torch.arange(start, start + length)
+        if cache_by == "keyword":
+            inputs = wrapper.prepare_inputs_for_generation(
+                _ids(length), past_key_values=cache, cache_position=cache_position
+            )
+        else:  # the upstream signature of the installed release decides where the cache goes
+            parameters = list(inspect.signature(wrapper.prepare_inputs_for_generation).parameters)
+            before = [None] * (parameters.index("past_key_values") - 1)
+            inputs = wrapper.prepare_inputs_for_generation(_ids(length), *before, cache, cache_position=cache_position)
         cache.update_seen_tokens(start + length)
         return inputs["delta"]
 
