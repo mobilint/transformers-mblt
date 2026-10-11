@@ -442,6 +442,18 @@ class MobilintCacheRopeDeltasMixin:
         self._pending_rope_deltas().value = prompt_rope_deltas if cache is None else None
         return position_ids
 
+    def prepare_inputs_for_generation(self, *args, **kwargs):
+        # Before transformers 5.2, each step's positions are built here from ``self.model.rope_deltas``.
+        cache = kwargs.get("past_key_values")
+        if cache is None:  # no offset to load, and none to keep
+            return super().prepare_inputs_for_generation(*args, **kwargs)  # type: ignore[misc]
+        with cache_rope_deltas(self.model, cache) as keep:
+            used = self.model.rope_deltas
+            model_inputs = super().prepare_inputs_for_generation(*args, **kwargs)  # type: ignore[misc]
+            if self.model.rope_deltas is not used:  # a prompt step computed its offset
+                keep(cache)
+        return model_inputs
+
     def _prepare_cache_for_generation(self, generation_config, model_kwargs, *args, **kwargs):
         result = super()._prepare_cache_for_generation(generation_config, model_kwargs, *args, **kwargs)  # type: ignore[misc]
         pending = self._pending_rope_deltas()

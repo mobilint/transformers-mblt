@@ -42,7 +42,9 @@
   continues from a filled cache, and that attribute holds the offset of whichever conversation ran last, so an image
   conversation resumed after another conversation got the wrong text positions. `copy()` and
   `dump_cache_memory_to()` keep the offset; `reset()` clears it. A filled cache without one (older files) recomputes
-  it from the full input instead of borrowing another conversation's.
+  it from the full input instead of borrowing another conversation's. This covers both places upstream adds the
+  offset: `_prepare_position_ids_for_generation` (transformers 5.2 and later) and each step's
+  `prepare_inputs_for_generation` (earlier releases).
 
 ### Changed
 
