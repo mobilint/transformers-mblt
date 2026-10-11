@@ -1199,23 +1199,12 @@ class MobilintModelMixin(PretrainedOnlyMixin, PreTrainedModel):
                     # Layout A (per-item last row) — includes the
                     # active == total_tokens decode case where both
                     # layouts coincide.
-                    # A view of the MXQ output; the rows it finishes are copied into ``logits`` below.
-                    logits_chunks = cast(
-                        torch.FloatTensor,
-                        torch.from_numpy(np.ascontiguousarray(raw_arr)).reshape([active, 1, vocab]),
-                    )
+                    last_row_of = list(range(active))
                 elif n_rows == total_tokens:
-                    # Layout B (per-token flat): pick each item's last
-                    # row using cumulative offsets. Item k occupies rows
+                    # Layout B (per-token flat): item k occupies rows
                     # ``[offset, offset + seq_len_k)`` in the flat buffer;
                     # its default-keep row is the final one.
-                    flat = raw_arr.reshape(total_tokens, vocab)
-                    last_rows = np.empty((active, vocab), dtype=flat.dtype)
-                    offset = 0
-                    for k, len_k in enumerate(sequence_lengths_chunks):
-                        last_rows[k] = flat[offset + len_k - 1]
-                        offset += len_k
-                    logits_chunks = cast(torch.FloatTensor, torch.from_numpy(last_rows).reshape([active, 1, vocab]))
+                    last_row_of = (np.cumsum(sequence_lengths_chunks) - 1).tolist()
                 else:
                     hint = ""
                     if n_rows == 1 and active > 1:
@@ -1239,8 +1228,12 @@ class MobilintModelMixin(PretrainedOnlyMixin, PreTrainedModel):
                         f"expected {active} (per-item last row) or "
                         f"{total_tokens} (per-token flat).{hint}"
                     )
+                # A view of the MXQ output. Each item's row is copied into ``logits`` only when its last chunk
+                # finishes, so neither layout copies the logits more than once.
+                output_rows = torch.from_numpy(np.ascontiguousarray(raw_arr)).reshape([n_rows, vocab])
 
                 if debug_enabled:
+                    logits_chunks = output_rows[last_row_of].reshape([active, 1, vocab])
                     batch_seq_sum = sum(sequence_lengths_chunks)
                     logger.debug(
                         (
@@ -1336,7 +1329,7 @@ class MobilintModelMixin(PretrainedOnlyMixin, PreTrainedModel):
                             logits = torch.empty(
                                 (batch_size, 1, vocab), dtype=inputs_embeds.dtype, device=inputs_embeds.device
                             )
-                        logits[cache_ids[j]] = logits_chunks[j, :, :]
+                        logits[cache_ids[j]] = output_rows[last_row_of[j]]
                         finished.add(cache_ids[j])
 
                 if past_key_values is not None:
