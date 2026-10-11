@@ -290,3 +290,15 @@ def test_concurrent_requests_do_not_see_each_other_offsets() -> None:
 
     assert wrapper.model.seen == [-11, -11, -3]
     assert a.rope_deltas.tolist() == [[-3]] and b.rope_deltas.tolist() == [[-11]]
+
+
+def test_fake_prefill_drops_the_offset_of_the_prompt_the_row_held() -> None:
+    cache = MobilintCache(object())
+    cache.rope_deltas = torch.tensor([[-3]])
+    cache.fake_prefill(16)
+    assert cache.rope_deltas is None
+
+    batched = MobilintCache(object(), per_model_batch=2)
+    batched.rope_deltas = torch.tensor([[-3], [-11]])
+    batched.fake_prefill({1: 16})
+    assert batched.rope_deltas.tolist() == [[-3], [0]]

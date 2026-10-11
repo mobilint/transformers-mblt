@@ -517,12 +517,17 @@ class MobilintCache(Cache):
         Raises:
             ValueError: If any sequence length is negative.
         """
+        # A synthetic prefix has no image tokens: the offset of the prompt the row held before no longer applies.
         if isinstance(sequence_lengths, int):
             for layer in self.layers:
                 layer.fake_prefill(sequence_lengths)
+            self.rope_deltas = None
             return
         for cache_id, seq_len in sequence_lengths.items():
             self.layers[cache_id].fake_prefill(seq_len)
+            if self.rope_deltas is not None and cache_id < int(self.rope_deltas.shape[0]):
+                self.rope_deltas = self.rope_deltas.clone()
+                self.rope_deltas[cache_id] = 0
 
     def update_cache_position(self, cache_position: torch.Tensor, index: int = 0):
         self.layers[index].update_cache_position(cache_position)
