@@ -212,10 +212,10 @@ def test_restoring_an_empty_row_keeps_the_offset_of_a_filled_one(tmp_path) -> No
     for row in (0, 1):
         restored.load_cache_memory_from(str(tmp_path / str(row)), index=row)
 
-    assert restored.rope_deltas.tolist() == [[-3], [0]]
+    assert restored.rope_deltas.tolist() == [[-3]]  # the empty row 1 is past the active batch
 
 
-def test_rows_past_the_active_batch_save_and_restore_as_empty(tmp_path) -> None:
+def test_rows_past_the_active_batch_are_left_out_on_restore(tmp_path) -> None:
     cache = MobilintCache(_FileMxq(), per_model_batch=3)
     cache.update_seen_tokens({0: 5})
     cache.rope_deltas = torch.tensor([[-3]])  # one active row in a cache with room for three
@@ -227,7 +227,11 @@ def test_rows_past_the_active_batch_save_and_restore_as_empty(tmp_path) -> None:
     for row in range(3):
         restored.load_cache_memory_from(str(tmp_path / str(row)), index=row)
 
-    assert restored.rope_deltas.tolist() == [[-3], [0], [0]]
+    assert restored.rope_deltas.tolist() == [[-3]]  # sized to the active batch, not the cache's capacity
+
+    wrapper = _wrapper(MobilintQwen2VLForConditionalGeneration)
+    wrapper.forward(input_ids=_ids(1), past_key_values=restored)  # a one-row continuation
+    assert wrapper.model.seen == [-3]
 
 
 def test_files_keep_the_offset(tmp_path) -> None:

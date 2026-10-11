@@ -544,7 +544,7 @@ class MobilintCache(Cache):
 
     def dump_cache_memory_to(self, cache_dir: str, index: int = 0):
         self.layers[index].dump_cache_memory_to(cache_dir)
-        # Rows past the active batch have no offset: saved as unknown, restored as empty rows.
+        # Rows past the active batch have no offset: saved as unknown and left out on restore.
         has_row = self.rope_deltas is not None and index < int(self.rope_deltas.shape[0])
         row = self.rope_deltas[index].tolist() if has_row else None
         (Path(cache_dir) / self._ROPE_DELTAS_FILE).write_text(json.dumps({"rope_deltas": row}), encoding="utf-8")
@@ -553,20 +553,23 @@ class MobilintCache(Cache):
         self.layers[index].load_cache_memory_from(cache_dir)
         rope_path = Path(cache_dir) / self._ROPE_DELTAS_FILE
         row = json.loads(rope_path.read_text(encoding="utf-8")).get("rope_deltas") if rope_path.exists() else None
-        if row is None and self.layers[index].get_seq_length() == 0:
-            # An empty row has no offset yet: its next prompt computes one. Keep the other rows' offsets.
-            width = 1 if self.rope_deltas is None else int(self.rope_deltas.shape[1])
-            row = [0] * width
-        if row is None:
-            # This row holds tokens whose offset was not saved: recomputed from the full input instead of guessed.
-            self.rope_deltas = None
-            return
         known = 0 if self.rope_deltas is None else int(self.rope_deltas.shape[0])
-        # Rows that gain an offset of 0 here must hold nothing yet; their next prompt computes the real one.
-        if not all(self.layers[i].get_seq_length() == 0 for i in range(known, self.batch_size) if i != index):
-            self.rope_deltas = None
+        if row is None:
+            if self.layers[index].get_seq_length() > 0:
+                # This row holds tokens whose offset was not saved: recomputed from the full input, not guessed.
+                self.rope_deltas = None
+            elif index < known:
+                # An empty row inside the active batch: its next prompt computes the offset.
+                self.rope_deltas = self.rope_deltas.clone()
+                self.rope_deltas[index] = 0
+            # An empty row past the active batch leaves the offsets alone, so they keep the active batch's size.
             return
-        rope_deltas = torch.zeros((self.batch_size, len(row)), dtype=torch.long)
+        # The offsets cover the rows that had one when saved (the active batch), not the cache's full capacity.
+        size = max(known, index + 1)
+        if not all(self.layers[i].get_seq_length() == 0 for i in range(known, self.batch_size) if i != index):
+            self.rope_deltas = None  # other rows hold tokens with unknown offsets
+            return
+        rope_deltas = torch.zeros((size, len(row)), dtype=torch.long)
         if known:
             rope_deltas[:known] = self.rope_deltas
         rope_deltas[index] = torch.tensor(row, dtype=torch.long)
