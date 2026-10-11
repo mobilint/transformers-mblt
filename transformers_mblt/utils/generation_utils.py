@@ -20,8 +20,10 @@ from ..utils.cache_utils import (
     build_mobilint_cache_from_model,
     cache_matches_backend_topology,
     defer_eagle3_accept_tokens,
+    keep_cache_rope_deltas,
     note_eagle3_fed_tokens,
     take_eagle3_unfed_tokens,
+    use_cache_rope_deltas,
 )
 from ..utils.modeling_utils import MobilintModelMixin
 
@@ -416,6 +418,22 @@ def with_mobilint_generation_signature(wrapped: Callable, *extra_keyword_names: 
         return wrapper
 
     return decorator
+
+
+class MobilintCacheRopeDeltasMixin:
+    """Keep upstream Qwen-VL ``rope_deltas`` with the cache passed to ``generate()``, not on ``self.model``.
+
+    Upstream continues a generation from a non-empty cache by adding ``self.model.rope_deltas`` to the text
+    positions. That attribute holds the offset of whichever sequence ran last, so a conversation resumed after
+    another one would get the other one's positions. Mix in before the upstream ``*ForConditionalGeneration``.
+    """
+
+    def _prepare_position_ids_for_generation(self, inputs_tensor, model_kwargs):
+        cache = model_kwargs.get("past_key_values")
+        use_cache_rope_deltas(self.model, cache)
+        position_ids = super()._prepare_position_ids_for_generation(inputs_tensor, model_kwargs)  # type: ignore[misc]
+        keep_cache_rope_deltas(self.model, cache)
+        return position_ids
 
 
 class MobilintGenerationMixin(ABC, GenerationMixin):

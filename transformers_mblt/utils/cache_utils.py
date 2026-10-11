@@ -393,6 +393,9 @@ class MobilintCache(Cache):
 
         self.num_hidden_layers = 1
         self.cache_processor = None
+        # M-RoPE offset per row (Qwen2-VL, Qwen3-VL, Qwen3-ASR): text position minus cache position after the
+        # prompt. It belongs to the sequence in this cache, not to the model, so two conversations can alternate.
+        self.rope_deltas: Optional[torch.Tensor] = None
 
     @property
     def batch_size(self) -> int:
@@ -537,16 +540,28 @@ class MobilintCache(Cache):
         for layer_idx in range(len(self.layers)):
             self.layers[layer_idx].load_cache_memory()
 
+    _ROPE_DELTAS_FILE = "rope_deltas.json"
+
     def dump_cache_memory_to(self, cache_dir: str, index: int = 0):
         self.layers[index].dump_cache_memory_to(cache_dir)
+        row = None if self.rope_deltas is None else self.rope_deltas[index].tolist()
+        (Path(cache_dir) / self._ROPE_DELTAS_FILE).write_text(json.dumps({"rope_deltas": row}), encoding="utf-8")
 
     def load_cache_memory_from(self, cache_dir: str, index: int = 0):
         self.layers[index].load_cache_memory_from(cache_dir)
+        rope_path = Path(cache_dir) / self._ROPE_DELTAS_FILE
+        row = json.loads(rope_path.read_text(encoding="utf-8")).get("rope_deltas") if rope_path.exists() else None
+        if row is not None and self.batch_size == 1:
+            self.rope_deltas = torch.tensor([row], dtype=torch.long)
+        else:
+            # Unknown, or one row of several whose offsets the file does not hold: recomputed from the next prompt.
+            self.rope_deltas = None
 
     def reset(self) -> None:
         """Reset all cache entries in this Mobilint cache."""
         for layer in self.layers:
             layer.reset()
+        self.rope_deltas = None
 
     def ensure_batch_size(self, batch_size: int) -> None:
         """Grow logical cache entries so batched generation can track each active row.
@@ -582,7 +597,38 @@ class MobilintCache(Cache):
         copied._explicit_slots = self._explicit_slots
         copied._batch_size = self._batch_size
         copied.layers = [layer.copy() for layer in self.layers]
+        copied.rope_deltas = copy_rope_deltas(self)
         return copied
+
+
+def copy_rope_deltas(cache: Any) -> Optional[torch.Tensor]:
+    """Return an independent copy of ``cache.rope_deltas`` (``None`` when the cache has none)."""
+    rope_deltas = getattr(cache, "rope_deltas", None)
+    return None if rope_deltas is None else rope_deltas.clone()
+
+
+def use_cache_rope_deltas(holder: Any, cache: Any) -> None:
+    """Point ``holder.rope_deltas`` (the attribute upstream M-RoPE code reads) at ``cache``'s offset.
+
+    Upstream Qwen-VL code keeps ``rope_deltas`` on the model, so a cache that resumes after another conversation ran
+    would get that conversation's offset. Call this before a forward or ``generate()`` step with ``cache``, and
+    :func:`keep_cache_rope_deltas` after it. An empty cache leaves ``holder`` alone: the prompt about to fill it
+    recomputes the offset, and ``generate()`` computes it before it builds the cache. A cache with tokens but no
+    offset (from an older release, or a file without one) sets ``None`` so the offset is recomputed from the full
+    input instead of borrowed from another sequence.
+    """
+    if cache is None or not hasattr(cache, "get_seq_length"):
+        return
+    stored = getattr(cache, "rope_deltas", None)
+    if stored is not None or cache.get_seq_length() > 0:
+        holder.rope_deltas = stored
+
+
+def keep_cache_rope_deltas(holder: Any, cache: Any) -> None:
+    """Store ``holder.rope_deltas`` on ``cache`` after a step that may have computed it."""
+    if cache is None or not hasattr(cache, "get_seq_length"):
+        return
+    cache.rope_deltas = getattr(holder, "rope_deltas", None)
 
 
 def _resolve_language_model_candidate(model: Any) -> Optional[Any]:
@@ -1070,6 +1116,7 @@ class MobilintBeamCache(MobilintCache):
         copied._active_token_history = list(self._active_token_history)
         copied._active_source_index = self._active_source_index
         copied._beam_seq_lengths = list(self._beam_seq_lengths)
+        copied.rope_deltas = copy_rope_deltas(self)
         return copied
 
 
@@ -1152,6 +1199,7 @@ class MobilintDeepStackCache(MobilintCache):
         for layer in self.layers:
             layer.reset()
         self._deepstack_tensor = None
+        self.rope_deltas = None
 
     def fake_prefill(self, sequence_lengths: Union[dict[int, int], int], index: int = 0) -> None:
         """Mark the cache as fake-prefilled and clear real deepstack payloads."""
@@ -1225,6 +1273,7 @@ class MobilintDeepStackCache(MobilintCache):
         copied._batch_size = self._batch_size
         copied.layers = [layer.copy() for layer in self.layers]
         copied._deepstack_tensor = None if self._deepstack_tensor is None else self._deepstack_tensor.clone()
+        copied.rope_deltas = copy_rope_deltas(self)
         return copied
 
 

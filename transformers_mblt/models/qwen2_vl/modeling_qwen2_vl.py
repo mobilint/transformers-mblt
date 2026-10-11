@@ -40,8 +40,9 @@ from transformers.processing_utils import Unpack
 from transformers.utils.generic import TransformersKwargs, can_return_tuple, logging
 
 from ...utils.base_utils import PretrainedOnlyMixin
-from ...utils.cache_utils import MobilintCache
+from ...utils.cache_utils import MobilintCache, keep_cache_rope_deltas, use_cache_rope_deltas
 from ...utils.generation_utils import (
+    MobilintCacheRopeDeltasMixin,
     MobilintGenerationMixin,
     build_loss_kwargs_dynamic,
     mirror_output_fields,
@@ -481,6 +482,10 @@ class MobilintQwen2VLTextModel(MobilintModelMixin, MobilintGenerationMixin, Mobi
                 position_ids = cache_position.view(1, 1, -1).expand(3, inputs_embeds.shape[0], -1)
             elif position_ids.ndim == 2:
                 position_ids = position_ids[None].expand(3, position_ids.shape[0], -1)
+            elif position_ids.ndim == 3 and position_ids.shape[0] == 1:
+                # Upstream continues a generation from a filled cache with text positions + rope_deltas, one axis
+                # for all three (temporal, height, width).
+                position_ids = position_ids.expand(3, -1, -1)
             assert self._mobilint_rotary_emb is not None
             position_embeddings = self._mobilint_rotary_emb(position_ids)
 
@@ -538,6 +543,7 @@ class MobilintQwen2VLModel(PretrainedOnlyMixin, MobilintQwen2VLPreTrainedModel, 
 class MobilintQwen2VLForConditionalGeneration(
     PretrainedOnlyMixin,
     MobilintQwen2VLPreTrainedModel,
+    MobilintCacheRopeDeltasMixin,
     MobilintGenerationMixin,
     Qwen2VLForConditionalGeneration,
 ):
@@ -645,11 +651,14 @@ class MobilintQwen2VLForConditionalGeneration(
         # so leaking these into that call would raise ``TypeError``.
         loss_only_kwargs = pop_loss_only_kwargs(kwargs)
 
+        cache = kwargs.get("past_key_values")
+        use_cache_rope_deltas(self.model, cache)
         outputs = self.model(
             logits_to_keep=logits_to_keep,
             count_npu_time=count_npu_time,
             **kwargs,
         )
+        keep_cache_rope_deltas(self.model, cache)
 
         # The Mobilint text decoder already returns logits sliced to the requested
         # positions and ``self.lm_head`` is ``nn.Identity``, so skip the upstream

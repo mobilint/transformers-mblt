@@ -16,7 +16,7 @@ from transformers.processing_utils import Unpack
 from transformers.utils.generic import TransformersKwargs, logging
 
 from ...utils.base_utils import PretrainedOnlyMixin
-from ...utils.cache_utils import MobilintBeamCache, MobilintCache
+from ...utils.cache_utils import MobilintBeamCache, MobilintCache, keep_cache_rope_deltas, use_cache_rope_deltas
 from ...utils.generation_utils import MobilintGenerationMixin
 from ...utils.modeling_utils import MobilintModelMixin
 from ._errors import guard_qwen_asr_import
@@ -613,6 +613,7 @@ class MobilintQwen3ASRThinkerForConditionalGeneration(
         else:
             audio_feature_lengths = None
 
+        use_cache_rope_deltas(self, past_key_values)
         if attention_mask is not None and position_ids is None:
             if (
                 cache_position is None
@@ -642,6 +643,7 @@ class MobilintQwen3ASRThinkerForConditionalGeneration(
             count_npu_time=count_npu_time,
             **kwargs,
         )
+        keep_cache_rope_deltas(self, past_key_values)
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
         if isinstance(logits, torch.Tensor) and logits.ndim == 4 and int(logits.shape[1]) == 1:
