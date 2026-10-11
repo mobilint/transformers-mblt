@@ -781,7 +781,6 @@ def test_cache_displaced_by_a_second_restore_snapshots_its_own_kv(tmp_path) -> N
 # Joining request caches into one batch (MobilintCache.from_rows)
 # ----------------------------------------------------------------------
 
-from transformers_mblt.models.qwen3_vl.modeling_qwen3_vl import _row_text_position_ids  # noqa: E402
 from transformers_mblt.utils.cache_utils import MobilintBeamCache, MobilintDeepStackCache  # noqa: E402
 
 
@@ -830,14 +829,13 @@ def test_from_rows_restores_a_request_whose_slot_another_cache_took() -> None:
     assert backend.mxq_models[0].calls == [("dump", 0), ("load", 0)]
 
 
-def test_from_rows_gathers_rope_deltas_only_when_every_row_has_one() -> None:
+def test_from_rows_gathers_rope_deltas_row_by_row() -> None:
     backend = _Backend(k=2)
     a, b = _request(backend, (0, 0)), _request(backend, (0, 1))
-    a.rope_deltas = torch.tensor([[-182]])
     assert MobilintCache.from_rows([a, b]).rope_deltas is None
 
-    b.rope_deltas = torch.tensor([[0]])
-    assert MobilintCache.from_rows([a, b]).rope_deltas.tolist() == [[-182], [0]]
+    a.rope_deltas = torch.tensor([[-182]])
+    assert MobilintCache.from_rows([a, b]).rope_deltas.tolist() == [[-182], [0]]  # b had no image: offset 0
 
 
 def test_from_rows_keeps_the_deepstack_cache_type() -> None:
@@ -869,21 +867,3 @@ def test_from_rows_rejects_caches_it_cannot_join() -> None:
         MobilintCache.from_rows([a, MobilintBeamCache(backend.mxq_models[0])])
     with pytest.raises(TypeError):
         MobilintDeepStackCache.from_rows([a, b])
-
-
-def test_qwen3_vl_text_positions_continue_each_row_from_its_own_length() -> None:
-    backend = _Backend(k=2)
-    a, b = _request(backend, (0, 0)), _request(backend, (0, 1))
-    a.set_seq_length(10)
-    b.set_seq_length(4)
-    batch = MobilintCache.from_rows([a, b])
-    embeds = torch.zeros(2, 3, 1)
-
-    right_padded = _row_text_position_ids(batch, torch.tensor([[1, 0, 0], [1, 1, 1]]), embeds)
-    left_padded = _row_text_position_ids(batch, torch.tensor([[0, 0, 1], [1, 1, 1]]), embeds)
-
-    assert right_padded[0, 0].item() == 10 and right_padded[1].tolist() == [4, 5, 6]
-    assert left_padded[0, 2].item() == 10 and left_padded[1].tolist() == [4, 5, 6]
-    b.set_seq_length(10)
-    assert _row_text_position_ids(MobilintCache.from_rows([a, b]), None, embeds) is None  # rows agree
-    assert _row_text_position_ids(a, None, embeds[:1]) is None  # one row

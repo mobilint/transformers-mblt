@@ -12,9 +12,9 @@
 
 ### Changed
 
-- Qwen3-VL text forward without `position_ids` gives each row text positions from its own cache length when the rows
-  hold different numbers of tokens, instead of row 0's. Padding takes no position. Image tokens still need the
-  caller's M-RoPE `position_ids`.
+- Qwen3-VL without `position_ids` gives each row of a batch whose rows hold different numbers of tokens its own text
+  positions: its cache length plus its `rope_deltas`, with padding taking no position. Upstream gave every row row
+  0's start. Such a batch that carries images or videos raises and asks for the caller's M-RoPE `position_ids`.
 
 - A cache that loses its NPU slot is no longer dumped again when its host copy already matches every cached position
   (it was just `copy()`-ed or `dump_cache_memory()`-ed and no infer wrote since). Snapshotting a cache and then

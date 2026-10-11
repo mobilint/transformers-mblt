@@ -633,8 +633,9 @@ class MobilintCache(Cache):
         batched forward (with an ``attention_mask``) and every request's cache advances by its own row, each from its
         own length. The rows keep their slots, so the requests must sit on distinct slots of the same backend.
 
-        ``rope_deltas`` is gathered when every row has one. An offset the forward computes for a prompt stays on the
-        view: run prompts that need one on the request's own cache, or pass ``position_ids``.
+        ``rope_deltas`` (the M-RoPE offset a prompt with images leaves) is gathered row by row, 0 for a row without
+        one, as long as any row has one. An offset the forward computes for a prompt stays on the view: run prompts
+        that need one on the request's own cache, or pass ``position_ids``.
         """
         caches = list(caches)
         if not caches:
@@ -661,7 +662,11 @@ class MobilintCache(Cache):
         view = first._empty_like([cache.slot_of(0) for cache in caches])
         view.layers = [cache.layers[0] for cache in caches]
         deltas = [cache.rope_deltas for cache in caches]
-        view.rope_deltas = None if any(delta is None for delta in deltas) else torch.cat(deltas, dim=0)
+        known = next((delta for delta in deltas if delta is not None), None)
+        if known is not None:
+            view.rope_deltas = torch.cat(
+                [torch.zeros_like(known[:1]) if delta is None else delta.reshape(1, -1) for delta in deltas], dim=0
+            )
         return view
 
     def _empty_like(self, slots: Sequence[Tuple[int, int]]) -> "MobilintCache":
