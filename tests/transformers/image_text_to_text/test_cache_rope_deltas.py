@@ -199,6 +199,22 @@ def test_a_row_restored_next_to_a_filled_row_of_unknown_offset_recomputes(tmp_pa
     assert restored.rope_deltas is None
 
 
+def test_restoring_an_empty_row_keeps_the_offset_of_a_filled_one(tmp_path) -> None:
+    cache = MobilintCache(_FileMxq(), per_model_batch=2)
+    cache.update_seen_tokens({0: 5})
+    cache.rope_deltas = torch.tensor([[-3], [0]])
+    for row in (0, 1):
+        (tmp_path / str(row)).mkdir()
+        cache.dump_cache_memory_to(str(tmp_path / str(row)), index=row)
+    (tmp_path / "1" / "rope_deltas.json").unlink()  # an empty row saved without an offset
+
+    restored = MobilintCache(_FileMxq(), per_model_batch=2)
+    for row in (0, 1):
+        restored.load_cache_memory_from(str(tmp_path / str(row)), index=row)
+
+    assert restored.rope_deltas.tolist() == [[-3], [0]]
+
+
 def test_files_keep_the_offset(tmp_path) -> None:
     cache = MobilintCache(_FileMxq())
     cache.update_seen_tokens(5)
