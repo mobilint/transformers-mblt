@@ -40,7 +40,7 @@ from transformers.processing_utils import Unpack
 from transformers.utils.generic import TransformersKwargs, can_return_tuple, logging
 
 from ...utils.base_utils import PretrainedOnlyMixin
-from ...utils.cache_utils import MobilintCache, cache_rope_deltas
+from ...utils.cache_utils import MobilintCache, cache_rope_deltas, require_positions_for_joined_rows
 from ...utils.generation_utils import (
     MobilintCacheRopeDeltasMixin,
     MobilintGenerationMixin,
@@ -652,6 +652,9 @@ class MobilintQwen2VLForConditionalGeneration(
         loss_only_kwargs = pop_loss_only_kwargs(kwargs)
 
         cache = kwargs.get("past_key_values")
+        if getattr(getattr(self.model, "language_model", None), "_uses_rope_input", False):
+            # A text MXQ that takes RoPE as an input reads the positions; a static one keeps its own.
+            require_positions_for_joined_rows(cache, kwargs.get("position_ids"))
         with cache_rope_deltas(self.model, cache) as keep:
             outputs = self.model(
                 logits_to_keep=logits_to_keep,

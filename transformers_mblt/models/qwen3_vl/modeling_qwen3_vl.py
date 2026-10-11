@@ -25,6 +25,7 @@ from ...utils.cache_utils import (
     build_mobilint_cache_from_model,
     cache_matches_backend_topology,
     cache_rope_deltas,
+    require_positions_for_joined_rows,
 )
 from ...utils.generation_utils import (
     MobilintCacheRopeDeltasMixin,
@@ -1005,45 +1006,6 @@ class MobilintQwen3VLRotaryEmbedding(nn.Module):
         return result
 
 
-
-_VISION_INPUTS = ("pixel_values", "pixel_values_videos", "image_grid_thw", "video_grid_thw")
-
-
-def _row_text_position_ids(
-    cache: Optional[MobilintDeepStackCache], attention_mask: Optional[torch.Tensor], batch: int, length: int
-) -> Optional[torch.Tensor]:
-    """Text positions ``(batch, length)`` continuing each row from its own cache, or ``None`` if the rows agree.
-
-    Upstream builds one start for the whole batch (row 0's cache length, or the attention mask with one shared
-    offset), which is right only while every row holds the same number of tokens. A batch of requests joined with
-    ``MobilintCache.from_rows`` does not. Row ``j`` continues at its cache length plus its ``rope_deltas`` (the
-    M-RoPE offset its prompt left), and padding (where ``attention_mask`` is 0) takes no position. ``attention_mask``
-    may cover only the new tokens or the cached ones too; its last ``length`` columns are used. A batch with a row
-    whose offset is unknown (``rope_deltas_unknown``) raises rather than guess.
-    """
-    if cache is None:
-        return None
-    if getattr(cache, "rope_deltas_unknown", False):
-        raise ValueError(
-            "Some batch rows hold tokens whose M-RoPE offset is unknown (a text conversation, or a cache restored from "
-            "files saved without rope_deltas.json): pass position_ids for every row."
-        )
-    if batch <= 1 or len(getattr(cache, "layers", ())) < batch:
-        return None
-    starts = [int(cache.get_seq_length(row)) for row in range(batch)]
-    if len(set(starts)) == 1:
-        return None
-    if attention_mask is not None and attention_mask.ndim == 2 and int(attention_mask.shape[1]) >= length:
-        offsets = (attention_mask[:, -length:].to("cpu", torch.long).cumsum(dim=-1) - 1).clamp(min=0)
-    else:
-        offsets = torch.arange(length).expand(batch, -1)
-    positions = torch.tensor(starts).view(batch, 1) + offsets
-    rope_deltas = getattr(cache, "rope_deltas", None)
-    if rope_deltas is not None and int(rope_deltas.shape[0]) == batch:
-        positions = positions + rope_deltas.reshape(batch, -1)[:, :1].to("cpu", torch.long)
-    return positions
-
-
 class MobilintQwen3VLTextModel(MobilintModelMixin, MobilintGenerationMixin, MobilintQwen3VLPreTrainedModel):
     config: MobilintQwen3VLTextConfig
     input_modalities = ("text",)
@@ -1332,10 +1294,6 @@ class MobilintQwen3VLTextModel(MobilintModelMixin, MobilintGenerationMixin, Mobi
 
         if self._uses_rope_input:
             # the hard coded `3` is for temporal, height and width.
-            if position_ids is None:
-                position_ids = _row_text_position_ids(
-                    past_key_values, attention_mask, int(inputs_embeds.shape[0]), int(inputs_embeds.shape[1])
-                )
             if position_ids is None:
                 position_ids = cache_position.view(1, 1, -1).expand(3, inputs_embeds.shape[0], -1)
             elif position_ids.ndim == 2:
@@ -2065,30 +2023,6 @@ class MobilintQwen3VLForConditionalGeneration(
             model_inputs["npu_prefill_chunk_size"] = npu_prefill_chunk_size
         return model_inputs
 
-    @staticmethod
-    def _row_position_ids(cache: Any, kwargs: dict[str, Any]) -> Optional[torch.Tensor]:
-        """M-RoPE positions ``(3, batch, seq)`` for a batch whose rows hold different numbers of tokens, else None.
-
-        Upstream would give every row the same start (see :func:`_row_text_position_ids`). Text continues each row
-        from its own cache; a prompt with image or video tokens in such a batch needs the caller's ``position_ids``.
-        """
-        reference = kwargs.get("inputs_embeds")
-        if reference is None:
-            reference = kwargs.get("input_ids")
-        if reference is None:
-            return None
-        positions = _row_text_position_ids(
-            cache, kwargs.get("attention_mask"), int(reference.shape[0]), int(reference.shape[1])
-        )
-        if positions is None:
-            return None
-        if any(kwargs.get(name) is not None for name in _VISION_INPUTS):
-            raise ValueError(
-                "The batch rows hold different numbers of cached tokens and the inputs carry images or videos: pass "
-                "position_ids (the M-RoPE positions of each row) so every row's image tokens get their own positions."
-            )
-        return positions.unsqueeze(0).expand(3, -1, -1).to(reference.device)
-
     @with_mobilint_generation_signature(Qwen3VLForConditionalGeneration.forward, "count_npu_time")
     @can_return_tuple
     def forward(
@@ -2148,11 +2082,9 @@ class MobilintQwen3VLForConditionalGeneration(
         loss_only_kwargs = pop_loss_only_kwargs(kwargs)
 
         cache = kwargs.get("past_key_values")
-        if kwargs.get("position_ids") is None and getattr(
-            getattr(self.model, "language_model", None), "_uses_rope_input", True
-        ):
-            # Only a text MXQ that takes RoPE as an input reads positions; a static one keeps its own.
-            kwargs["position_ids"] = self._row_position_ids(cache, kwargs)
+        if getattr(getattr(self.model, "language_model", None), "_uses_rope_input", False):
+            # A text MXQ that takes RoPE as an input reads the positions; a static one keeps its own.
+            require_positions_for_joined_rows(cache, kwargs.get("position_ids"))
         with cache_rope_deltas(self.model, cache) as keep:
             outputs = self.model(
                 logits_to_keep=logits_to_keep,

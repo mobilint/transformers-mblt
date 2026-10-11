@@ -781,7 +781,11 @@ def test_cache_displaced_by_a_second_restore_snapshots_its_own_kv(tmp_path) -> N
 # Joining request caches into one batch (MobilintCache.from_rows)
 # ----------------------------------------------------------------------
 
-from transformers_mblt.utils.cache_utils import MobilintBeamCache, MobilintDeepStackCache  # noqa: E402
+from transformers_mblt.utils.cache_utils import (  # noqa: E402
+    MobilintBeamCache,
+    MobilintDeepStackCache,
+    require_positions_for_joined_rows,
+)
 
 
 def _request(backend, slot, **kwargs):
@@ -829,59 +833,21 @@ def test_from_rows_restores_a_request_whose_slot_another_cache_took() -> None:
     assert backend.mxq_models[0].calls == [("dump", 0), ("load", 0)]
 
 
-def test_from_rows_gathers_rope_deltas_row_by_row() -> None:
+def test_from_rows_batch_carries_no_rope_deltas_and_asks_for_positions() -> None:
     backend = _Backend(k=2)
     a, b = _request(backend, (0, 0)), _request(backend, (0, 1))
-    assert MobilintCache.from_rows([a, b]).rope_deltas is None  # both empty: nothing to offset
-
     a.rope_deltas = torch.tensor([[-182]])
-    batch = MobilintCache.from_rows([a, b])
-    assert batch.rope_deltas.tolist() == [[-182], [0]]  # b is empty: its prompt will start at 0
-    assert not batch.rope_deltas_unknown
-
-
-@pytest.mark.parametrize("other_offset", [None, [[-182]]], ids=["no-row-knows", "another-row-knows"])
-def test_from_rows_keeps_an_unknown_offset_unknown(other_offset) -> None:
-    backend = _Backend(k=2)
-    other, restored = _request(backend, (0, 0)), _request(backend, (0, 1))
-    other.set_seq_length(3)
-    other.rope_deltas = None if other_offset is None else torch.tensor(other_offset)
-    restored.set_seq_length(5)  # holds tokens, but its files carried no rope_deltas.json
-
-    batch = MobilintCache.from_rows([other, restored])
-
-    assert batch.rope_deltas is None
-    assert batch.rope_deltas_unknown
-
-
-def test_unknown_offsets_follow_copy_and_clear_on_reset_or_fake_prefill() -> None:
-    backend = _Backend(k=2)
-    a, b = _request(backend, (0, 0)), _request(backend, (0, 1))
-    a.set_seq_length(3)
+    empty = MobilintCache.from_rows([_request(backend, (0, 0)), _request(backend, (0, 1))])
+    a.set_seq_length(5)
     batch = MobilintCache.from_rows([a, b])
 
-    assert batch.copy().rope_deltas_unknown
-    batch.fake_prefill(8)
-    assert not batch.rope_deltas_unknown
-    batch = MobilintCache.from_rows([a, b])
-    batch.reset()
-    assert not batch.rope_deltas_unknown
-
-
-def test_fake_prefilling_the_unknown_rows_brings_the_known_offsets_back() -> None:
-    backend = _Backend(k=3)
-    known, unknown, empty = _request(backend, (0, 0)), _request(backend, (0, 1)), _request(backend, (0, 2))
-    known.set_seq_length(4)
-    known.rope_deltas = torch.tensor([[-6]])
-    unknown.set_seq_length(5)
-    batch = MobilintCache.from_rows([known, unknown, empty])
-
-    batch.fake_prefill({2: 3})  # an untouched unknown row keeps the batch unknown
-    assert batch.rope_deltas_unknown and batch.rope_deltas is None
-
-    batch.fake_prefill({1: 5})
-    assert not batch.rope_deltas_unknown
-    assert batch.rope_deltas.tolist() == [[-6], [0], [0]]
+    assert batch.joined_rows and batch.copy().joined_rows and not a.joined_rows
+    assert batch.rope_deltas is None  # the rows' offsets are not combined into one
+    with pytest.raises(ValueError, match="pass position_ids"):
+        require_positions_for_joined_rows(batch, None)
+    require_positions_for_joined_rows(batch, torch.zeros(3, 2, 1))
+    require_positions_for_joined_rows(empty, None)  # nothing cached yet: every row starts at 0
+    require_positions_for_joined_rows(a, None)  # a request's own cache keeps upstream's positions
 
 
 def test_from_rows_keeps_the_deepstack_cache_type() -> None:
