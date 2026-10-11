@@ -544,7 +544,9 @@ class MobilintCache(Cache):
 
     def dump_cache_memory_to(self, cache_dir: str, index: int = 0):
         self.layers[index].dump_cache_memory_to(cache_dir)
-        row = None if self.rope_deltas is None else self.rope_deltas[index].tolist()
+        # Rows past the active batch have no offset: saved as unknown, restored as empty rows.
+        has_row = self.rope_deltas is not None and index < int(self.rope_deltas.shape[0])
+        row = self.rope_deltas[index].tolist() if has_row else None
         (Path(cache_dir) / self._ROPE_DELTAS_FILE).write_text(json.dumps({"rope_deltas": row}), encoding="utf-8")
 
     def load_cache_memory_from(self, cache_dir: str, index: int = 0):
@@ -558,16 +560,17 @@ class MobilintCache(Cache):
         if row is None:
             # This row holds tokens whose offset was not saved: recomputed from the full input instead of guessed.
             self.rope_deltas = None
-        elif self.rope_deltas is not None and self.rope_deltas.shape[0] == self.batch_size:
-            self.rope_deltas = self.rope_deltas.clone()
-            self.rope_deltas[index] = torch.tensor(row, dtype=self.rope_deltas.dtype)
-        elif all(layer.get_seq_length() == 0 for i, layer in enumerate(self.layers) if i != index):
-            # The other rows hold nothing yet; their next prompt recomputes the offset for the batch.
-            self.rope_deltas = torch.zeros((self.batch_size, len(row)), dtype=torch.long)
-            self.rope_deltas[index] = torch.tensor(row, dtype=torch.long)
-        else:
-            # Other rows hold tokens with unknown offsets: leave the whole batch to be recomputed.
+            return
+        known = 0 if self.rope_deltas is None else int(self.rope_deltas.shape[0])
+        # Rows that gain an offset of 0 here must hold nothing yet; their next prompt computes the real one.
+        if not all(self.layers[i].get_seq_length() == 0 for i in range(known, self.batch_size) if i != index):
             self.rope_deltas = None
+            return
+        rope_deltas = torch.zeros((self.batch_size, len(row)), dtype=torch.long)
+        if known:
+            rope_deltas[:known] = self.rope_deltas
+        rope_deltas[index] = torch.tensor(row, dtype=torch.long)
+        self.rope_deltas = rope_deltas
 
     def reset(self) -> None:
         """Reset all cache entries in this Mobilint cache."""

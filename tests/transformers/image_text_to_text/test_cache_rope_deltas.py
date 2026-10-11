@@ -215,6 +215,21 @@ def test_restoring_an_empty_row_keeps_the_offset_of_a_filled_one(tmp_path) -> No
     assert restored.rope_deltas.tolist() == [[-3], [0]]
 
 
+def test_rows_past_the_active_batch_save_and_restore_as_empty(tmp_path) -> None:
+    cache = MobilintCache(_FileMxq(), per_model_batch=3)
+    cache.update_seen_tokens({0: 5})
+    cache.rope_deltas = torch.tensor([[-3]])  # one active row in a cache with room for three
+    for row in range(3):
+        (tmp_path / str(row)).mkdir()
+        cache.dump_cache_memory_to(str(tmp_path / str(row)), index=row)
+
+    restored = MobilintCache(_FileMxq(), per_model_batch=3)
+    for row in range(3):
+        restored.load_cache_memory_from(str(tmp_path / str(row)), index=row)
+
+    assert restored.rope_deltas.tolist() == [[-3], [0], [0]]
+
+
 def test_files_keep_the_offset(tmp_path) -> None:
     cache = MobilintCache(_FileMxq())
     cache.update_seen_tokens(5)
