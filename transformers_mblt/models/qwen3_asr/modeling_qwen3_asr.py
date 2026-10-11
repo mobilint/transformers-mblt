@@ -643,7 +643,7 @@ class MobilintQwen3ASRThinkerForConditionalGeneration(
             count_npu_time=count_npu_time,
             **kwargs,
         )
-        keep_cache_rope_deltas(self, past_key_values)
+        keep_cache_rope_deltas(self, past_key_values if past_key_values is not None else outputs.past_key_values)
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
         if isinstance(logits, torch.Tensor) and logits.ndim == 4 and int(logits.shape[1]) == 1:

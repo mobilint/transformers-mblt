@@ -31,8 +31,10 @@ class _PromptModel:
         positions = torch.arange(input_ids.shape[1]).view(1, 1, -1).expand(3, 1, -1) + delta
         return positions, torch.tensor([[delta]])
 
-    def __call__(self, *, past_key_values, input_ids, **kwargs):
+    def __call__(self, *, input_ids, past_key_values=None, **kwargs):
         del kwargs
+        if past_key_values is None:  # like the text model, build a cache and return it
+            past_key_values = MobilintCache(object())
         if past_key_values.get_seq_length() == 0:
             _, self.rope_deltas = self.get_rope_index(input_ids)
         self.seen.append(None if self.rope_deltas is None else int(self.rope_deltas))
@@ -134,14 +136,54 @@ def test_copy_and_reset_carry_the_offset(make) -> None:
     assert copied.rope_deltas is None
 
 
+class _FileMxq:
+    def dump_cache_memory_to(self, cache_dir, cache_id=0):
+        del cache_dir, cache_id
+
+    def load_cache_memory_from(self, cache_dir, cache_id=0):
+        del cache_dir, cache_id
+
+
+@pytest.mark.parametrize("cls", [MobilintQwen2VLForConditionalGeneration, MobilintQwen3VLForConditionalGeneration])
+def test_a_forward_without_a_cache_keeps_the_offset_on_the_cache_it_returns(cls) -> None:
+    wrapper = _wrapper(cls)
+
+    built = wrapper.forward(input_ids=_ids(5)).past_key_values
+    wrapper.forward(input_ids=_ids(7), past_key_values=MobilintCache(object()))
+    wrapper.forward(input_ids=_ids(1), past_key_values=built)
+
+    assert built.rope_deltas.tolist() == [[-3]] and wrapper.model.seen[-1] == -3
+
+
+def test_batched_files_keep_each_row_offset(tmp_path) -> None:
+    cache = MobilintCache(_FileMxq(), per_model_batch=2)
+    cache.update_seen_tokens({0: 5, 1: 7})
+    cache.rope_deltas = torch.tensor([[-3], [-11]])
+    for row in (0, 1):
+        (tmp_path / str(row)).mkdir()
+        cache.dump_cache_memory_to(str(tmp_path / str(row)), index=row)
+
+    restored = MobilintCache(_FileMxq(), per_model_batch=2)
+    for row in (0, 1):
+        restored.load_cache_memory_from(str(tmp_path / str(row)), index=row)
+
+    assert restored.rope_deltas.tolist() == [[-3], [-11]]
+
+
+def test_a_row_restored_next_to_a_filled_row_of_unknown_offset_recomputes(tmp_path) -> None:
+    cache = MobilintCache(_FileMxq(), per_model_batch=2)
+    cache.update_seen_tokens({0: 5})
+    cache.rope_deltas = torch.tensor([[-3], [0]])
+    cache.dump_cache_memory_to(str(tmp_path), index=0)
+
+    restored = MobilintCache(_FileMxq(), per_model_batch=2)
+    restored.update_seen_tokens({1: 4})  # row 1 holds a sequence whose offset nobody recorded
+    restored.load_cache_memory_from(str(tmp_path), index=0)
+
+    assert restored.rope_deltas is None
+
+
 def test_files_keep_the_offset(tmp_path) -> None:
-    class _FileMxq:
-        def dump_cache_memory_to(self, cache_dir, cache_id=0):
-            del cache_dir, cache_id
-
-        def load_cache_memory_from(self, cache_dir, cache_id=0):
-            del cache_dir, cache_id
-
     cache = MobilintCache(_FileMxq())
     cache.update_seen_tokens(5)
     cache.rope_deltas = torch.tensor([[-3]])

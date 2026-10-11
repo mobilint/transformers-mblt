@@ -551,10 +551,16 @@ class MobilintCache(Cache):
         self.layers[index].load_cache_memory_from(cache_dir)
         rope_path = Path(cache_dir) / self._ROPE_DELTAS_FILE
         row = json.loads(rope_path.read_text(encoding="utf-8")).get("rope_deltas") if rope_path.exists() else None
-        if row is not None and self.batch_size == 1:
-            self.rope_deltas = torch.tensor([row], dtype=torch.long)
+        others_empty = all(layer.get_seq_length() == 0 for i, layer in enumerate(self.layers) if i != index)
+        if row is not None and self.rope_deltas is not None and self.rope_deltas.shape[0] == self.batch_size:
+            self.rope_deltas = self.rope_deltas.clone()
+            self.rope_deltas[index] = torch.tensor(row, dtype=self.rope_deltas.dtype)
+        elif row is not None and others_empty:
+            # The other rows hold nothing yet; their next prompt recomputes the offset for the batch.
+            self.rope_deltas = torch.zeros((self.batch_size, len(row)), dtype=torch.long)
+            self.rope_deltas[index] = torch.tensor(row, dtype=torch.long)
         else:
-            # Unknown, or one row of several whose offsets the file does not hold: recomputed from the next prompt.
+            # Unknown for this row, or for other filled rows: recomputed from the full input instead of guessed.
             self.rope_deltas = None
 
     def reset(self) -> None:

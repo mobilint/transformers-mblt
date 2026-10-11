@@ -658,7 +658,8 @@ class MobilintQwen2VLForConditionalGeneration(
             count_npu_time=count_npu_time,
             **kwargs,
         )
-        keep_cache_rope_deltas(self.model, cache)
+        # A forward without a cache returns the one the text model built: the offset goes there.
+        keep_cache_rope_deltas(self.model, cache if cache is not None else outputs.past_key_values)
 
         # The Mobilint text decoder already returns logits sliced to the requested
         # positions and ``self.lm_head`` is ``nn.Identity``, so skip the upstream
