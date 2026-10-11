@@ -1,5 +1,6 @@
 import dataclasses
 import inspect
+import threading
 from abc import ABC
 from functools import lru_cache, wraps
 from typing import Any, Callable, Dict, Mapping, MutableMapping, Optional, cast
@@ -19,6 +20,7 @@ from ..utils.cache_utils import (
     MobilintMixtureOfExpertsCache,
     build_mobilint_cache_from_model,
     cache_matches_backend_topology,
+    cache_rope_deltas,
     defer_eagle3_accept_tokens,
     note_eagle3_fed_tokens,
     take_eagle3_unfed_tokens,
@@ -416,6 +418,44 @@ def with_mobilint_generation_signature(wrapped: Callable, *extra_keyword_names: 
         return wrapper
 
     return decorator
+
+
+class MobilintCacheRopeDeltasMixin:
+    """Keep upstream Qwen-VL ``rope_deltas`` with the cache passed to ``generate()``, not on ``self.model``.
+
+    Upstream continues a generation from a non-empty cache by adding ``self.model.rope_deltas`` to the text
+    positions. That attribute holds the offset of whichever sequence ran last, so a conversation resumed after
+    another one would get the other one's positions. Mix in before the upstream ``*ForConditionalGeneration``.
+    """
+
+    def _prepare_position_ids_for_generation(self, inputs_tensor, model_kwargs):
+        cache = model_kwargs.get("past_key_values")
+        with cache_rope_deltas(self.model, cache) as keep:
+            if self.model.rope_deltas is not None:
+                # Upstream adds the offset to positions built on the input device; a restored one is on the host.
+                self.model.rope_deltas = self.model.rope_deltas.to(inputs_tensor.device)
+            position_ids = super()._prepare_position_ids_for_generation(inputs_tensor, model_kwargs)  # type: ignore[misc]
+            keep(cache)
+            prompt_rope_deltas = self.model.rope_deltas
+        # Without a cache, generate() builds one after this; hand it the prompt's offset on this thread rather than
+        # through the shared model attribute another request may change in between.
+        self._pending_rope_deltas().value = prompt_rope_deltas if cache is None else None
+        return position_ids
+
+    def _prepare_cache_for_generation(self, generation_config, model_kwargs, *args, **kwargs):
+        result = super()._prepare_cache_for_generation(generation_config, model_kwargs, *args, **kwargs)  # type: ignore[misc]
+        pending = self._pending_rope_deltas()
+        cache = model_kwargs.get("past_key_values")
+        if getattr(pending, "value", None) is not None and cache is not None:
+            cache.rope_deltas = pending.value
+        pending.value = None
+        return result
+
+    def _pending_rope_deltas(self) -> threading.local:
+        pending = self.__dict__.get("_mobilint_pending_rope_deltas")
+        if pending is None:
+            pending = self.__dict__["_mobilint_pending_rope_deltas"] = threading.local()
+        return pending
 
 
 class MobilintGenerationMixin(ABC, GenerationMixin):

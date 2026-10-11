@@ -197,3 +197,30 @@ def test_rotary_embedding_forward_builds_lazy_on_first_call() -> None:
 
     assert emb.position_table is not None
     assert result.shape == (1, 8, emb.peSize)
+
+
+def test_single_axis_positions_from_a_continued_generation_feed_all_three_axes() -> None:
+    """Upstream continues ``generate()`` from a filled cache with ``(1, batch, seq)`` text positions + rope_deltas."""
+    from transformers_mblt.utils.cache_utils import MobilintCache
+
+    model = MobilintQwen3VLTextModel.__new__(MobilintQwen3VLTextModel)
+    nn.Module.__init__(model)
+    model.config = _minimal_text_config()
+    model._uses_rope_input = True
+    model._set_runtime_rotary_embedding(model.config)
+    model.resolve_batched_attention_mask = lambda inputs_embeds, attention_mask: attention_mask
+    received = {}
+
+    def llm_forward(**kwargs):
+        received.update(kwargs)
+        return torch.zeros(1, 1, 4)
+
+    model.llm_forward = llm_forward
+    cache = MobilintCache(object())
+    cache.update_seen_tokens(7)
+    inputs_embeds = torch.zeros(1, 2, model.config.hidden_size)
+
+    model.forward(inputs_embeds=inputs_embeds, position_ids=torch.tensor([[[5, 6]]]), past_key_values=cache)
+
+    expected = model._mobilint_rotary_emb(inputs_embeds, torch.tensor([[[5, 6]]]).expand(3, -1, -1))
+    assert np.array_equal(np.asarray(received["position_embeddings"]), np.asarray(expected))

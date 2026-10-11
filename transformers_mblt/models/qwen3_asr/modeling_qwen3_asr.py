@@ -16,7 +16,7 @@ from transformers.processing_utils import Unpack
 from transformers.utils.generic import TransformersKwargs, logging
 
 from ...utils.base_utils import PretrainedOnlyMixin
-from ...utils.cache_utils import MobilintBeamCache, MobilintCache
+from ...utils.cache_utils import MobilintBeamCache, MobilintCache, cache_rope_deltas
 from ...utils.generation_utils import MobilintGenerationMixin
 from ...utils.modeling_utils import MobilintModelMixin
 from ._errors import guard_qwen_asr_import
@@ -613,35 +613,40 @@ class MobilintQwen3ASRThinkerForConditionalGeneration(
         else:
             audio_feature_lengths = None
 
-        if attention_mask is not None and position_ids is None:
-            if (
-                cache_position is None
-                or (cache_position is not None and cache_position[0] == 0)
-                or self.rope_deltas is None
-            ):
-                delta0 = (1 - attention_mask).sum(dim=-1).unsqueeze(1)
-                position_ids, rope_deltas = self.get_rope_index(attention_mask)
-                rope_deltas = rope_deltas - delta0
-                self.rope_deltas = rope_deltas
-            else:
-                batch_size, seq_length = input_ids.shape
-                delta = cache_position[0] + self.rope_deltas if cache_position is not None else 0
-                position_ids = torch.arange(seq_length, device=input_ids.device)
-                position_ids = position_ids.view(1, -1).expand(batch_size, -1)
-                position_ids = position_ids.add(delta)
-                position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
+        with cache_rope_deltas(self, past_key_values) as keep:
+            if attention_mask is not None and position_ids is None:
+                if (
+                    cache_position is None
+                    or (cache_position is not None and cache_position[0] == 0)
+                    or self.rope_deltas is None
+                ):
+                    delta0 = (1 - attention_mask).sum(dim=-1).unsqueeze(1)
+                    position_ids, rope_deltas = self.get_rope_index(attention_mask)
+                    rope_deltas = rope_deltas - delta0
+                    self.rope_deltas = rope_deltas
+                else:
+                    batch_size, seq_length = input_ids.shape
+                    # A restored cache keeps its offset on the host; the positions live on the input device.
+                    rope_deltas = self.rope_deltas.to(input_ids.device)
+                    delta = cache_position[0] + rope_deltas if cache_position is not None else 0
+                    position_ids = torch.arange(seq_length, device=input_ids.device)
+                    position_ids = position_ids.view(1, -1).expand(batch_size, -1)
+                    position_ids = position_ids.add(delta)
+                    position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
 
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            count_npu_time=count_npu_time,
-            **kwargs,
-        )
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                count_npu_time=count_npu_time,
+                **kwargs,
+            )
+            keep(past_key_values if past_key_values is not None else outputs.past_key_values)
+            request_rope_deltas = self.rope_deltas
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
         if isinstance(logits, torch.Tensor) and logits.ndim == 4 and int(logits.shape[1]) == 1:
@@ -657,7 +662,7 @@ class MobilintQwen3ASRThinkerForConditionalGeneration(
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             past_key_values=outputs.past_key_values,
-            rope_deltas=self.rope_deltas,
+            rope_deltas=request_rope_deltas,
         )
         if not return_dict:
             return output.to_tuple()

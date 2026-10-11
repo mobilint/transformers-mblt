@@ -24,8 +24,10 @@ from ...utils.cache_utils import (
     MobilintDeepStackCache,
     build_mobilint_cache_from_model,
     cache_matches_backend_topology,
+    cache_rope_deltas,
 )
 from ...utils.generation_utils import (
+    MobilintCacheRopeDeltasMixin,
     MobilintGenerationMixin,
     build_loss_kwargs_dynamic,
     mirror_output_fields,
@@ -1295,6 +1297,10 @@ class MobilintQwen3VLTextModel(MobilintModelMixin, MobilintGenerationMixin, Mobi
                 position_ids = cache_position.view(1, 1, -1).expand(3, inputs_embeds.shape[0], -1)
             elif position_ids.ndim == 2:
                 position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
+            elif position_ids.ndim == 3 and position_ids.shape[0] == 1:
+                # Upstream continues a generation from a filled cache with text positions + rope_deltas, one axis
+                # for all three (temporal, height, width).
+                position_ids = position_ids.expand(3, -1, -1)
 
             if position_ids.ndim == 3 and position_ids.shape[0] == 4:
                 position_ids = position_ids[1:]
@@ -1930,6 +1936,7 @@ class MobilintQwen3VLModel(PretrainedOnlyMixin, MobilintQwen3VLPreTrainedModel, 
 class MobilintQwen3VLForConditionalGeneration(
     PretrainedOnlyMixin,
     MobilintQwen3VLPreTrainedModel,
+    MobilintCacheRopeDeltasMixin,
     MobilintGenerationMixin,
     Qwen3VLForConditionalGeneration,
 ):
@@ -2073,11 +2080,15 @@ class MobilintQwen3VLForConditionalGeneration(
         # through. Keeps parity with the Qwen2-VL wrapper.
         loss_only_kwargs = pop_loss_only_kwargs(kwargs)
 
-        outputs = self.model(
-            logits_to_keep=logits_to_keep,
-            count_npu_time=count_npu_time,
-            **kwargs,
-        )
+        cache = kwargs.get("past_key_values")
+        with cache_rope_deltas(self.model, cache) as keep:
+            outputs = self.model(
+                logits_to_keep=logits_to_keep,
+                count_npu_time=count_npu_time,
+                **kwargs,
+            )
+            # A forward without a cache returns the one the text model built: the offset goes there.
+            keep(cache if cache is not None else outputs.past_key_values)
 
         # The Mobilint text decoder already returns logits sliced to the requested
         # positions and ``self.lm_head`` is ``nn.Identity``, so skip the upstream

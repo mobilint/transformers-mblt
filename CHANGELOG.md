@@ -37,6 +37,12 @@
   other's KV. A replay that fails midway keeps only the shared prefix as the slot's history. The Whisper cacheless
   chunked prefill and the shared encoder-decoder `decoder_forward` (BLIP text) also go through the owner table.
   `MobilintBeamCache` gains `offload()`, `is_resident` and `host_nbytes` (always 0).
+- Portable caches, part 5 (M-RoPE offsets). Qwen2-VL, Qwen3-VL and Qwen3-ASR keep `rope_deltas` on the cache
+  (`MobilintCache.rope_deltas`) instead of only on the model. Upstream reads `model.rope_deltas` when a generation
+  continues from a filled cache, and that attribute holds the offset of whichever conversation ran last, so an image
+  conversation resumed after another conversation got the wrong text positions. `copy()` and
+  `dump_cache_memory_to()` keep the offset; `reset()` clears it. A filled cache without one (older files) recomputes
+  it from the full input instead of borrowing another conversation's.
 
 ### Changed
 
@@ -47,6 +53,9 @@
 
 ### Fixed
 
+- Qwen3-VL (and dynamic Qwen2-VL) `generate()` continuing from a filled cache raised `IndexError` in the external
+  RoPE: upstream passes `(1, batch, seq)` text positions there, which the text model now expands to the three M-RoPE
+  axes.
 - EAGLE-3 generation with a delta-only follow-up (only the new tokens as `input_ids`, with a reused cache) produced
   garbage: tree decoding placed the tree at RoPE positions derived from the input length instead of the cached
   prefix, and each decode step derived the draft's input from that short history. Positions now come from the cache,
