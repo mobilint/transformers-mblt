@@ -2,7 +2,20 @@
 
 ## Unreleased
 
+### Added
+
+- `MobilintCache.from_rows(caches)` joins one-row request caches into a batch cache whose rows are the requests'
+  own rows, shared rather than copied. A serving engine that keeps one cache per request can run a step's requests
+  through the standard batched forward (`attention_mask` plus `past_key_values=MobilintCache.from_rows(...)`); each
+  request continues from its own length on its own slot, and its cache advances with the forward. Subclasses such as
+  `MobilintDeepStackCache` keep their type.
+
 ### Changed
+
+- Qwen2-VL and Qwen3-VL with an external-RoPE text MXQ refuse a `from_rows` batch that holds tokens unless
+  `position_ids` are passed: each row continues from its own length and M-RoPE offset, which upstream's positions
+  (one start for the batch, one offset on the model) cannot express. The batch carries no `rope_deltas`. Qwen2-VL
+  external-RoPE MXQs run one sequence at a time, so they refuse a joined batch of more than one row outright.
 
 - A cache that loses its NPU slot is no longer dumped again when its host copy already matches every cached position
   (it was just `copy()`-ed or `dump_cache_memory()`-ed and no infer wrote since). Snapshotting a cache and then

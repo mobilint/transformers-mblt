@@ -408,6 +408,8 @@ class MobilintCache(Cache):
         # M-RoPE offset per row (Qwen2-VL, Qwen3-VL, Qwen3-ASR): text position minus cache position after the
         # prompt. It belongs to the sequence in this cache, not to the model, so two conversations can alternate.
         self.rope_deltas: Optional[torch.Tensor] = None
+        # Whether the rows were joined from request caches by ``from_rows`` (see there).
+        self.joined_rows = False
 
     @property
     def batch_size(self) -> int:
@@ -625,6 +627,49 @@ class MobilintCache(Cache):
         self.batch_size = batch_size
         self.k_per_model = batch_size
 
+    @classmethod
+    def from_rows(cls, caches: Sequence["MobilintCache"]) -> "MobilintCache":
+        """Return a batch cache whose row ``i`` is ``caches[i]``'s only row, shared rather than copied.
+
+        A serving engine keeps one cache per request and runs the requests of a step together: pass the view to a
+        batched forward (with an ``attention_mask``) and every request's cache advances by its own row, each from its
+        own length. The rows keep their slots, so the requests must sit on distinct slots of the same backend.
+
+        The view carries no ``rope_deltas``: an M-RoPE model cannot tell from the rows where each one's positions
+        continue, so it needs the caller's ``position_ids`` for a view that holds tokens
+        (:func:`require_positions_for_joined_rows`).
+        """
+        caches = list(caches)
+        if not caches:
+            raise ValueError("from_rows needs at least one cache")
+        first = caches[0]
+        if not isinstance(first, cls):
+            raise TypeError(f"{cls.__name__}.from_rows got a {type(first).__name__}")
+        for cache in caches:
+            if type(cache) is not type(first) or isinstance(cache, MobilintBeamCache):
+                raise TypeError(
+                    f"from_rows joins caches of one type that move KV through the owner table; got "
+                    f"{type(first).__name__} and {type(cache).__name__}"
+                )
+            if len(cache.layers) != 1:
+                raise ValueError(f"from_rows joins one-row caches; got a cache with {len(cache.layers)} rows")
+            if (
+                cache.k_per_model != first.k_per_model
+                or len(cache.mxq_models) != len(first.mxq_models)
+                or any(mine is not theirs for mine, theirs in zip(cache.mxq_models, first.mxq_models))
+            ):
+                raise ValueError(
+                    "from_rows joins caches of one backend; move the others first with adopt_backend(backend)"
+                )
+        view = first._empty_like([cache.slot_of(0) for cache in caches])
+        view.layers = [cache.layers[0] for cache in caches]
+        view.joined_rows = True
+        return view
+
+    def _empty_like(self, slots: Sequence[Tuple[int, int]]) -> "MobilintCache":
+        """An empty cache of this type on the same backend, with rows on ``slots``."""
+        return MobilintCache(list(self.mxq_models), per_model_batch=self.k_per_model, slots=slots)
+
     def copy(self):
         """Return an independent snapshot; resident rows save their KV first (see :meth:`MobilintLayer.copy`)."""
         copied = MobilintCache(list(self.mxq_models), per_model_batch=self.k_per_model)
@@ -633,7 +678,21 @@ class MobilintCache(Cache):
         copied._batch_size = self._batch_size
         copied.layers = [layer.copy() for layer in self.layers]
         copied.rope_deltas = copy_rope_deltas(self)
+        copied.joined_rows = self.joined_rows
         return copied
+
+
+def require_positions_for_joined_rows(cache: Any, position_ids: Optional[torch.Tensor]) -> None:
+    """Refuse an M-RoPE forward over a :meth:`MobilintCache.from_rows` batch that holds tokens without ``position_ids``.
+
+    Each row continues from its own length and its own M-RoPE offset, which the view does not carry, so upstream's
+    positions (one start for the batch, one offset on the model) would be wrong for some rows.
+    """
+    if position_ids is None and getattr(cache, "joined_rows", False) and _cache_holds_tokens(cache):
+        raise ValueError(
+            "This batch was joined from request caches with MobilintCache.from_rows: pass position_ids (each row's "
+            "M-RoPE positions, continuing from its own cached tokens)."
+        )
 
 
 def copy_rope_deltas(cache: Any) -> Optional[torch.Tensor]:
@@ -1324,6 +1383,15 @@ class MobilintDeepStackCache(MobilintCache):
             device=device,
         )
 
+    def _empty_like(self, slots: Sequence[Tuple[int, int]]) -> "MobilintDeepStackCache":
+        return MobilintDeepStackCache(
+            list(self.mxq_models),
+            per_model_batch=self.k_per_model,
+            num_deepstack_layers=self.num_deepstack_layers,
+            hidden_size=self.hidden_size,
+            slots=slots,
+        )
+
     def copy(self) -> "MobilintDeepStackCache":
         """Return a copy preserving KV state and the current deepstack tensor."""
         copied = MobilintDeepStackCache(
@@ -1338,6 +1406,7 @@ class MobilintDeepStackCache(MobilintCache):
         copied.layers = [layer.copy() for layer in self.layers]
         copied._deepstack_tensor = None if self._deepstack_tensor is None else self._deepstack_tensor.clone()
         copied.rope_deltas = copy_rope_deltas(self)
+        copied.joined_rows = self.joined_rows
         return copied
 
 

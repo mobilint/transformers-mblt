@@ -775,3 +775,107 @@ def test_cache_displaced_by_a_second_restore_snapshots_its_own_kv(tmp_path) -> N
     assert _slot(backend) == "second?"
     _run(first, backend, 0, "!")
     assert _slot(backend) == "first!"
+
+
+# ----------------------------------------------------------------------
+# Joining request caches into one batch (MobilintCache.from_rows)
+# ----------------------------------------------------------------------
+
+from transformers_mblt.utils.cache_utils import (  # noqa: E402
+    MobilintBeamCache,
+    MobilintDeepStackCache,
+    require_positions_for_joined_rows,
+)
+
+
+def _request(backend, slot, **kwargs):
+    return MobilintCache(backend.mxq_models, per_model_batch=backend.k_per_model, slots=[slot], **kwargs)
+
+
+def _alone(slot, prefix: list[int], step: list[int]) -> list[float]:
+    """Logits of ``step`` after ``prefix`` for one request running by itself."""
+    backend = _ModelBackend(n=2, k=2)
+    cache = _request(backend, slot)
+    _dispatch(backend, cache, [0], [prefix])
+    return _dispatch(backend, cache, [0], [step])[0].tolist()
+
+
+def test_from_rows_runs_requests_on_their_own_slots_in_one_batch() -> None:
+    backend = _ModelBackend(n=2, k=2)
+    requests = [_request(backend, slot) for slot in ((0, 1), (1, 0), (0, 0))]
+    prefixes = [[1, 2, 3], [4], [5, 6]]
+    for cache, prefix in zip(requests, prefixes):
+        _dispatch(backend, cache, [0], [prefix])
+    steps = [[7], [8, 9], [2]]  # one request decodes while another prefills, each from its own length
+
+    batch = MobilintCache.from_rows(requests)
+    logits = _dispatch(backend, batch, [0, 1, 2], steps)
+
+    assert batch.layers == [cache.layers[0] for cache in requests]
+    assert [batch.slot_of(row) for row in range(3)] == [(0, 1), (1, 0), (0, 0)]
+    assert logits.tolist() == [
+        _alone(slot, prefix, step) for slot, prefix, step in zip(((0, 1), (1, 0), (0, 0)), prefixes, steps)
+    ]
+    assert [cache.get_seq_length() for cache in requests] == [4, 3, 3]
+    assert all(mxq.calls == [] for mxq in backend.mxq_models)
+
+
+def test_from_rows_restores_a_request_whose_slot_another_cache_took() -> None:
+    backend = _ModelBackend(n=1, k=2)
+    a, b = _request(backend, (0, 0)), _request(backend, (0, 1))
+    _dispatch(backend, a, [0], [[1, 2, 3]])
+    _dispatch(backend, b, [0], [[4]])
+    _dispatch(backend, _request(backend, (0, 0)), [0], [[9, 9]])  # another request takes a's slot
+
+    logits = _dispatch(backend, MobilintCache.from_rows([a, b]), [0, 1], [[5], [6]])
+
+    assert logits.tolist() == [_alone((0, 0), [1, 2, 3], [5]), _alone((0, 1), [4], [6])]
+    assert backend.mxq_models[0].calls == [("dump", 0), ("load", 0)]
+
+
+def test_from_rows_batch_carries_no_rope_deltas_and_asks_for_positions() -> None:
+    backend = _Backend(k=2)
+    a, b = _request(backend, (0, 0)), _request(backend, (0, 1))
+    a.rope_deltas = torch.tensor([[-182]])
+    empty = MobilintCache.from_rows([_request(backend, (0, 0)), _request(backend, (0, 1))])
+    a.set_seq_length(5)
+    batch = MobilintCache.from_rows([a, b])
+
+    assert batch.joined_rows and batch.copy().joined_rows and not a.joined_rows
+    assert batch.rope_deltas is None  # the rows' offsets are not combined into one
+    with pytest.raises(ValueError, match="pass position_ids"):
+        require_positions_for_joined_rows(batch, None)
+    require_positions_for_joined_rows(batch, torch.zeros(3, 2, 1))
+    require_positions_for_joined_rows(empty, None)  # nothing cached yet: every row starts at 0
+    require_positions_for_joined_rows(a, None)  # a request's own cache keeps upstream's positions
+
+
+def test_from_rows_keeps_the_deepstack_cache_type() -> None:
+    backend = _Backend(k=2)
+    rows = [
+        MobilintDeepStackCache(backend.mxq_models, per_model_batch=2, num_deepstack_layers=3, hidden_size=4, slots=[s])
+        for s in ((0, 1), (0, 0))
+    ]
+
+    batch = MobilintDeepStackCache.from_rows(rows)
+
+    assert type(batch) is MobilintDeepStackCache
+    assert (batch.num_deepstack_layers, batch.hidden_size, batch.batch_size) == (3, 4, 2)
+
+
+def test_from_rows_rejects_caches_it_cannot_join() -> None:
+    backend, other = _Backend(k=2), _Backend(k=2)
+    a, b = _request(backend, (0, 0)), _request(backend, (0, 1))
+
+    with pytest.raises(ValueError, match="at least one"):
+        MobilintCache.from_rows([])
+    with pytest.raises(ValueError, match="one-row"):
+        MobilintCache.from_rows([a, MobilintCache(backend.mxq_models, per_model_batch=2)])
+    with pytest.raises(ValueError, match="one backend"):
+        MobilintCache.from_rows([a, _request(other, (0, 1))])
+    with pytest.raises(ValueError, match="distinct"):
+        MobilintCache.from_rows([a, _request(backend, (0, 0))])
+    with pytest.raises(TypeError):
+        MobilintCache.from_rows([a, MobilintBeamCache(backend.mxq_models[0])])
+    with pytest.raises(TypeError):
+        MobilintDeepStackCache.from_rows([a, b])
