@@ -1018,15 +1018,15 @@ def _row_text_position_ids(
     offset), which is right only while every row holds the same number of tokens. A batch of requests joined with
     ``MobilintCache.from_rows`` does not. Row ``j`` continues at its cache length plus its ``rope_deltas`` (the
     M-RoPE offset its prompt left), and padding (where ``attention_mask`` is 0) takes no position. ``attention_mask``
-    may cover only the new tokens or the cached ones too; its last ``length`` columns are used. A batch mixing known
-    offsets with unknown ones raises rather than guess.
+    may cover only the new tokens or the cached ones too; its last ``length`` columns are used. A batch with a row
+    whose offset is unknown (``rope_deltas_unknown``) raises rather than guess.
     """
     if cache is None or batch <= 1 or len(getattr(cache, "layers", ())) < batch:
         return None
     if getattr(cache, "rope_deltas_unknown", False):
         raise ValueError(
-            "Some batch rows hold tokens whose M-RoPE offset is unknown (for example a cache restored from files saved "
-            "without rope_deltas.json) while other rows have one: pass position_ids for every row."
+            "Some batch rows hold tokens whose M-RoPE offset is unknown (a text conversation, or a cache restored from "
+            "files saved without rope_deltas.json): pass position_ids for every row."
         )
     starts = [int(cache.get_seq_length(row)) for row in range(batch)]
     if len(set(starts)) == 1:

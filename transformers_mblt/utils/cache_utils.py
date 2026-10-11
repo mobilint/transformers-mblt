@@ -408,7 +408,8 @@ class MobilintCache(Cache):
         # M-RoPE offset per row (Qwen2-VL, Qwen3-VL, Qwen3-ASR): text position minus cache position after the
         # prompt. It belongs to the sequence in this cache, not to the model, so two conversations can alternate.
         self.rope_deltas: Optional[torch.Tensor] = None
-        # Set on a from_rows batch whose rows mix known M-RoPE offsets with unknown ones.
+        # Set on a from_rows batch with a row that holds tokens but no M-RoPE offset: its offset is unknown, so
+        # positions cannot be derived from the rows and must come from the caller.
         self.rope_deltas_unknown = False
 
     @property
@@ -534,6 +535,7 @@ class MobilintCache(Cache):
             for layer in self.layers:
                 layer.fake_prefill(sequence_lengths)
             self.rope_deltas = None
+            self.rope_deltas_unknown = False
             return
         for cache_id, seq_len in sequence_lengths.items():
             self.layers[cache_id].fake_prefill(seq_len)
@@ -599,6 +601,7 @@ class MobilintCache(Cache):
         for layer in self.layers:
             layer.reset()
         self.rope_deltas = None
+        self.rope_deltas_unknown = False
 
     def ensure_batch_size(self, batch_size: int) -> None:
         """Grow logical cache entries so batched generation can track each active row.
@@ -635,11 +638,11 @@ class MobilintCache(Cache):
         batched forward (with an ``attention_mask``) and every request's cache advances by its own row, each from its
         own length. The rows keep their slots, so the requests must sit on distinct slots of the same backend.
 
-        ``rope_deltas`` (the M-RoPE offset a prompt with images leaves) is gathered row by row when some row has one;
-        an empty row counts as 0. A row that holds tokens without an offset has an unknown one (a cache restored from
-        files saved without it), so a batch mixing it with known offsets keeps none and asks the forward for
-        ``position_ids`` instead of guessing. An offset the forward computes for a prompt stays on the view: run
-        prompts that need one on the request's own cache, or pass ``position_ids``.
+        ``rope_deltas`` (the M-RoPE offset a prompt with images leaves) is gathered row by row; an empty row counts
+        as 0. A row that holds tokens without an offset has an unknown one: it may be a text conversation, or a
+        cache restored from files saved without it. Such a batch keeps no offsets and sets ``rope_deltas_unknown``,
+        so M-RoPE models ask for ``position_ids`` instead of guessing. An offset the forward computes for a prompt
+        stays on the view: run prompts that need one on the request's own cache, or pass ``position_ids``.
         """
         caches = list(caches)
         if not caches:
@@ -667,14 +670,14 @@ class MobilintCache(Cache):
         view.layers = [cache.layers[0] for cache in caches]
         deltas = [cache.rope_deltas for cache in caches]
         known = next((delta for delta in deltas if delta is not None), None)
-        if known is not None:
-            if any(delta is None and cache.get_seq_length() > 0 for delta, cache in zip(deltas, caches)):
-                view.rope_deltas_unknown = True
-            else:
-                view.rope_deltas = torch.cat(
-                    [torch.zeros_like(known[:1]) if delta is None else delta.reshape(1, -1) for delta in deltas],
-                    dim=0,
-                )
+        if any(cache.rope_deltas_unknown for cache in caches) or any(
+            delta is None and cache.get_seq_length() > 0 for delta, cache in zip(deltas, caches)
+        ):
+            view.rope_deltas_unknown = True
+        elif known is not None:
+            view.rope_deltas = torch.cat(
+                [torch.zeros_like(known[:1]) if delta is None else delta.reshape(1, -1) for delta in deltas], dim=0
+            )
         return view
 
     def _empty_like(self, slots: Sequence[Tuple[int, int]]) -> "MobilintCache":
@@ -689,6 +692,7 @@ class MobilintCache(Cache):
         copied._batch_size = self._batch_size
         copied.layers = [layer.copy() for layer in self.layers]
         copied.rope_deltas = copy_rope_deltas(self)
+        copied.rope_deltas_unknown = self.rope_deltas_unknown
         return copied
 
 
@@ -1237,6 +1241,7 @@ class MobilintBeamCache(MobilintCache):
         copied._active_source_index = self._active_source_index
         copied._beam_seq_lengths = list(self._beam_seq_lengths)
         copied.rope_deltas = copy_rope_deltas(self)
+        copied.rope_deltas_unknown = self.rope_deltas_unknown
         return copied
 
 
@@ -1320,6 +1325,7 @@ class MobilintDeepStackCache(MobilintCache):
             layer.reset()
         self._deepstack_tensor = None
         self.rope_deltas = None
+        self.rope_deltas_unknown = False
 
     def fake_prefill(self, sequence_lengths: Union[dict[int, int], int], index: int = 0) -> None:
         """Mark the cache as fake-prefilled and clear real deepstack payloads."""
@@ -1403,6 +1409,7 @@ class MobilintDeepStackCache(MobilintCache):
         copied.layers = [layer.copy() for layer in self.layers]
         copied._deepstack_tensor = None if self._deepstack_tensor is None else self._deepstack_tensor.clone()
         copied.rope_deltas = copy_rope_deltas(self)
+        copied.rope_deltas_unknown = self.rope_deltas_unknown
         return copied
 
 

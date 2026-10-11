@@ -832,7 +832,7 @@ def test_from_rows_restores_a_request_whose_slot_another_cache_took() -> None:
 def test_from_rows_gathers_rope_deltas_row_by_row() -> None:
     backend = _Backend(k=2)
     a, b = _request(backend, (0, 0)), _request(backend, (0, 1))
-    assert MobilintCache.from_rows([a, b]).rope_deltas is None
+    assert MobilintCache.from_rows([a, b]).rope_deltas is None  # both empty: nothing to offset
 
     a.rope_deltas = torch.tensor([[-182]])
     batch = MobilintCache.from_rows([a, b])
@@ -840,16 +840,32 @@ def test_from_rows_gathers_rope_deltas_row_by_row() -> None:
     assert not batch.rope_deltas_unknown
 
 
-def test_from_rows_keeps_an_unknown_offset_unknown() -> None:
+@pytest.mark.parametrize("other_offset", [None, [[-182]]], ids=["no-row-knows", "another-row-knows"])
+def test_from_rows_keeps_an_unknown_offset_unknown(other_offset) -> None:
     backend = _Backend(k=2)
-    a, restored = _request(backend, (0, 0)), _request(backend, (0, 1))
-    a.rope_deltas = torch.tensor([[-182]])
+    other, restored = _request(backend, (0, 0)), _request(backend, (0, 1))
+    other.set_seq_length(3)
+    other.rope_deltas = None if other_offset is None else torch.tensor(other_offset)
     restored.set_seq_length(5)  # holds tokens, but its files carried no rope_deltas.json
 
-    batch = MobilintCache.from_rows([a, restored])
+    batch = MobilintCache.from_rows([other, restored])
 
     assert batch.rope_deltas is None
     assert batch.rope_deltas_unknown
+
+
+def test_unknown_offsets_follow_copy_and_clear_on_reset_or_fake_prefill() -> None:
+    backend = _Backend(k=2)
+    a, b = _request(backend, (0, 0)), _request(backend, (0, 1))
+    a.set_seq_length(3)
+    batch = MobilintCache.from_rows([a, b])
+
+    assert batch.copy().rope_deltas_unknown
+    batch.fake_prefill(8)
+    assert not batch.rope_deltas_unknown
+    batch = MobilintCache.from_rows([a, b])
+    batch.reset()
+    assert not batch.rope_deltas_unknown
 
 
 def test_from_rows_keeps_the_deepstack_cache_type() -> None:
