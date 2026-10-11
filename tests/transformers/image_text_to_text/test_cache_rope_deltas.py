@@ -302,3 +302,16 @@ def test_fake_prefill_drops_the_offset_of_the_prompt_the_row_held() -> None:
     batched.rope_deltas = torch.tensor([[-3], [-11]])
     batched.fake_prefill({1: 16})
     assert batched.rope_deltas.tolist() == [[-3], [0]]
+
+
+def test_a_restored_offset_follows_the_input_device() -> None:
+    wrapper = _wrapper(MobilintQwen2VLForConditionalGeneration)
+    cache = MobilintCache(object())
+    cache.update_seen_tokens(5)
+    cache.rope_deltas = torch.tensor([[-3]])  # restored from files: on the host
+
+    position_ids = wrapper._prepare_position_ids_for_generation(
+        torch.zeros(1, 6, dtype=torch.long, device="meta"), {"past_key_values": cache}
+    )
+
+    assert position_ids.device.type == "meta"

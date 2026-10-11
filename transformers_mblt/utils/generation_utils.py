@@ -431,6 +431,9 @@ class MobilintCacheRopeDeltasMixin:
     def _prepare_position_ids_for_generation(self, inputs_tensor, model_kwargs):
         cache = model_kwargs.get("past_key_values")
         with cache_rope_deltas(self.model, cache) as keep:
+            if self.model.rope_deltas is not None:
+                # Upstream adds the offset to positions built on the input device; a restored one is on the host.
+                self.model.rope_deltas = self.model.rope_deltas.to(inputs_tensor.device)
             position_ids = super()._prepare_position_ids_for_generation(inputs_tensor, model_kwargs)  # type: ignore[misc]
             keep(cache)
             prompt_rope_deltas = self.model.rope_deltas
