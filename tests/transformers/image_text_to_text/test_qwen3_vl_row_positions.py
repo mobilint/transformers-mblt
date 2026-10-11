@@ -57,7 +57,7 @@ def test_qwen3_vl_text_positions_continue_each_row_from_its_own_length() -> None
     assert _row_text_position_ids(a, None, 1, 3) is None  # one row
 
 
-def _qwen3_vl_wrapper():
+def _qwen3_vl_wrapper(uses_rope_input: bool = True):
     """The public Qwen3-VL model around a stub inner model that records what it was called with."""
     wrapper = MobilintQwen3VLForConditionalGeneration.__new__(MobilintQwen3VLForConditionalGeneration)
     torch.nn.Module.__init__(wrapper)
@@ -65,6 +65,7 @@ def _qwen3_vl_wrapper():
 
     class _Inner:
         rope_deltas = None
+        language_model = SimpleNamespace(_uses_rope_input=uses_rope_input)
 
         def __call__(self, **kwargs):
             calls.append(kwargs)
@@ -138,3 +139,13 @@ def test_qwen3_vl_model_asks_for_positions_for_a_one_row_batch_with_an_unknown_o
 
     with pytest.raises(ValueError, match="offset is unknown"):
         wrapper(inputs_embeds=torch.zeros(1, 1, 1), past_key_values=MobilintCache.from_rows([restored]))
+
+
+def test_qwen3_vl_static_text_mxq_does_not_need_row_positions() -> None:
+    restored = _request(_Backend(k=2), (0, 1))
+    restored.set_seq_length(10)  # unknown offset, but a static text MXQ never reads positions
+    wrapper, calls = _qwen3_vl_wrapper(uses_rope_input=False)
+
+    wrapper(inputs_embeds=torch.zeros(1, 1, 1), past_key_values=MobilintCache.from_rows([restored]))
+
+    assert calls[-1].get("position_ids") is None

@@ -2148,7 +2148,10 @@ class MobilintQwen3VLForConditionalGeneration(
         loss_only_kwargs = pop_loss_only_kwargs(kwargs)
 
         cache = kwargs.get("past_key_values")
-        if kwargs.get("position_ids") is None:
+        if kwargs.get("position_ids") is None and getattr(
+            getattr(self.model, "language_model", None), "_uses_rope_input", True
+        ):
+            # Only a text MXQ that takes RoPE as an input reads positions; a static one keeps its own.
             kwargs["position_ids"] = self._row_position_ids(cache, kwargs)
         with cache_rope_deltas(self.model, cache) as keep:
             outputs = self.model(
