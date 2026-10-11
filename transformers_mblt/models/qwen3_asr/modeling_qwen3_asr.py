@@ -270,6 +270,7 @@ class MobilintQwen3ASRTextModel(
         past_key_values.ensure_batch_size(batch_size)
         resolved_npu_prefill_chunk_size = self.resolve_npu_prefill_chunk_size(npu_prefill_chunk_size)
         mxq_model = self.npu_backend.mxq_model
+        past_key_values.bind_active(mxq_model)
         # Mirror the 3-path dispatch in ``_run_chunked_logits_to_keep``: on a
         # last-only MXQ each ``mxq_model.infer`` returns a single row instead
         # of one row per input token, so the per-chunk concat would collapse
@@ -349,6 +350,8 @@ class MobilintQwen3ASRTextModel(
             # selector referencing positions outside the final chunk would
             # either raise or (worse) pick from the wrong window.
             chunk_logits_tensors: list[torch.Tensor] = []
+            # The replay overwrites the slot from ``prefix_length`` on; if it fails midway, only the prefix is valid.
+            past_key_values.truncate_active_tokens(prefix_length)
 
             for chunk_index in range(num_suffix_chunks):
                 start_index = chunk_index * effective_chunk_size

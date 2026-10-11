@@ -21,6 +21,7 @@ from transformers.models.whisper.modeling_whisper import (
 from transformers.utils.generic import logging
 
 from ...utils.base_utils import PretrainedOnlyMixin
+from ...utils.cache_residency import bind_cacheless
 from ...utils.cache_utils import (
     MobilintWhisperCache,
     append_whisper_beam_debug_event,
@@ -236,6 +237,7 @@ class MobilintWhisperDecoder(MobilintModelMixin, MobilintWhisperPreTrainedModel)
             return super().decoder_forward(hidden_states, encoder_hidden_states, None, cache_position)
 
         mxq_model = self.npu_backend.mxq_model
+        bind_cacheless([(mxq_model, 0)])  # save the cache that holds the slot before the chunks overwrite it
         encoder_hidden_states_numpy = encoder_hidden_states.type(torch.float32).cpu().numpy()
         chunk_tensors: list[torch.Tensor] = []
         cursor = 0
@@ -293,6 +295,7 @@ class MobilintWhisperDecoder(MobilintModelMixin, MobilintWhisperPreTrainedModel)
         logits_list: list[torch.Tensor] = []
         logits_by_target_tokens: dict[tuple[int, tuple[int, ...]], torch.Tensor] = {}
         mxq_model = self.npu_backend.mxq_model
+        past_key_values.bind_active(mxq_model)
         trace_enabled = is_whisper_beam_debug_trace_enabled()
         for beam_index in range(batch_size):
             target_tokens = past_key_values.build_target_tokens(beam_index, input_ids[beam_index])
@@ -344,6 +347,8 @@ class MobilintWhisperDecoder(MobilintModelMixin, MobilintWhisperPreTrainedModel)
             # chunk width. Per-chunk logits are concatenated along the token axis so
             # ``_normalize_decoder_logits`` still sees a ``suffix_length``-tall payload.
             chunk_logit_tensors: list[torch.Tensor] = []
+            # The replay overwrites the slot from ``prefix_length`` on; if it fails midway, only the prefix is valid.
+            past_key_values.truncate_active_tokens(prefix_length)
             current_prefix = prefix_length
             chunk_cursor = 0
             while chunk_cursor < suffix_length:

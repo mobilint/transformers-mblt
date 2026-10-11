@@ -137,3 +137,34 @@ def test_decoder_forward_multi_slot_backend_raises_clear_error() -> None:
     # NPU work happens.
     assert m0.calls == []
     assert m1.calls == []
+
+
+def test_decoder_forward_binds_the_cache_and_saves_the_previous_owner() -> None:
+    """Cross-attention decoders put their cache's KV on slot 0 through the owner table before inferring."""
+    from transformers_mblt.utils import cache_residency as residency
+
+    class _SlotMxq(_RecordingCrossAttnMxq):
+        def __init__(self) -> None:
+            super().__init__()
+            self.kv = "other"
+
+        def dump_cache_memory(self, cache_id=0):
+            return [self.kv.encode()]
+
+        def load_cache_memory(self, buffer, cache_id=0):
+            self.kv = buffer[0].decode()
+
+    m0 = _SlotMxq()
+    model = _make_encoder_decoder_model([m0])
+    other = MobilintCache(m0, per_model_batch=1)
+    residency.acquire(other.layers[0], m0, 0)
+    other.layers[0].update_seen_tokens(5)
+    cache = MobilintCache(m0, per_model_batch=1)
+
+    model.decoder_forward(torch.zeros(1, 1, 1, 4), torch.zeros(1, 1, 2, 4), cache, torch.arange(1))
+
+    assert cache.layers[0].is_resident
+    assert other.layers[0]._host_kv == [b"other"]  # saved before the infer overwrote the slot
+
+    model.decoder_forward(torch.zeros(1, 1, 1, 4), torch.zeros(1, 1, 2, 4), None, torch.arange(1))
+    assert not cache.layers[0].is_resident  # a forward without a cache saved it first
