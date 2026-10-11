@@ -110,8 +110,11 @@ def test_generate_continues_a_cache_with_its_own_offset(cls) -> None:
     # Second turn on a: the full conversation is passed again, the cache already holds the first 5 tokens.
     position_ids = wrapper._prepare_position_ids_for_generation(_ids(6), {"past_key_values": a})
 
-    text_positions = torch.arange(6 + 5)  # upstream counts the cache length on top
-    assert position_ids[0, 0].tolist() == (text_positions - 3).tolist()  # a's offset, not b's -11
+    # Text positions before the offset. Releases differ in whether they cover the cached prefix and in whether the
+    # continuation is (batch, seq) or (1, batch, seq), so compare the first row of each.
+    text_positions = GenerationMixin._prepare_position_ids_for_generation(wrapper, _ids(6), {"past_key_values": a})
+    first_row = position_ids.reshape(-1, position_ids.shape[-1])[0]
+    assert first_row.tolist() == (text_positions[0] - 3).tolist()  # a's offset, not b's -11
     assert a.rope_deltas.tolist() == [[-3]] and b.rope_deltas.tolist() == [[-11]]
 
 
