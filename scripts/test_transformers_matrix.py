@@ -96,7 +96,7 @@ MAX_WORKERS = len(_CORES_PER_DEVICE)
 
 
 def default_core_map() -> tuple[str, ...]:
-    """Spread workers over every Aries board found, else keep them on device 0's eight cores.
+    """Spread workers over every Aries board found; one board (or none found) gets its eight cores.
 
     Each worker loads its own models, so eight workers on one board share that board's memory and the larger
     models (Aya-8B, Qwen-VL) hit BadAlloc. Workers go to boards in turn, on different cores of each board.
@@ -106,8 +106,10 @@ def default_core_map() -> tuple[str, ...]:
         for path in Path("/dev").glob("aries*")
         if path.name.removeprefix("aries").isdigit()
     )
-    if len(devices) <= 1:
-        return _CORES_PER_DEVICE
+    if not devices or devices == [0]:
+        return _CORES_PER_DEVICE  # device 0 is the backend default, so no --dev-no is needed
+    if len(devices) == 1:
+        return tuple(f"{devices[0]}:{core}" for core in _CORES_PER_DEVICE)
     return tuple(f"{devices[i % len(devices)]}:{_CORES_PER_DEVICE[i // len(devices)]}" for i in range(MAX_WORKERS))
 
 
@@ -354,8 +356,9 @@ def run_phase_parallel(
             proc, fh = launch(f"w{i}", bucket, slots[i])
             host_procs.append((f"w{i}", proc, fh))
 
-    board_of = {slot: split_core_entry(slot)[0] for slot in slots}
-    used_mb: dict[str | None, int] = {}
+    # An entry without a device runs on the backend default, device 0: count it with explicit "0:..." entries.
+    board_of = {slot: int(split_core_entry(slot)[0] or 0) for slot in slots}
+    used_mb: dict[int, int] = {}
     free_slots = list(slots)
     pending = list(npu_files)
     running: dict[subprocess.Popen, tuple] = {}
