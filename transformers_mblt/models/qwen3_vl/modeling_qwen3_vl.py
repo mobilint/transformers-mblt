@@ -1021,13 +1021,15 @@ def _row_text_position_ids(
     may cover only the new tokens or the cached ones too; its last ``length`` columns are used. A batch with a row
     whose offset is unknown (``rope_deltas_unknown``) raises rather than guess.
     """
-    if cache is None or batch <= 1 or len(getattr(cache, "layers", ())) < batch:
+    if cache is None:
         return None
     if getattr(cache, "rope_deltas_unknown", False):
         raise ValueError(
             "Some batch rows hold tokens whose M-RoPE offset is unknown (a text conversation, or a cache restored from "
             "files saved without rope_deltas.json): pass position_ids for every row."
         )
+    if batch <= 1 or len(getattr(cache, "layers", ())) < batch:
+        return None
     starts = [int(cache.get_seq_length(row)) for row in range(batch)]
     if len(set(starts)) == 1:
         return None

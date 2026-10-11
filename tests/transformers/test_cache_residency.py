@@ -868,6 +868,22 @@ def test_unknown_offsets_follow_copy_and_clear_on_reset_or_fake_prefill() -> Non
     assert not batch.rope_deltas_unknown
 
 
+def test_fake_prefilling_the_unknown_rows_brings_the_known_offsets_back() -> None:
+    backend = _Backend(k=3)
+    known, unknown, empty = _request(backend, (0, 0)), _request(backend, (0, 1)), _request(backend, (0, 2))
+    known.set_seq_length(4)
+    known.rope_deltas = torch.tensor([[-6]])
+    unknown.set_seq_length(5)
+    batch = MobilintCache.from_rows([known, unknown, empty])
+
+    batch.fake_prefill({2: 3})  # an untouched unknown row keeps the batch unknown
+    assert batch.rope_deltas_unknown and batch.rope_deltas is None
+
+    batch.fake_prefill({1: 5})
+    assert not batch.rope_deltas_unknown
+    assert batch.rope_deltas.tolist() == [[-6], [0], [0]]
+
+
 def test_from_rows_keeps_the_deepstack_cache_type() -> None:
     backend = _Backend(k=2)
     rows = [

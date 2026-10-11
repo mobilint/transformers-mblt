@@ -129,3 +129,12 @@ def test_qwen3_vl_model_asks_for_positions_when_a_row_offset_is_unknown() -> Non
     explicit = torch.tensor([[[4], [7]]] * 3)
     wrapper(inputs_embeds=torch.zeros(2, 1, 1), past_key_values=batch, position_ids=explicit)
     assert calls[-1]["position_ids"] is explicit
+
+
+def test_qwen3_vl_model_asks_for_positions_for_a_one_row_batch_with_an_unknown_offset() -> None:
+    restored = _request(_Backend(k=2), (0, 1))
+    restored.set_seq_length(10)
+    wrapper, _ = _qwen3_vl_wrapper()
+
+    with pytest.raises(ValueError, match="offset is unknown"):
+        wrapper(inputs_embeds=torch.zeros(1, 1, 1), past_key_values=MobilintCache.from_rows([restored]))

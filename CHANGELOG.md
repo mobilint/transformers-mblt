@@ -16,8 +16,8 @@
   positions: its cache length plus its `rope_deltas`, with padding taking no position. Upstream gave every row row
   0's start. Such a batch that carries images or videos raises and asks for the caller's M-RoPE `position_ids`, and so
   does a `from_rows` batch with a row that holds tokens but no offset (`rope_deltas_unknown`: a text conversation, or
-  a cache restored from files without `rope_deltas.json`). `copy()` keeps that state; `reset()` and `fake_prefill()`
-  clear it.
+  a cache restored from files without `rope_deltas.json`), even a one-row one. `copy()` keeps that state; `reset()`
+  and `fake_prefill()` of the unknown rows clear it, restoring the other rows' offsets.
 
 - A cache that loses its NPU slot is no longer dumped again when its host copy already matches every cached position
   (it was just `copy()`-ed or `dump_cache_memory()`-ed and no infer wrote since). Snapshotting a cache and then

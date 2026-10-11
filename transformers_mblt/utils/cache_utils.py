@@ -408,9 +408,20 @@ class MobilintCache(Cache):
         # M-RoPE offset per row (Qwen2-VL, Qwen3-VL, Qwen3-ASR): text position minus cache position after the
         # prompt. It belongs to the sequence in this cache, not to the model, so two conversations can alternate.
         self.rope_deltas: Optional[torch.Tensor] = None
-        # Set on a from_rows batch with a row that holds tokens but no M-RoPE offset: its offset is unknown, so
-        # positions cannot be derived from the rows and must come from the caller.
-        self.rope_deltas_unknown = False
+        # Rows of a from_rows batch that hold tokens but no M-RoPE offset: their offset is unknown, so positions
+        # cannot be derived from the rows and must come from the caller. Meanwhile ``rope_deltas`` stays None and
+        # the other rows' offsets wait in ``_row_rope_deltas`` until no row is unknown.
+        self._unknown_rope_rows: set[int] = set()
+        self._row_rope_deltas: Optional[List[Optional[torch.Tensor]]] = None
+
+    @property
+    def rope_deltas_unknown(self) -> bool:
+        """Whether some row holds tokens whose M-RoPE offset is unknown (see :meth:`from_rows`)."""
+        return bool(self._unknown_rope_rows)
+
+    def _forget_unknown_rope_rows(self) -> None:
+        self._unknown_rope_rows = set()
+        self._row_rope_deltas = None
 
     @property
     def batch_size(self) -> int:
@@ -535,13 +546,20 @@ class MobilintCache(Cache):
             for layer in self.layers:
                 layer.fake_prefill(sequence_lengths)
             self.rope_deltas = None
-            self.rope_deltas_unknown = False
+            self._forget_unknown_rope_rows()
             return
         for cache_id, seq_len in sequence_lengths.items():
             self.layers[cache_id].fake_prefill(seq_len)
             if self.rope_deltas is not None and cache_id < int(self.rope_deltas.shape[0]):
                 self.rope_deltas = self.rope_deltas.clone()
                 self.rope_deltas[cache_id] = 0
+            self._unknown_rope_rows.discard(cache_id)
+            if self._row_rope_deltas is not None:
+                self._row_rope_deltas[cache_id] = None  # counts as 0
+        if self._row_rope_deltas is not None and not self._unknown_rope_rows:
+            # Every row's offset is known again.
+            self.rope_deltas = _stack_row_rope_deltas(self._row_rope_deltas)
+            self._row_rope_deltas = None
 
     def update_cache_position(self, cache_position: torch.Tensor, index: int = 0):
         self.layers[index].update_cache_position(cache_position)
@@ -601,7 +619,7 @@ class MobilintCache(Cache):
         for layer in self.layers:
             layer.reset()
         self.rope_deltas = None
-        self.rope_deltas_unknown = False
+        self._forget_unknown_rope_rows()
 
     def ensure_batch_size(self, batch_size: int) -> None:
         """Grow logical cache entries so batched generation can track each active row.
@@ -668,16 +686,16 @@ class MobilintCache(Cache):
                 )
         view = first._empty_like([cache.slot_of(0) for cache in caches])
         view.layers = [cache.layers[0] for cache in caches]
-        deltas = [cache.rope_deltas for cache in caches]
-        known = next((delta for delta in deltas if delta is not None), None)
-        if any(cache.rope_deltas_unknown for cache in caches) or any(
-            delta is None and cache.get_seq_length() > 0 for delta, cache in zip(deltas, caches)
-        ):
-            view.rope_deltas_unknown = True
-        elif known is not None:
-            view.rope_deltas = torch.cat(
-                [torch.zeros_like(known[:1]) if delta is None else delta.reshape(1, -1) for delta in deltas], dim=0
-            )
+        deltas = [None if cache.rope_deltas is None else cache.rope_deltas.reshape(1, -1) for cache in caches]
+        view._unknown_rope_rows = {
+            row
+            for row, (delta, cache) in enumerate(zip(deltas, caches))
+            if cache.rope_deltas_unknown or (delta is None and cache.get_seq_length() > 0)
+        }
+        if view._unknown_rope_rows:
+            view._row_rope_deltas = deltas
+        else:
+            view.rope_deltas = _stack_row_rope_deltas(deltas)
         return view
 
     def _empty_like(self, slots: Sequence[Tuple[int, int]]) -> "MobilintCache":
@@ -691,9 +709,27 @@ class MobilintCache(Cache):
         copied._explicit_slots = self._explicit_slots
         copied._batch_size = self._batch_size
         copied.layers = [layer.copy() for layer in self.layers]
-        copied.rope_deltas = copy_rope_deltas(self)
-        copied.rope_deltas_unknown = self.rope_deltas_unknown
+        _copy_rope_state(self, copied)
         return copied
+
+
+def _stack_row_rope_deltas(deltas: Sequence[Optional[torch.Tensor]]) -> Optional[torch.Tensor]:
+    """Stack per-row ``(1, k)`` offsets into ``(rows, k)``, 0 for a row without one; ``None`` if no row has one."""
+    known = next((delta for delta in deltas if delta is not None), None)
+    if known is None:
+        return None
+    return torch.cat([torch.zeros_like(known) if delta is None else delta for delta in deltas], dim=0)
+
+
+def _copy_rope_state(source: "MobilintCache", target: "MobilintCache") -> None:
+    """Copy ``rope_deltas`` and the unknown-offset rows of a :meth:`MobilintCache.from_rows` batch."""
+    target.rope_deltas = copy_rope_deltas(source)
+    target._unknown_rope_rows = set(source._unknown_rope_rows)
+    target._row_rope_deltas = (
+        None
+        if source._row_rope_deltas is None
+        else [None if delta is None else delta.clone() for delta in source._row_rope_deltas]
+    )
 
 
 def copy_rope_deltas(cache: Any) -> Optional[torch.Tensor]:
@@ -1240,8 +1276,7 @@ class MobilintBeamCache(MobilintCache):
         copied._active_token_history = list(self._active_token_history)
         copied._active_source_index = self._active_source_index
         copied._beam_seq_lengths = list(self._beam_seq_lengths)
-        copied.rope_deltas = copy_rope_deltas(self)
-        copied.rope_deltas_unknown = self.rope_deltas_unknown
+        _copy_rope_state(self, copied)
         return copied
 
 
@@ -1325,7 +1360,7 @@ class MobilintDeepStackCache(MobilintCache):
             layer.reset()
         self._deepstack_tensor = None
         self.rope_deltas = None
-        self.rope_deltas_unknown = False
+        self._forget_unknown_rope_rows()
 
     def fake_prefill(self, sequence_lengths: Union[dict[int, int], int], index: int = 0) -> None:
         """Mark the cache as fake-prefilled and clear real deepstack payloads."""
@@ -1408,8 +1443,7 @@ class MobilintDeepStackCache(MobilintCache):
         copied._batch_size = self._batch_size
         copied.layers = [layer.copy() for layer in self.layers]
         copied._deepstack_tensor = None if self._deepstack_tensor is None else self._deepstack_tensor.clone()
-        copied.rope_deltas = copy_rope_deltas(self)
-        copied.rope_deltas_unknown = self.rope_deltas_unknown
+        _copy_rope_state(self, copied)
         return copied
 
 
