@@ -654,6 +654,12 @@ class MobilintQwen2VLForConditionalGeneration(
         cache = kwargs.get("past_key_values")
         if getattr(getattr(self.model, "language_model", None), "_uses_rope_input", False):
             # A text MXQ that takes RoPE as an input reads the positions; a static one keeps its own.
+            if getattr(cache, "joined_rows", False) and cache.batch_size > 1:
+                raise NotImplementedError(
+                    "Qwen2-VL text MXQs with an external RoPE input run one sequence at a time, so a "
+                    f"MobilintCache.from_rows batch of {cache.batch_size} rows is not supported: run each request on "
+                    "its own cache."
+                )
             require_positions_for_joined_rows(cache, kwargs.get("position_ids"))
         with cache_rope_deltas(self.model, cache) as keep:
             outputs = self.model(

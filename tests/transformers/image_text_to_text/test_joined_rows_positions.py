@@ -24,12 +24,12 @@ class _Mxq:
     """Just enough of a qbruntime Model for caches that never bind."""
 
 
-def _joined_batch() -> MobilintCache:
+def _joined_batch(rows: int = 2) -> MobilintCache:
     models = [_Mxq()]
-    rows = [MobilintCache(models, per_model_batch=2, slots=[slot]) for slot in ((0, 0), (0, 1))]
-    rows[0].set_seq_length(10)
-    rows[1].set_seq_length(4)
-    return MobilintCache.from_rows(rows)
+    caches = [MobilintCache(models, per_model_batch=2, slots=[(0, row)]) for row in range(rows)]
+    for cache, length in zip(caches, (10, 4)):
+        cache.set_seq_length(length)
+    return MobilintCache.from_rows(caches)
 
 
 def _wrapper(cls, uses_rope_input: bool):
@@ -55,17 +55,34 @@ def _wrapper(cls, uses_rope_input: bool):
     return wrapper, calls
 
 
-@pytest.mark.parametrize("cls", _VL_CLASSES)
-def test_joined_batch_needs_position_ids_on_an_external_rope_mxq(cls) -> None:
+@pytest.mark.parametrize(
+    ("cls", "rows"),
+    [
+        pytest.param(MobilintQwen2VLForConditionalGeneration, 1, id="qwen2_vl"),
+        pytest.param(*_QWEN3_VL.values, 2, id="qwen3_vl", marks=_QWEN3_VL.marks),
+    ],
+)
+def test_joined_batch_needs_position_ids_on_an_external_rope_mxq(cls, rows) -> None:
     wrapper, calls = _wrapper(cls, uses_rope_input=True)
-    batch = _joined_batch()
+    batch = _joined_batch(rows)
 
     with pytest.raises(ValueError, match="pass position_ids"):
-        wrapper(inputs_embeds=torch.zeros(2, 1, 1), past_key_values=batch)
+        wrapper(inputs_embeds=torch.zeros(rows, 1, 1), past_key_values=batch)
 
-    positions = torch.tensor([[[4], [7]]] * 3)
-    wrapper(inputs_embeds=torch.zeros(2, 1, 1), past_key_values=batch, position_ids=positions)
+    positions = torch.tensor([[[4], [7]][:rows]] * 3)
+    wrapper(inputs_embeds=torch.zeros(rows, 1, 1), past_key_values=batch, position_ids=positions)
     assert calls[-1]["position_ids"] is positions
+
+
+def test_qwen2_vl_external_rope_mxq_refuses_a_multi_row_joined_batch() -> None:
+    wrapper, _ = _wrapper(MobilintQwen2VLForConditionalGeneration, uses_rope_input=True)
+
+    with pytest.raises(NotImplementedError, match="one sequence at a time"):
+        wrapper(
+            inputs_embeds=torch.zeros(2, 1, 1),
+            past_key_values=_joined_batch(2),
+            position_ids=torch.zeros(3, 2, 1, dtype=torch.long),
+        )
 
 
 @pytest.mark.parametrize("cls", _VL_CLASSES)

@@ -14,7 +14,8 @@
 
 - Qwen2-VL and Qwen3-VL with an external-RoPE text MXQ refuse a `from_rows` batch that holds tokens unless
   `position_ids` are passed: each row continues from its own length and M-RoPE offset, which upstream's positions
-  (one start for the batch, one offset on the model) cannot express. The batch carries no `rope_deltas`.
+  (one start for the batch, one offset on the model) cannot express. The batch carries no `rope_deltas`. Qwen2-VL
+  external-RoPE MXQs run one sequence at a time, so they refuse a joined batch of more than one row outright.
 
 - A cache that loses its NPU slot is no longer dumped again when its host copy already matches every cached position
   (it was just `copy()`-ed or `dump_cache_memory()`-ed and no infer wrote since). Snapshotting a cache and then
