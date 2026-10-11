@@ -747,7 +747,10 @@ def main() -> int:
         eagle3_rc = run_phase_eagle3(v, log_dir, extra)
 
         elapsed = time.monotonic() - start
-        all_rcs = list(worker_rcs.values()) + [batch_rc, eagle3_rc]
+        # A single model test file whose model this release lacks (e.g. Qwen3-VL before 4.57) collects nothing;
+        # that is expected, so it neither marks the version NO_TESTS nor counts as a failure.
+        all_rcs = [rc for name, rc in worker_rcs.items() if not (name.startswith("npu-") and rc == 5)]
+        all_rcs += [batch_rc, eagle3_rc]
         # rc 5 = pytest "no tests collected"; benign when `-k`/`-m` filters
         # deselect every test in a shard, so remap to 0 for aggregation.
         # But if *every* phase came back with 5, no test actually ran for this
