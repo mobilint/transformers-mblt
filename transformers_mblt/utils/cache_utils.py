@@ -116,6 +116,10 @@ class MobilintLayer(CacheLayerMixin):
         """Set the cached sequence length for an in-memory cache snapshot."""
         if seq_length < 0:
             raise ValueError(f"seq_length must be non-negative, got {seq_length}")
+        if seq_length > self._seen_tokens and self._tracked and self.is_resident:
+            # While resident, an infer may have written past the old length without advancing the cursor (the
+            # caller sets it here instead): the host copy is no longer known to match those positions.
+            self._host_valid_len = min(self._host_valid_len, self._seen_tokens)
         self._seen_tokens = seq_length
 
     def fake_prefill(self, seq_length: int) -> None:
@@ -183,8 +187,14 @@ class MobilintLayer(CacheLayerMixin):
         return self._kv_signature
 
     def _save_from_slot(self) -> None:
-        """Dump the slot into the host buffer; called by the owner table while this layer is resident."""
+        """Dump the slot into the host buffer; called by the owner table while this layer is resident.
+
+        Skips the dump when the host copy already matches every cached position (a ``copy()`` or
+        ``dump_cache_memory()`` saved it and no infer wrote since), so evicting a just-copied layer costs nothing.
+        """
         if self._seen_tokens > 0 and self.kv_valid:
+            if self._host_kv and self._host_valid_len >= self._seen_tokens:
+                return
             self._host_kv = self.mxq_model.dump_cache_memory(self.cache_id)
             self._host_valid_len = self._seen_tokens
 
