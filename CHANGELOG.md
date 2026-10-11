@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Batched forward with `logits_to_keep=1` copies each row's last-token logits once into the returned tensor, instead
+  of converting the whole MXQ output, cloning every row and stacking them. A 16-row decode step of
+  Llama-3.2-1B-Batch16 takes 2.8 ms less in total (40.7 ms to 37.9 ms; a bare MXQ infer takes 36.5 ms): about
+  1.0 ms less outside the infer call and 1.7 ms less inside it, where the extra allocations had slowed it down.
+
 ## 0.4.0
 
 ### Added

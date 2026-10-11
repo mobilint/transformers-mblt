@@ -879,3 +879,47 @@ def test_from_rows_rejects_caches_it_cannot_join() -> None:
         MobilintCache.from_rows([a, MobilintBeamCache(backend.mxq_models[0])])
     with pytest.raises(TypeError):
         MobilintDeepStackCache.from_rows([a, b])
+
+
+class _FlatTokenKvMxq(_TokenKvMxq):
+    """A full-logits batch MXQ: one output row per packed input token instead of one per item."""
+
+    def infer(self, inputs, _outputs, cache_size, batch_params=None):
+        chunk = np.asarray(inputs[0]).reshape(-1, np.asarray(inputs[0]).shape[-1])
+        tokens = [int(row[0]) for row in chunk]
+        rows, offset = [], 0
+        for param in batch_params:
+            n, cache_id = int(param.sequence_length), int(param.cache_id)
+            for i in range(n):  # the logits after each token of the item
+                rows.append(self._step(cache_id, int(param.cache_size) + i, tokens[offset + i : offset + i + 1]))
+            offset += n
+        return [np.stack(rows)]
+
+
+@pytest.mark.parametrize("flat_output", [False, True], ids=["per-item-rows", "per-token-rows"])
+def test_batched_forward_returns_each_row_last_logits_in_a_tensor_of_its_own(flat_output) -> None:
+    backend = _ModelBackend(n=1, k=2)
+    if flat_output:
+        backend.mxq_models = [_FlatTokenKvMxq(2)]
+    model = _model(backend)
+    model._batched_input_expand_dims = True
+    a, b = _request(backend, (0, 0)), _request(backend, (0, 1))
+
+    def forward(tokens: list[list[int]]) -> torch.Tensor:
+        length = max(len(t) for t in tokens)
+        embeds = torch.zeros(len(tokens), length, 1)
+        mask = torch.zeros(len(tokens), length, dtype=torch.long)
+        for row, t in enumerate(tokens):
+            embeds[row, : len(t), 0] = torch.tensor(t, dtype=torch.float32)
+            mask[row, : len(t)] = 1
+        cache = MobilintCache.from_rows([a, b])
+        return model.llm_forward(embeds, cache, torch.arange(length), npu_prefill_chunk_size=64, attention_mask=mask)
+
+    first = forward([[1, 2, 3], [4]])
+    first_values = first.clone()
+    second = forward([[5], [6, 7]])
+
+    assert first.shape == (2, 1, 3)
+    assert torch.equal(first, first_values)  # the next forward does not write into the previous result
+    assert first[:, 0].tolist() == [_alone((0, 0), [], [1, 2, 3]), _alone((0, 1), [], [4])]
+    assert second[:, 0].tolist() == [_alone((0, 0), [1, 2, 3], [5]), _alone((0, 1), [4], [6, 7])]
