@@ -1327,7 +1327,7 @@ class MobilintModelMixin(PretrainedOnlyMixin, PreTrainedModel):
                     if prefill_mask is False:
                         if logits is None:
                             # Filled on the host, where the MXQ output is, and moved to the input device once.
-                            logits = torch.empty((batch_size, 1, vocab), dtype=inputs_embeds.dtype)
+                            logits = torch.empty((batch_size, 1, vocab), dtype=inputs_embeds.dtype, device="cpu")
                         logits[cache_ids[j]] = output_rows[last_row_of[j]]
                         finished.add(cache_ids[j])
 
