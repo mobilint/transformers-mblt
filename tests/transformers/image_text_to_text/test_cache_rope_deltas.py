@@ -169,6 +169,30 @@ def test_generate_without_a_cache_hands_the_prompt_offset_to_the_cache_it_builds
     assert cache.rope_deltas.tolist() == [[-3]]
 
 
+class _TextPromptKeepsOffsetModel(_PromptModel):
+    """Like upstream transformers 5.x: a prompt without images computes no offset and leaves ``rope_deltas`` as is."""
+
+    def get_rope_index(self, input_ids, **kwargs):
+        if int(input_ids.shape[1]) not in _PROMPT_DELTAS:  # no image: upstream skips the M-RoPE index
+            return None, self.rope_deltas
+        return super().get_rope_index(input_ids, **kwargs)
+
+
+@pytest.mark.parametrize("cls", _VL_CLASSES)
+@pytest.mark.parametrize("with_cache", [True, False], ids=["empty-cache", "no-cache"])
+def test_a_text_prompt_after_an_image_conversation_does_not_take_its_offset(cls, with_cache) -> None:
+    wrapper = _wrapper(cls)
+    wrapper.model = _TextPromptKeepsOffsetModel()
+    wrapper.forward(input_ids=_ids(5), past_key_values=MobilintCache(object()))  # an image conversation: -3
+
+    text = MobilintCache(object()) if with_cache else None
+    text = wrapper.forward(input_ids=_ids(4), past_key_values=text).past_key_values
+    wrapper.forward(input_ids=_ids(1), past_key_values=text)
+
+    assert wrapper.model.seen == [-3, None, None]  # positions of the text conversation get no offset
+    assert text.rope_deltas is None
+
+
 def test_a_filled_cache_without_an_offset_does_not_borrow_another_one() -> None:
     wrapper = _wrapper(MobilintQwen2VLForConditionalGeneration)
     wrapper.model.rope_deltas = torch.tensor([[-11]])  # left by another conversation

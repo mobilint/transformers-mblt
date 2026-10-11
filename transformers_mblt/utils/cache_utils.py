@@ -706,16 +706,24 @@ def use_cache_rope_deltas(holder: Any, cache: Any) -> None:
 
     Upstream Qwen-VL code keeps ``rope_deltas`` on the model, so a cache that resumes after another conversation ran
     would get that conversation's offset. Call this before a forward or ``generate()`` step with ``cache``, and
-    :func:`keep_cache_rope_deltas` after it. An empty cache leaves ``holder`` alone: the prompt about to fill it
-    recomputes the offset, and ``generate()`` computes it before it builds the cache. A cache with tokens but no
-    offset (from an older release, or a file without one) sets ``None`` so the offset is recomputed from the full
-    input instead of borrowed from another sequence.
+    :func:`keep_cache_rope_deltas` after it. A cache without an offset sets ``None``, whether or not it holds tokens:
+
+    - an empty cache is about to take a prompt, which computes its own offset. Upstream skips that for a prompt
+      without images, whose offset is 0; leaving the previous conversation's offset on ``holder`` would hand it to
+      this cache and shift every later position.
+    - a cache with tokens but no offset (from an older release, or a file without one) recomputes it from the full
+      input instead of borrowing another sequence's.
+    - no cache means the forward starts a new sequence and builds its cache: the same as an empty one.
+
+    ``generate()`` computes a prompt's offset before its forward and gives it to the cache first (see
+    :class:`~transformers_mblt.utils.generation_utils.MobilintCacheRopeDeltasMixin`), so the forward finds it there.
     """
-    if cache is None or not hasattr(cache, "get_seq_length"):
+    if cache is None:
+        holder.rope_deltas = None
         return
-    stored = getattr(cache, "rope_deltas", None)
-    if stored is not None or _cache_holds_tokens(cache):
-        holder.rope_deltas = stored
+    if not hasattr(cache, "get_seq_length"):
+        return
+    holder.rope_deltas = getattr(cache, "rope_deltas", None)
 
 
 def _cache_holds_tokens(cache: Any) -> bool:

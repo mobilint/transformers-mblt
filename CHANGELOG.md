@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0
 
 ### Added
 
@@ -20,6 +20,14 @@
 - A cache that loses its NPU slot is no longer dumped again when its host copy already matches every cached position
   (it was just `copy()`-ed or `dump_cache_memory()`-ed and no infer wrote since). Snapshotting a cache and then
   letting another cache take its slot costs one dump instead of two.
+
+### Fixed
+
+- Qwen2-VL / Qwen3-VL: a text prompt run with `forward()` right after an image conversation no longer takes that
+  conversation's M-RoPE offset. Upstream computes no offset for a prompt without images and kept the model's last
+  one, which the new cache then stored, so every later position was shifted (for example "oneoneone..." instead of
+  "one, two, three..." on Qwen3-VL-2B). A forward on an empty cache, or without a cache, now starts with no offset;
+  `generate()` was not affected.
 
 ## 0.3.0
 
