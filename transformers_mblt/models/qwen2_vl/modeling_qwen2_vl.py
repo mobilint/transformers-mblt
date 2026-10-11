@@ -40,7 +40,7 @@ from transformers.processing_utils import Unpack
 from transformers.utils.generic import TransformersKwargs, can_return_tuple, logging
 
 from ...utils.base_utils import PretrainedOnlyMixin
-from ...utils.cache_utils import MobilintCache, keep_cache_rope_deltas, use_cache_rope_deltas
+from ...utils.cache_utils import MobilintCache, cache_rope_deltas
 from ...utils.generation_utils import (
     MobilintCacheRopeDeltasMixin,
     MobilintGenerationMixin,
@@ -652,14 +652,14 @@ class MobilintQwen2VLForConditionalGeneration(
         loss_only_kwargs = pop_loss_only_kwargs(kwargs)
 
         cache = kwargs.get("past_key_values")
-        use_cache_rope_deltas(self.model, cache)
-        outputs = self.model(
-            logits_to_keep=logits_to_keep,
-            count_npu_time=count_npu_time,
-            **kwargs,
-        )
-        # A forward without a cache returns the one the text model built: the offset goes there.
-        keep_cache_rope_deltas(self.model, cache if cache is not None else outputs.past_key_values)
+        with cache_rope_deltas(self.model, cache) as keep:
+            outputs = self.model(
+                logits_to_keep=logits_to_keep,
+                count_npu_time=count_npu_time,
+                **kwargs,
+            )
+            # A forward without a cache returns the one the text model built: the offset goes there.
+            keep(cache if cache is not None else outputs.past_key_values)
 
         # The Mobilint text decoder already returns logits sliced to the requested
         # positions and ``self.lm_head`` is ``nn.Identity``, so skip the upstream

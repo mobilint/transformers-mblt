@@ -1,5 +1,6 @@
 import dataclasses
 import inspect
+import threading
 from abc import ABC
 from functools import lru_cache, wraps
 from typing import Any, Callable, Dict, Mapping, MutableMapping, Optional, cast
@@ -19,11 +20,10 @@ from ..utils.cache_utils import (
     MobilintMixtureOfExpertsCache,
     build_mobilint_cache_from_model,
     cache_matches_backend_topology,
+    cache_rope_deltas,
     defer_eagle3_accept_tokens,
-    keep_cache_rope_deltas,
     note_eagle3_fed_tokens,
     take_eagle3_unfed_tokens,
-    use_cache_rope_deltas,
 )
 from ..utils.modeling_utils import MobilintModelMixin
 
@@ -430,10 +430,29 @@ class MobilintCacheRopeDeltasMixin:
 
     def _prepare_position_ids_for_generation(self, inputs_tensor, model_kwargs):
         cache = model_kwargs.get("past_key_values")
-        use_cache_rope_deltas(self.model, cache)
-        position_ids = super()._prepare_position_ids_for_generation(inputs_tensor, model_kwargs)  # type: ignore[misc]
-        keep_cache_rope_deltas(self.model, cache)
+        with cache_rope_deltas(self.model, cache) as keep:
+            position_ids = super()._prepare_position_ids_for_generation(inputs_tensor, model_kwargs)  # type: ignore[misc]
+            keep(cache)
+            prompt_rope_deltas = self.model.rope_deltas
+        # Without a cache, generate() builds one after this; hand it the prompt's offset on this thread rather than
+        # through the shared model attribute another request may change in between.
+        self._pending_rope_deltas().value = prompt_rope_deltas if cache is None else None
         return position_ids
+
+    def _prepare_cache_for_generation(self, generation_config, model_kwargs, *args, **kwargs):
+        result = super()._prepare_cache_for_generation(generation_config, model_kwargs, *args, **kwargs)  # type: ignore[misc]
+        pending = self._pending_rope_deltas()
+        cache = model_kwargs.get("past_key_values")
+        if getattr(pending, "value", None) is not None and cache is not None:
+            cache.rope_deltas = pending.value
+        pending.value = None
+        return result
+
+    def _pending_rope_deltas(self) -> threading.local:
+        pending = self.__dict__.get("_mobilint_pending_rope_deltas")
+        if pending is None:
+            pending = self.__dict__["_mobilint_pending_rope_deltas"] = threading.local()
+        return pending
 
 
 class MobilintGenerationMixin(ABC, GenerationMixin):

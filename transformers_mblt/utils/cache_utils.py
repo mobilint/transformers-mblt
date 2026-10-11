@@ -1,10 +1,12 @@
 import copy
 import json
 import os
+import threading
 import time
 import weakref
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Type, Union
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Type, Union
 
 import qbruntime
 import torch
@@ -648,6 +650,27 @@ def _cache_holds_tokens(cache: Any) -> bool:
     if layers:
         return any(layer.get_seq_length() > 0 for layer in layers)
     return cache.get_seq_length() > 0
+
+
+_ROPE_DELTAS_LOCKS: "weakref.WeakKeyDictionary[Any, threading.RLock]" = weakref.WeakKeyDictionary()
+_ROPE_DELTAS_LOCKS_GUARD = threading.Lock()
+
+
+@contextmanager
+def cache_rope_deltas(holder: Any, cache: Any) -> Iterator[Callable[[Any], None]]:
+    """Run upstream M-RoPE code with ``cache``'s offset on ``holder``, one request at a time per holder.
+
+    ``holder.rope_deltas`` is shared by every request on the model, so loading a cache's offset, running the code
+    that reads or recomputes it, and storing it back happen under one lock. Yields ``keep(target)``, which stores
+    the holder's offset on ``target`` (the cache the step filled, which a forward without a cache builds itself).
+    """
+    with _ROPE_DELTAS_LOCKS_GUARD:
+        lock = _ROPE_DELTAS_LOCKS.get(holder)
+        if lock is None:
+            lock = _ROPE_DELTAS_LOCKS[holder] = threading.RLock()
+    with lock:
+        use_cache_rope_deltas(holder, cache)
+        yield lambda target: keep_cache_rope_deltas(holder, target)
 
 
 def keep_cache_rope_deltas(holder: Any, cache: Any) -> None:

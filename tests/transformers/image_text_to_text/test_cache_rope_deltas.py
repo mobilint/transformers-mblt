@@ -244,3 +244,49 @@ def test_files_keep_the_offset(tmp_path) -> None:
     restored.load_cache_memory_from(str(tmp_path))
 
     assert restored.get_seq_length() == 5 and restored.rope_deltas.tolist() == [[-3]]
+
+
+def test_generate_hands_the_prompt_offset_to_its_cache_even_if_another_request_ran_in_between(monkeypatch) -> None:
+    from transformers_mblt.utils.generation_utils import MobilintGenerationMixin
+
+    built = MobilintCache(object())
+    monkeypatch.setattr(
+        MobilintGenerationMixin,
+        "_prepare_cache_for_generation",
+        lambda self, generation_config, model_kwargs, *args, **kwargs: model_kwargs.update(past_key_values=built),
+    )
+    wrapper = _wrapper(MobilintQwen2VLForConditionalGeneration)
+    model_kwargs = {"mm_token_type_ids": torch.zeros(1, 1), "image_grid_thw": torch.ones(1, 3)}
+
+    wrapper._prepare_position_ids_for_generation(_ids(5), model_kwargs)
+    wrapper.model.rope_deltas = torch.tensor([[-11]])  # another request's prompt, between the two steps
+    wrapper._prepare_cache_for_generation(None, model_kwargs, None, 1, 0)
+
+    assert built.rope_deltas.tolist() == [[-3]]
+
+
+def test_concurrent_requests_do_not_see_each_other_offsets() -> None:
+    import threading
+    import time
+
+    wrapper = _wrapper(MobilintQwen2VLForConditionalGeneration)
+    a, b = MobilintCache(object()), MobilintCache(object())
+    wrapper.forward(input_ids=_ids(7), past_key_values=b)  # b's offset: -11
+    started = threading.Event()
+    original_call = _PromptModel.__call__
+
+    def slow_call(self, **kwargs):
+        if kwargs.get("past_key_values") is b:
+            started.set()
+            time.sleep(0.05)  # a's prompt tries to set the shared offset meanwhile
+        return original_call(self, **kwargs)
+
+    wrapper.model.__class__ = type("_SlowPromptModel", (_PromptModel,), {"__call__": slow_call})
+    thread = threading.Thread(target=lambda: wrapper.forward(input_ids=_ids(1), past_key_values=b))
+    thread.start()
+    started.wait()
+    wrapper.forward(input_ids=_ids(5), past_key_values=a)
+    thread.join()
+
+    assert wrapper.model.seen == [-11, -11, -3]
+    assert a.rope_deltas.tolist() == [[-3]] and b.rope_deltas.tolist() == [[-11]]
