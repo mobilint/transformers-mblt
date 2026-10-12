@@ -1429,6 +1429,18 @@ def defer_eagle3_accept_tokens(cache: Any) -> None:
     cache.accept_tokens = None
 
 
+def defer_eagle3_round_tokens(cache: Any) -> None:
+    """Keep the tokens an EAGLE-3 cache left between rounds returned but never fed: the accepted tokens, then the
+    next tree's root (``eagle3_decode_step`` returns it as ``next_token``). No-op without a pending tree.
+    """
+    next_tree = getattr(cache, "pending_draft_tokens", None)
+    if next_tree is None:
+        return
+    defer_eagle3_accept_tokens(cache)
+    cache.accept_tokens = next_tree[:, :1]
+    defer_eagle3_accept_tokens(cache)
+
+
 def take_eagle3_unfed_tokens(cache: Any) -> Optional[torch.LongTensor]:
     """Return and clear the tokens an EAGLE-3 cache still has to feed before the next input."""
     tokens = getattr(cache, "unfed_tokens", None)

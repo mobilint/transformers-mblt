@@ -239,3 +239,59 @@ def test_configure_eagle3_tree_sets_the_draft_tree_from_arguments_over_generatio
 
     assert model.eagle3_draft_model.max_draft_tokens == 4
     assert shapes == [{"depth": 4, "top_k": 8}, {"depth": 4, "top_k": 2}]
+
+
+class _RoundCache(MobilintEagle3Cache):
+    """A cache left between rounds: accepted tokens pending and the next tree drafted, without MXQs."""
+
+    def __init__(self) -> None:  # noqa: D107 - no MXQs to bind
+        self.accept_tokens = torch.tensor([[5, 6, 7]])
+        self.pending_draft_tokens = torch.tensor([[9, 10, 11]])
+        self.retrieve_indices = torch.tensor([[0, 1, 2]])
+        self.tree_mask = torch.ones((1, 1, 3, 3))
+        self.tree_position_ids = torch.tensor([0, 1, 2])
+        self.unfed_tokens = None
+
+    def clear_tree_state(self) -> None:
+        self.accept_tokens = None
+        self.pending_draft_tokens = None
+        self.retrieve_indices = None
+        self.tree_mask = None
+        self.tree_position_ids = None
+
+    def sync_draft_seq_length_to_base(self) -> None:
+        pass
+
+
+def test_eagle3_prefill_after_rounds_feeds_the_tokens_they_returned_first(monkeypatch) -> None:
+    """The next turn on a cache left between rounds must not lose the accepted tokens and the next token."""
+    model = _eagle3_model()
+    cache = _RoundCache()
+    seen: dict = {}
+
+    def _initialize_tree(input_ids, model_arg, cache_arg, logits_processor, *, remaining_tokens, count_npu_time):
+        seen["unfed"] = cache_arg.unfed_tokens
+        seen["tree"] = cache_arg.pending_draft_tokens
+        return torch.tensor([[1]]), None, None, None, None
+
+    monkeypatch.setattr(decoding_module, "initialize_tree", _initialize_tree)
+
+    model.eagle3_prefill(torch.tensor([[20, 21]]), cache)
+
+    assert torch.equal(seen["unfed"], torch.tensor([[5, 6, 7, 9]]))
+    assert seen["tree"] is None
+
+
+def test_eagle3_prefill_rejects_a_batch_or_an_empty_budget_without_touching_the_cache(monkeypatch) -> None:
+    model = _eagle3_model()
+    cache = _RoundCache()
+    monkeypatch.setattr(decoding_module, "initialize_tree", lambda *args, **kwargs: pytest.fail("must not run"))
+
+    with pytest.raises(NotImplementedError, match="batch size 1"):
+        model.eagle3_prefill(torch.tensor([[1], [2]]), cache)
+    with pytest.raises(NotImplementedError, match="batch size 1"):
+        model.eagle3_prefill(torch.tensor([1, 2]), cache)
+    with pytest.raises(ValueError, match="max_new_tokens must be >= 1"):
+        model.eagle3_prefill(torch.tensor([[1]]), cache, max_new_tokens=0)
+    assert torch.equal(cache.accept_tokens, torch.tensor([[5, 6, 7]]))
+    assert cache.unfed_tokens is None

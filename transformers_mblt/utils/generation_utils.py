@@ -22,6 +22,7 @@ from ..utils.cache_utils import (
     cache_matches_backend_topology,
     cache_rope_deltas,
     defer_eagle3_accept_tokens,
+    defer_eagle3_round_tokens,
     note_eagle3_fed_tokens,
     take_eagle3_unfed_tokens,
 )
@@ -1064,6 +1065,9 @@ class MobilintEagle3GenerationMixin(ABC, GenerationMixin):
             cache.reset()
         elif not isinstance(cache, MobilintEagle3Cache):
             raise TypeError("past_key_values must be MobilintEagle3Cache for EAGLE-3 models.")
+        # A cache left between eagle3_decode_step rounds already returned its accepted tokens and next token; this
+        # call feeds them first instead of dropping them with the tree.
+        defer_eagle3_round_tokens(cache)
         cache.clear_tree_state()
         cache.sync_draft_seq_length_to_base()
         # Reset the draft model's reusable attention-mask buffer bookkeeping
@@ -1086,15 +1090,20 @@ class MobilintEagle3GenerationMixin(ABC, GenerationMixin):
     ) -> torch.LongTensor:
         """Feed ``input_ids`` to ``cache`` and draft the first tree; return its root, the next token ``[1, 1]``.
 
-        ``input_ids`` is the whole sequence or, for a cache that already holds a prefix, the tokens after it.
-        ``logits_processor`` (see :func:`~transformers_mblt.utils.eagle3.decoding.prepare_logits_processor`) samples
-        the tokens; ``None`` is greedy. ``max_new_tokens`` caps the draft tree for a short generation. Continue with
-        :meth:`eagle3_decode_step`. Uses the tree that :meth:`configure_eagle3_tree` set.
+        ``input_ids`` (``[1, n]``) is the whole sequence or, for a cache that already holds a prefix, the tokens after
+        it. Tokens that earlier rounds on ``cache`` returned without feeding are fed first. ``logits_processor`` (see
+        :func:`~transformers_mblt.utils.eagle3.decoding.prepare_logits_processor`) samples the tokens; ``None`` is
+        greedy. ``max_new_tokens`` (at least 1, counting the returned token) caps the draft tree for a short
+        generation. Continue with :meth:`eagle3_decode_step`. Uses the tree that :meth:`configure_eagle3_tree` set.
         """
         from ..utils.eagle3.decoding import initialize_tree
 
         if cache is None:
             raise TypeError("eagle3_prefill needs the request's MobilintEagle3Cache; the next rounds run on it.")
+        if input_ids.ndim != 2 or input_ids.shape[0] != 1:
+            raise NotImplementedError("EAGLE-3 models only support batch size 1.")
+        if max_new_tokens is not None and max_new_tokens < 1:
+            raise ValueError(f"eagle3_prefill returns a token, so max_new_tokens must be >= 1, got {max_new_tokens}.")
         cache = self._prepare_eagle3_cache(cache)
         draft_tokens, _, _, _, _ = initialize_tree(
             input_ids,
@@ -1121,8 +1130,11 @@ class MobilintEagle3GenerationMixin(ABC, GenerationMixin):
         Returns an :class:`~transformers_mblt.utils.eagle3.decoding.Eagle3DecodeStep`. Its ``tokens`` start with
         the root that :meth:`eagle3_prefill` or the previous step returned as ``next_token``, followed by the
         accepted draft tokens. A caller that already emitted the root emits ``tokens[:, 1:]`` and then
-        ``next_token``. ``max_new_tokens`` caps ``tokens``, counting the root. Each request needs its own cache;
-        rounds of different caches can interleave.
+        ``next_token``. ``max_new_tokens`` caps ``tokens``, counting the root. ``eos_token_id`` ends the round at
+        those ids; ``None`` (the default) never stops at EOS, so pass ``generation_config.eos_token_id`` to stop as
+        :meth:`generate` does. Each request needs its own cache; rounds of different caches can interleave. A cache
+        left between rounds can go to :meth:`eagle3_prefill` or :meth:`generate` for the next turn: they feed the
+        tokens the rounds returned first.
         """
         from ..utils.eagle3.decoding import decode_step
 

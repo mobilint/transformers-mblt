@@ -9,7 +9,8 @@
   `eagle3_decode_step(cache)` verifies the draft tree and returns an `Eagle3DecodeStep` (the round's tokens and the
   next tree's root). Each request keeps its own `MobilintEagle3Cache`, which holds its draft tree between rounds.
   `configure_eagle3_tree()` sets the tree size that `generate()` otherwise resolves per call. `generate()` now runs
-  its loop on the same `decode_step`, so its outputs are unchanged.
+  its loop on the same `decode_step`, so its outputs are unchanged. A cache left between rounds can take the next
+  turn through `eagle3_prefill` or `generate()`: the tokens the rounds returned without feeding are fed first.
 
 ### Changed
 
