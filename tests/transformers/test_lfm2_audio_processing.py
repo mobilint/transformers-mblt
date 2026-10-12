@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from tokenizers.pre_tokenizers import Whitespace
+from transformers import AutoFeatureExtractor, AutoProcessor, PreTrainedTokenizerFast
 
 from transformers_mblt.models.lfm2_audio.configuration_lfm2_audio import MobilintLfm2AudioConfig
 from transformers_mblt.models.lfm2_audio.processing_lfm2_audio import (
     MobilintLfm2AudioFeatureExtractor,
+    MobilintLfm2AudioProcessor,
     audio_embedding_count,
 )
 
@@ -61,12 +68,41 @@ def test_feature_extractor_rejects_other_sampling_rates() -> None:
         extractor(np.zeros(8000, dtype=np.float32), sampling_rate=8000)
 
 
-def test_feature_extractor_config_round_trip_drops_filters() -> None:
+def test_feature_extractor_config_round_trip_drops_runtime_fields() -> None:
     extractor = MobilintLfm2AudioFeatureExtractor()
     payload = extractor.to_dict()
     assert "mel_filters" not in payload
-    restored = MobilintLfm2AudioFeatureExtractor(**{k: v for k, v in payload.items() if k != "feature_extractor_type"})
+    assert "feature_extractor_type" not in payload
+    restored = MobilintLfm2AudioFeatureExtractor(**payload)
     assert np.allclose(restored.mel_filters, extractor.mel_filters)
+
+
+def test_auto_classes_load_saved_processor_from_config_registration(tmp_path: Path) -> None:
+    backend = Tokenizer(WordLevel({"<unk>": 0, "<pad>": 1, "<|reserved_6|>": 2}, unk_token="<unk>"))
+    backend.pre_tokenizer = Whitespace()
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="<unk>", pad_token="<pad>")
+    tokenizer._processor_class = "ExistingProcessor"
+    extractor = MobilintLfm2AudioFeatureExtractor()
+    extractor._processor_class = "ExistingFeatureProcessor"
+    processor = MobilintLfm2AudioProcessor(extractor, tokenizer)
+
+    MobilintLfm2AudioConfig().save_pretrained(tmp_path)
+    processor.save_pretrained(tmp_path)
+
+    assert tokenizer._processor_class == "ExistingProcessor"
+    assert extractor._processor_class == "ExistingFeatureProcessor"
+    sidecar_names = ("preprocessor_config.json", "processor_config.json", "tokenizer_config.json")
+    sidecars = "\n".join((tmp_path / name).read_text() for name in sidecar_names if (tmp_path / name).exists())
+    assert "MobilintLfm2AudioFeatureExtractor" not in sidecars
+    assert "MobilintLfm2AudioProcessor" not in sidecars
+    assert "ExistingProcessor" not in sidecars
+    assert "ExistingFeatureProcessor" not in sidecars
+
+    loaded_extractor = AutoFeatureExtractor.from_pretrained(tmp_path, trust_remote_code=False)
+    loaded_processor = AutoProcessor.from_pretrained(tmp_path, trust_remote_code=False)
+
+    assert isinstance(loaded_extractor, MobilintLfm2AudioFeatureExtractor)
+    assert isinstance(loaded_processor, MobilintLfm2AudioProcessor)
 
 
 def test_config_routes_prefixed_npu_kwargs_to_sub_configs() -> None:

@@ -102,6 +102,10 @@ class MobilintLfm2AudioFeatureExtractor(SequenceFeatureExtractor):
     def to_dict(self) -> dict[str, Any]:
         output = super().to_dict()
         output.pop("mel_filters", None)
+        output.pop("feature_extractor_type", None)
+        output.pop("processor_class", None)
+        output.pop("_processor_class", None)
+        output.pop("_set_processor_class", None)
         return output
 
     def num_frames(self, num_samples: int) -> int:
@@ -230,6 +234,47 @@ class MobilintLfm2AudioProcessor(ProcessorMixin):
         super().__init__(feature_extractor, tokenizer, **kwargs)
         self.audio_token_id = tokenizer.convert_tokens_to_ids(audio_token)
 
+    def to_dict(self) -> dict[str, Any]:
+        output = super().to_dict()
+        output.pop("processor_class", None)
+        return output
+
+    def save_pretrained(self, save_directory, push_to_hub: bool = False, **kwargs: Any):
+        """Save without a custom processor hint that can block config-based Auto loading."""
+        missing = object()
+        component_states = []
+
+        def ignore_processor_class(_processor_class: str) -> None:
+            return None
+
+        # ProcessorMixin injects its class name into component sidecars while saving. Suppress that hint so the Auto
+        # classes reach config.json and the registered Mobilint config-to-component mappings.
+        for attribute_name in self.attributes:
+            component = getattr(self, attribute_name)
+            if not callable(getattr(component, "_set_processor_class", None)):
+                continue
+            component_states.append(
+                (
+                    component,
+                    getattr(component, "_processor_class", missing),
+                    component.__dict__.get("_set_processor_class", missing),
+                )
+            )
+            component._processor_class = None
+            component._set_processor_class = ignore_processor_class
+        try:
+            return super().save_pretrained(save_directory, push_to_hub=push_to_hub, **kwargs)
+        finally:
+            for component, previous_processor_class, previous_setter in component_states:
+                if previous_processor_class is missing:
+                    del component._processor_class
+                else:
+                    component._processor_class = previous_processor_class
+                if previous_setter is missing:
+                    del component._set_processor_class
+                else:
+                    component._set_processor_class = previous_setter
+
     def prompt_pieces(self, system_prompt: str) -> tuple[list[str], list[str]]:
         """Text pieces placed before and after the user's audio in the chat layout.
 
@@ -332,8 +377,8 @@ class MobilintLfm2AudioProcessor(ProcessorMixin):
         return ["input_ids", "attention_mask", "input_features", "feature_attention_mask"]
 
 
-# Hub releases name these classes in preprocessor_config.json / processor_config.json; registering them against the
-# Mobilint config lets the Auto classes resolve them after ``transformers_mblt.register()`` without remote code.
+# Hub sidecars omit the custom class names so the Auto classes reach config.json. Registering these classes against
+# the Mobilint config then resolves them after ``transformers_mblt.register()`` without remote code.
 AutoFeatureExtractor.register(MobilintLfm2AudioConfig, MobilintLfm2AudioFeatureExtractor, exist_ok=True)
 AutoProcessor.register(MobilintLfm2AudioConfig, MobilintLfm2AudioProcessor, exist_ok=True)
 
