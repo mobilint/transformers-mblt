@@ -531,7 +531,7 @@ class MobilintLfm2AudioForConditionalGeneration(
                 input_ids, input_features, feature_attention_mask, count_npu_time=bool(kwargs.get("count_npu_time"))
             )
 
-        # The model decodes one sequence at a time; beam search (the ASR pipeline default) becomes greedy decoding.
+        # The model decodes one sequence at a time; prevent generation from expanding the NPU cache batch.
         generation_config = kwargs.get("generation_config")
         num_beams = kwargs.get("num_beams")
         if num_beams is None:
@@ -541,6 +541,17 @@ class MobilintLfm2AudioForConditionalGeneration(
         if num_beams is not None and int(num_beams) > 1:
             logger.warning_once("Mobilint LFM2-Audio decodes greedily; num_beams=%d is ignored.", int(num_beams))
             kwargs["num_beams"] = 1
+        num_return_sequences = kwargs.get("num_return_sequences")
+        if num_return_sequences is None:
+            num_return_sequences = getattr(generation_config, "num_return_sequences", None)
+        if num_return_sequences is None:
+            num_return_sequences = getattr(self.generation_config, "num_return_sequences", None)
+        if num_return_sequences is not None and int(num_return_sequences) > 1:
+            logger.warning_once(
+                "Mobilint LFM2-Audio returns one sequence; num_return_sequences=%d is ignored.",
+                int(num_return_sequences),
+            )
+            kwargs["num_return_sequences"] = 1
         result = super().generate(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
         if pipeline_invocation:
             prompt_length = int(input_ids.shape[1])

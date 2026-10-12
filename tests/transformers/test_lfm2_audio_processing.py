@@ -19,6 +19,12 @@ from transformers_mblt.models.lfm2_audio.processing_lfm2_audio import (
 )
 
 
+def _tiny_tokenizer() -> PreTrainedTokenizerFast:
+    backend = Tokenizer(WordLevel({"<unk>": 0, "<pad>": 1, "<|reserved_6|>": 2}, unk_token="<unk>"))
+    backend.pre_tokenizer = Whitespace()
+    return PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="<unk>", pad_token="<pad>")
+
+
 @pytest.mark.parametrize(
     ("frames", "expected"),
     [(1, 1), (8, 1), (9, 2), (1000, 125), (1001, 126), (2000, 250), (2003, 251)],
@@ -77,10 +83,27 @@ def test_feature_extractor_config_round_trip_drops_runtime_fields() -> None:
     assert np.allclose(restored.mel_filters, extractor.mel_filters)
 
 
+def test_processor_requires_feature_mask_when_extractor_default_disables_it() -> None:
+    extractor = MobilintLfm2AudioFeatureExtractor(return_attention_mask=False)
+    processor = MobilintLfm2AudioProcessor(extractor, _tiny_tokenizer())
+    audio = np.random.default_rng(0).standard_normal(16000).astype(np.float32)
+
+    inputs = processor(audio=audio, sampling_rate=16000, return_tensors="np")
+
+    assert inputs["feature_attention_mask"].shape == (1, extractor.num_frames(16000))
+    assert inputs["feature_attention_mask"].sum() == 16000 // extractor.hop_length
+
+
+@pytest.mark.parametrize(("kwargs", "message"), [({"audio": []}, "audio"), ({"text": []}, "text")])
+def test_processor_rejects_empty_input_lists(kwargs: dict, message: str) -> None:
+    processor = MobilintLfm2AudioProcessor(MobilintLfm2AudioFeatureExtractor(), _tiny_tokenizer())
+
+    with pytest.raises(ValueError, match=message):
+        processor(**kwargs)
+
+
 def test_auto_classes_load_saved_processor_from_config_registration(tmp_path: Path) -> None:
-    backend = Tokenizer(WordLevel({"<unk>": 0, "<pad>": 1, "<|reserved_6|>": 2}, unk_token="<unk>"))
-    backend.pre_tokenizer = Whitespace()
-    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="<unk>", pad_token="<pad>")
+    tokenizer = _tiny_tokenizer()
     tokenizer._processor_class = "ExistingProcessor"
     extractor = MobilintLfm2AudioFeatureExtractor()
     extractor._processor_class = "ExistingFeatureProcessor"

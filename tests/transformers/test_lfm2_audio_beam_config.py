@@ -8,9 +8,9 @@ from transformers import GenerationConfig, GenerationMixin
 from transformers_mblt.models.lfm2_audio.modeling_lfm2_audio import MobilintLfm2AudioForConditionalGeneration
 
 
-def test_generate_forces_checkpoint_beam_default_to_greedy(monkeypatch) -> None:
+def test_generate_forces_checkpoint_multi_sequence_defaults_to_single_greedy(monkeypatch) -> None:
     model = object.__new__(MobilintLfm2AudioForConditionalGeneration)
-    model.generation_config = GenerationConfig(num_beams=4)
+    model.generation_config = GenerationConfig(num_beams=4, num_return_sequences=4)
     forwarded_kwargs = {}
 
     def fake_generate(_self, **kwargs):
@@ -24,3 +24,4 @@ def test_generate_forces_checkpoint_beam_default_to_greedy(monkeypatch) -> None:
 
     assert result is input_ids
     assert forwarded_kwargs["num_beams"] == 1
+    assert forwarded_kwargs["num_return_sequences"] == 1

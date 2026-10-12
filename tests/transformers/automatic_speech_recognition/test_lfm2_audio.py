@@ -7,10 +7,10 @@ when the variable is unset.
 import os
 
 import pytest
-from datasets import load_dataset
 from transformers import pipeline
 
 import transformers_mblt
+from tests.asr_samples import load_librispeech_dummy
 from tests.pipe_teardown import pipe_fixture
 
 MODEL_PATHS = tuple(filter(None, [os.environ.get("MBLT_LFM2_AUDIO_MODEL")]))
@@ -30,9 +30,9 @@ def pipe(request, encoder_decoder_npu_params):
 
 def test_via_huggingface_pipeline(pipe):
     """Transcribe LibriSpeech dummy clips and check that each output is non-empty text."""
-    ds = load_dataset("hf-internal-testing/librispeech_asr_dummy", "clean", split="validation")
-    for i in range(3):
-        output = pipe(ds[i]["audio"])  # type: ignore[index]
+    samples = load_librispeech_dummy(3)
+    for sample in samples:
+        output = pipe(sample["audio"])
         assert isinstance(output["text"], str) and output["text"].strip()
         print("Result: %s" % output["text"])
-        print("Answer: %s" % ds[i]["text"])  # type: ignore[index]
+        print("Answer: %s" % sample["text"])

@@ -331,14 +331,23 @@ class MobilintLfm2AudioProcessor(ProcessorMixin):
         if text is None and audio is None:
             raise ValueError("either text or audio is required")
         texts = None if text is None else ([text] if isinstance(text, str) else list(text))
+        if texts is not None and not texts:
+            raise ValueError("text must not be empty")
 
         audio_inputs: dict[str, Any] = {}
         counts: list[int] = []
         if audio is not None:
+            if isinstance(audio, (list, tuple)) and not audio:
+                raise ValueError("audio must not be empty")
             clips = audio if isinstance(audio, (list, tuple)) and not np.isscalar(audio[0]) else [audio]
             if texts is not None and len(clips) != len(texts):
                 raise ValueError(f"{len(clips)} audio clips for {len(texts)} prompts")
-            features = self.feature_extractor(clips, sampling_rate=sampling_rate, return_tensors=None)
+            features = self.feature_extractor(
+                clips,
+                sampling_rate=sampling_rate,
+                return_tensors=None,
+                return_attention_mask=True,
+            )
             audio_inputs["input_features"] = features["input_features"]
             audio_inputs["feature_attention_mask"] = features["attention_mask"]
             counts = [
