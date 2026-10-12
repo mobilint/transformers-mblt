@@ -533,7 +533,11 @@ class MobilintLfm2AudioForConditionalGeneration(
 
         # The model decodes one sequence at a time; beam search (the ASR pipeline default) becomes greedy decoding.
         generation_config = kwargs.get("generation_config")
-        num_beams = kwargs.get("num_beams", getattr(generation_config, "num_beams", None))
+        num_beams = kwargs.get("num_beams")
+        if num_beams is None:
+            num_beams = getattr(generation_config, "num_beams", None)
+        if num_beams is None:
+            num_beams = getattr(self.generation_config, "num_beams", None)
         if num_beams is not None and int(num_beams) > 1:
             logger.warning_once("Mobilint LFM2-Audio decodes greedily; num_beams=%d is ignored.", int(num_beams))
             kwargs["num_beams"] = 1
