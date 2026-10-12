@@ -48,7 +48,7 @@ class MobilintLfm2AudioFeatureExtractor(SequenceFeatureExtractor):
 
     ``__call__`` returns ``input_features`` of shape ``(batch, feature_size, frames)`` and ``attention_mask`` of
     shape ``(batch, frames)``. A clip of ``n`` samples yields ``1 + n // hop_length`` frames; the last frame
-    carries ``padding_value`` and is counted as part of the clip, matching the model's own front end.
+    carries ``padding_value`` and is excluded from the attention mask, matching the model's valid sequence length.
 
     Args:
         feature_size: Mel bins.
@@ -178,12 +178,13 @@ class MobilintLfm2AudioFeatureExtractor(SequenceFeatureExtractor):
                 raise ValueError(f"each clip must be a mono 1-D waveform, got shape {clip.shape}")
 
         features = [self._log_mel(clip) for clip in clips]
+        valid_frames = [clip.shape[0] // self.hop_length for clip in clips]
         max_frames = max(f.shape[1] for f in features)
         input_features = np.full((len(features), self.feature_size, max_frames), self.padding_value, dtype=np.float32)
         attention_mask = np.zeros((len(features), max_frames), dtype=np.int64)
-        for index, mel in enumerate(features):
+        for index, (mel, valid) in enumerate(zip(features, valid_frames)):
             input_features[index, :, : mel.shape[1]] = mel
-            attention_mask[index, : mel.shape[1]] = 1
+            attention_mask[index, :valid] = 1
 
         data: dict[str, Any] = {"input_features": input_features}
         if return_attention_mask if return_attention_mask is not None else self.return_attention_mask:

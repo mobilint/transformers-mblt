@@ -29,15 +29,30 @@ def test_feature_extractor_frames_and_mask() -> None:
     batch = extractor([short, long], sampling_rate=16000, return_tensors="np")
     assert batch["input_features"].shape == (2, 128, extractor.num_frames(24000))
     assert batch["attention_mask"].shape == (2, extractor.num_frames(24000))
-    assert batch["attention_mask"][0].sum() == extractor.num_frames(16000) == 1 + 16000 // 160
-    assert batch["attention_mask"][1].sum() == extractor.num_frames(24000)
-    # The frame after the last full hop is counted as part of the clip and carries the padding value.
+    assert batch["attention_mask"][0].sum() == 16000 // extractor.hop_length
+    assert batch["attention_mask"][1].sum() == 24000 // extractor.hop_length
+    # The frame after the last full hop carries the padding value and is excluded from the valid mask.
+    assert batch["attention_mask"][0, extractor.num_frames(16000) - 1] == 0
     assert np.all(batch["input_features"][0, :, extractor.num_frames(16000) - 1] == extractor.padding_value)
     assert np.all(batch["input_features"][0, :, extractor.num_frames(16000) :] == extractor.padding_value)
     # Per-feature normalization over the valid frames: zero mean, unit variance up to the epsilon.
     valid = batch["input_features"][0, :, : 16000 // 160]
     assert np.allclose(valid.mean(axis=1), 0.0, atol=1e-4)
     assert np.allclose(valid.std(axis=1, ddof=1), 1.0, atol=1e-2)
+
+
+def test_feature_extractor_excludes_terminal_padding_at_exact_encoder_window() -> None:
+    extractor = MobilintLfm2AudioFeatureExtractor()
+    audio = np.random.default_rng(0).standard_normal(160000).astype(np.float32)
+
+    batch = extractor(audio, sampling_rate=16000, return_tensors="np")
+
+    assert batch["input_features"].shape == (1, 128, 1001)
+    assert batch["attention_mask"].shape == (1, 1001)
+    assert batch["attention_mask"].sum() == 1000
+    assert batch["attention_mask"][0, 1000] == 0
+    assert np.all(batch["input_features"][0, :, 1000] == extractor.padding_value)
+    assert audio_embedding_count(int(batch["attention_mask"].sum())) == 125
 
 
 def test_feature_extractor_rejects_other_sampling_rates() -> None:
