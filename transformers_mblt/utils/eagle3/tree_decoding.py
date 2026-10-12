@@ -665,8 +665,8 @@ def update_inference_inputs(
     if remaining_tokens is not None:
         accepted = accepted[:, : max(0, remaining_tokens)]
     should_stop = accepted.numel() == 0
-    if eos_token_id is not None and accepted.numel() > 0:
-        eos_ids = [eos_token_id] if isinstance(eos_token_id, int) else eos_token_id
+    eos_ids = [] if eos_token_id is None else [eos_token_id] if isinstance(eos_token_id, int) else list(eos_token_id)
+    if eos_ids and accepted.numel() > 0:
         eos_positions = [index for index, token in enumerate(accepted[0].tolist()) if token in eos_ids]
         if eos_positions:
             accepted = accepted[:, : eos_positions[0] + 1]
@@ -706,6 +706,22 @@ def update_inference_inputs(
     else:
         token = torch.argmax(sample_p, dim=-1, keepdim=True)[None]
 
+    if int(token.reshape(-1)[0]) in eos_ids:
+        # The next token ends generation: return it with the accepted tokens instead of drafting a tree after it. None
+        # of them were fed, so all of them wait in unfed_tokens.
+        token = token.reshape(1, 1).to(device=accepted.device, dtype=accepted.dtype)
+        cache.accept_tokens = torch.cat((accepted, token), dim=1)
+        defer_eagle3_accept_tokens(cache)
+        return (
+            torch.cat([input_ids, token.to(input_ids.device)], dim=-1),
+            torch.empty(0, dtype=torch.long, device=input_ids.device),
+            retrieve_indices,
+            torch.empty(0),
+            torch.empty(0),
+            new_token_count + 1,
+            True,
+        )
+
     # The draft reads token t+1 with the base hidden state of token t: the accepted tokens shifted by one, then the
     # sampled token. Passing it explicitly keeps it right when ``input_ids`` is a delta-only input.
     draft_input_ids = torch.cat((accepted[:, 1:], token.to(accepted.device)), dim=1)
@@ -730,16 +746,19 @@ class Eagle3DecodeStep:
     """One EAGLE-3 round: the base model verifies the draft tree, then the draft builds the next tree.
 
     Attributes:
-        tokens: ``[1, n]`` tokens the round settles: the tree root, then the accepted draft tokens.
+        tokens: ``[1, n]`` tokens the round settles: the tree root, then the accepted draft tokens, then the next token
+            when it is an ``eos_token_id`` (the round then ends generation).
         next_token: ``[1, 1]`` root of the next tree, sampled from the base logits after ``tokens``. ``None`` when
             the round ended generation (EOS or the token budget) and built no tree.
         logits: Base-model logits over the verified tree nodes.
+        accepted_draft_tokens: Draft tokens among ``tokens`` (without the root and an appended EOS).
         candidate_draft_tokens: Draft tokens on the tree's longest path, the most the round could accept.
     """
 
     tokens: torch.LongTensor
     next_token: Optional[torch.LongTensor]
     logits: torch.Tensor
+    accepted_draft_tokens: int
     candidate_draft_tokens: int
 
     @property
@@ -808,5 +827,7 @@ def decode_step(
         tokens=tokens,
         next_token=None if stopped else next_draft_tokens[:, :1],
         logits=logits,
+        # The budget or an EOS can cut the accepted path; an EOS sampled after the whole path adds a token.
+        accepted_draft_tokens=max(0, min(int(accepted_draft_count), int(tokens.shape[1]) - 1)),
         candidate_draft_tokens=max(1, candidate_width - 1),
     )

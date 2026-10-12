@@ -11,6 +11,9 @@
   `configure_eagle3_tree()` sets the tree size that `generate()` otherwise resolves per call. `generate()` now runs
   its loop on the same `decode_step`, so its outputs are unchanged. A cache left between rounds can take the next
   turn through `eagle3_prefill` or `generate()`: the tokens the rounds returned without feeding are fed first.
+- An EAGLE-3 round whose next sampled token is EOS ends there and returns that token, instead of drafting a tree after
+  it and running one more round to emit it. `generate()` output is unchanged; the last round no longer counts as an
+  extra step in `last_eagle3_acceptance_stats`.
 
 ### Changed
 

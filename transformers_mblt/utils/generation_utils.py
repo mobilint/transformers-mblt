@@ -1283,12 +1283,10 @@ class MobilintEagle3GenerationMixin(ABC, GenerationMixin):
                 eos_token_id=eos_token_id,
                 count_npu_time=count_npu_time,
             )
-            emitted = int(step.tokens.shape[1])
             generated = torch.cat((generated, step.tokens.to(generated.device)), dim=1)
-            new_token_count += emitted
-            # A round emits its root token plus the accepted drafts, already cut at EOS and the remaining budget, so
-            # ``emitted - 1`` is the accepted draft count (zero when the round emits nothing).
-            accepted_tokens = max(0, emitted - 1)
+            new_token_count += int(step.tokens.shape[1])
+            # The drafts the round emitted, after EOS and the remaining budget cut them.
+            accepted_tokens = step.accepted_draft_tokens
             acceptance_steps += 1
             acceptance_tokens_sum += accepted_tokens
             acceptance_ratio_sum += float(accepted_tokens) / float(step.candidate_draft_tokens)

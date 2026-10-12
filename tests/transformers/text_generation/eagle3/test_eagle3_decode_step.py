@@ -161,6 +161,29 @@ def test_decode_step_stops_at_eos() -> None:
     assert step.stopped
 
 
+def test_decode_step_ends_the_round_when_the_next_token_is_eos() -> None:
+    """An EOS sampled after the accepted path is returned with them, and no tree is drafted after it."""
+    model, cache = _model_with_tree([6, 7, 2])
+
+    step = decode_step(model, cache, None, eos_token_id=[2, 13])
+
+    assert torch.equal(step.tokens, torch.tensor([[5, 6, 7, 2]]))
+    assert step.stopped
+    assert step.accepted_draft_tokens == 2
+    assert model.eagle3_draft_model.calls == []
+    assert torch.equal(cache.unfed_tokens, torch.tensor([[5, 6, 7, 2]]))
+    assert cache.pending_draft_tokens is None
+    assert cache.get_base_seq_length() == 4
+
+
+def test_decode_step_reports_the_drafts_it_accepted() -> None:
+    model, cache = _model_with_tree([6, 7, 9])
+    assert decode_step(model, cache, None).accepted_draft_tokens == 2
+
+    model, cache = _model_with_tree([6, 7, 9])
+    assert decode_step(model, cache, None, remaining_tokens=2).accepted_draft_tokens == 1
+
+
 class _FakeEagle3Cache(MobilintEagle3Cache):
     """Satisfies the type check without MXQs."""
 

@@ -77,6 +77,7 @@ def decode_rounds(monkeypatch: pytest.MonkeyPatch):
                 tokens=torch.tensor([list(tokens)], dtype=torch.long),
                 next_token=None if stopped else torch.tensor([[3]], dtype=torch.long),
                 logits=torch.zeros((1, 1, 16), dtype=torch.float32),
+                accepted_draft_tokens=max(0, len(tokens) - 1),
                 candidate_draft_tokens=candidate_draft_tokens,
             )
 
