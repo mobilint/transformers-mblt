@@ -49,3 +49,39 @@ def pipe(request: pytest.FixtureRequest, revision: Optional[str], eagle3_npu_par
         )
     yield created_pipe
     del created_pipe
+
+
+@pytest.fixture
+def decode_rounds(monkeypatch: pytest.MonkeyPatch):
+    """Replace ``decode_step`` with rounds that return the given tokens, for tests of the generate loop.
+
+    Call the fixture with one entry per round: ``(tokens, stopped)``, or a callable taking the cache and returning
+    that pair; the last entry repeats. ``tokens`` lists the ids the round settles. Rounds report zero logits over a
+    16-token vocabulary and ``candidate_draft_tokens`` (default 1). ``initialize_tree`` is left to the test.
+    """
+    import torch
+
+    from transformers_mblt.utils.eagle3 import decoding as decoding_module
+    from transformers_mblt.utils.eagle3.tree_decoding import Eagle3DecodeStep
+
+    def install(*rounds, candidate_draft_tokens: int = 1) -> list[dict]:
+        # The keyword arguments of each decode_step call.
+        calls: list[dict] = []
+        pending = list(rounds)
+
+        def _decode_step(_model, cache, _logits_processor, **kwargs):
+            calls.append(kwargs)
+            round_ = pending.pop(0) if len(pending) > 1 else pending[0]
+            tokens, stopped = round_(cache) if callable(round_) else round_
+            return Eagle3DecodeStep(
+                tokens=torch.tensor([list(tokens)], dtype=torch.long),
+                next_token=None if stopped else torch.tensor([[3]], dtype=torch.long),
+                logits=torch.zeros((1, 1, 16), dtype=torch.float32),
+                accepted_draft_tokens=max(0, len(tokens) - 1),
+                candidate_draft_tokens=candidate_draft_tokens,
+            )
+
+        monkeypatch.setattr(decoding_module, "decode_step", _decode_step)
+        return calls
+
+    return install

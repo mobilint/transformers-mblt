@@ -2,12 +2,31 @@
 
 ## Unreleased
 
+### Added
+
+- EAGLE-3 models can run one speculative round at a time, for a serving engine that interleaves requests:
+  `eagle3_prefill(input_ids, cache)` feeds the prompt and returns the first token, and each
+  `eagle3_decode_step(cache)` verifies the draft tree and returns an `Eagle3DecodeStep` (the round's tokens and the
+  next tree's root). Each request keeps its own `MobilintEagle3Cache`, which holds its draft tree between rounds.
+  `configure_eagle3_tree()` sets the tree size that `generate()` otherwise resolves per call. `generate()` now runs
+  its loop on the same `decode_step`, so its outputs are unchanged. A cache left between rounds can take the next
+  turn through `eagle3_prefill` or `generate()`: the tokens the rounds returned without feeding are fed first.
+- An EAGLE-3 round whose next sampled token is EOS ends there and returns that token, instead of drafting a tree after
+  it and running one more round to emit it. `generate()` output is unchanged; the last round no longer counts as an
+  extra step in `last_eagle3_acceptance_stats`.
+
 ### Changed
 
 - Batched forward with `logits_to_keep=1` copies each row's last-token logits once into the returned tensor, instead
   of converting the whole MXQ output, cloning every row and stacking them. A 16-row decode step of
   Llama-3.2-1B-Batch16 takes 2.8 ms less in total (40.7 ms to 37.9 ms; a bare MXQ infer takes 36.5 ms): about
   1.0 ms less outside the infer call and 1.7 ms less inside it, where the extra allocations had slowed it down.
+
+### Fixed
+
+- EAGLE-3 sampling at temperature 1.0 without top-k or top-p no longer decodes greedily.
+  `prepare_logits_processor` returned `None`, which means greedy, whenever no processor applied; it now returns an
+  empty list, which samples from the plain softmax.
 
 ## 0.4.0
 

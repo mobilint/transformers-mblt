@@ -657,6 +657,46 @@ outputs = model.generate(
 )
 ```
 
+### Running EAGLE-3 one round at a time
+
+A serving engine that interleaves requests drives the rounds itself instead of calling `generate()`. Each request keeps
+its own `MobilintEagle3Cache`, which holds the request's KV and its draft tree between rounds; rounds of different
+caches can interleave on the same model.
+
+```python
+from transformers_mblt.utils.cache_utils import MobilintEagle3Cache
+from transformers_mblt.utils.eagle3.decoding import prepare_logits_processor
+
+model.configure_eagle3_tree()  # tree size from generation_config.json, as generate() resolves it
+cache = MobilintEagle3Cache(*model.get_cache_mxq_models())
+cache.reset()
+logits_processor = None  # greedy; or prepare_logits_processor(temperature=0.7, top_p=0.9, top_k=50)
+
+eos_token_id = model.generation_config.eos_token_id  # None never stops at EOS
+
+root = model.eagle3_prefill(input_ids, cache, logits_processor=logits_processor, max_new_tokens=max_new_tokens)
+tokens = [int(root)]
+while len(tokens) < max_new_tokens:
+    step = model.eagle3_decode_step(
+        cache,
+        logits_processor=logits_processor,
+        max_new_tokens=max_new_tokens - len(tokens) + 1,
+        eos_token_id=eos_token_id,
+    )
+    tokens += step.tokens[0, 1:].tolist()  # step.tokens[0, 0] is the root returned last time
+    if step.stopped:
+        break
+    tokens.append(int(step.next_token))
+```
+
+`eagle3_prefill` returns the root of the first draft tree: the next token, sampled from the prompt's last logits.
+Each `eagle3_decode_step` returns an `Eagle3DecodeStep`: `tokens` is the round's root followed by the accepted draft
+tokens, and `next_token` is the root of the next tree, sampled from the base logits after them. `max_new_tokens` caps
+`tokens`, counting the root; a round that reaches it, or `eos_token_id`, returns `next_token=None` and keeps its
+accepted tokens in `unfed_tokens`. A cache that stops between rounds (here, when `next_token` fills the budget) has
+not fed its last accepted tokens and `next_token` yet. The next `eagle3_prefill` or `generate()` on it feeds them
+before its own input, so a delta-only next turn continues the conversation. `generate()` runs the same rounds.
+
 ### Original Keyword Parameters from `transformers`
 
 The parameters below follow the standard `transformers` semantics. For Mobilint quantized `*.mxq` models, they only affect the non-NPU parts of the model (typically CPU-side layers such as embeddings). NPU execution always runs on Mobilint NPUs.

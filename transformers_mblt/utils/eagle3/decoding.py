@@ -4,6 +4,8 @@ This module is a stable import surface for tree-decoding primitives.
 """
 
 from .tree_decoding import (
+    Eagle3DecodeStep,
+    decode_step,
     evaluate_posterior,
     initialize_tree,
     prepare_logits_processor,
@@ -12,6 +14,8 @@ from .tree_decoding import (
 )
 
 __all__ = [
+    "Eagle3DecodeStep",
+    "decode_step",
     "prepare_logits_processor",
     "initialize_tree",
     "tree_decoding",

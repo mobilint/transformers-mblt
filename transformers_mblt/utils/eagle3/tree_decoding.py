@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from typing import Any, Literal, Optional, Protocol, TypeAlias
 
 import torch
@@ -172,6 +173,9 @@ def prepare_logits_processor(
     Ordering matches Hugging Face's ``_get_logits_processor``/``_get_logits_warper`` contract
     (repetition penalty → temperature → top-k → top-p) so that :func:`softmax_topk_cpu_torch`
     can safely apply the list on top of a top-k slice when a ``TopKLogitsWarper`` is present.
+
+    Returns ``None`` (greedy) when ``temperature`` is zero. Any other temperature returns a list, empty for plain
+    sampling at temperature 1.0 without top-k or top-p.
     """
     processor_list = LogitsProcessorList()
     if temperature <= 1e-5:
@@ -184,7 +188,8 @@ def prepare_logits_processor(
         processor_list.append(TopKLogitsWarper(top_k))
     if 1e-8 <= top_p < 1.0:
         processor_list.append(TopPLogitsWarper(top_p))
-    return processor_list or None
+    # An empty list still means sampling: ``None`` would make the caller decode greedily.
+    return processor_list
 
 
 def _extract_top_k_from_processor(
@@ -460,7 +465,7 @@ def tree_decoding(
     model: MobilintEagle3GenerationProtocol,
     cache: MobilintEagle3Cache,
     tree_candidates: torch.LongTensor,
-    input_ids: torch.LongTensor,
+    input_ids: Optional[torch.LongTensor],
     retrieve_indices: torch.LongTensor,
     tree_position_ids: torch.LongTensor,
     *,
@@ -660,8 +665,8 @@ def update_inference_inputs(
     if remaining_tokens is not None:
         accepted = accepted[:, : max(0, remaining_tokens)]
     should_stop = accepted.numel() == 0
-    if eos_token_id is not None and accepted.numel() > 0:
-        eos_ids = [eos_token_id] if isinstance(eos_token_id, int) else eos_token_id
+    eos_ids = [] if eos_token_id is None else [eos_token_id] if isinstance(eos_token_id, int) else list(eos_token_id)
+    if eos_ids and accepted.numel() > 0:
         eos_positions = [index for index, token in enumerate(accepted[0].tolist()) if token in eos_ids]
         if eos_positions:
             accepted = accepted[:, : eos_positions[0] + 1]
@@ -701,6 +706,22 @@ def update_inference_inputs(
     else:
         token = torch.argmax(sample_p, dim=-1, keepdim=True)[None]
 
+    if int(token.reshape(-1)[0]) in eos_ids:
+        # The next token ends generation: return it with the accepted tokens instead of drafting a tree after it. None
+        # of them were fed, so all of them wait in unfed_tokens.
+        token = token.reshape(1, 1).to(device=accepted.device, dtype=accepted.dtype)
+        cache.accept_tokens = torch.cat((accepted, token), dim=1)
+        defer_eagle3_accept_tokens(cache)
+        return (
+            torch.cat([input_ids, token.to(input_ids.device)], dim=-1),
+            torch.empty(0, dtype=torch.long, device=input_ids.device),
+            retrieve_indices,
+            torch.empty(0),
+            torch.empty(0),
+            new_token_count + 1,
+            True,
+        )
+
     # The draft reads token t+1 with the base hidden state of token t: the accepted tokens shifted by one, then the
     # sampled token. Passing it explicitly keeps it right when ``input_ids`` is a delta-only input.
     draft_input_ids = torch.cat((accepted[:, 1:], token.to(accepted.device)), dim=1)
@@ -718,3 +739,98 @@ def update_inference_inputs(
     cache.tree_mask = tree_mask
     cache.tree_position_ids = tree_position_ids
     return input_ids, draft_tokens, retrieve_indices, tree_mask, tree_position_ids, new_token_count, False
+
+
+@dataclass(frozen=True)
+class Eagle3DecodeStep:
+    """One EAGLE-3 round: the base model verifies the draft tree, then the draft builds the next tree.
+
+    Attributes:
+        tokens: ``[1, n]`` tokens the round settles: the tree root, then the accepted draft tokens, then the next token
+            when it is an ``eos_token_id`` (the round then ends generation).
+        next_token: ``[1, 1]`` root of the next tree, sampled from the base logits after ``tokens``. ``None`` when
+            the round ended generation (EOS or the token budget) and built no tree.
+        logits: Base-model logits over the verified tree nodes.
+        accepted_draft_tokens: Draft tokens among ``tokens`` (without the root and an appended EOS).
+        candidate_draft_tokens: Draft tokens on the tree's longest path, the most the round could accept.
+    """
+
+    tokens: torch.LongTensor
+    next_token: Optional[torch.LongTensor]
+    logits: torch.Tensor
+    accepted_draft_tokens: int
+    candidate_draft_tokens: int
+
+    @property
+    def stopped(self) -> bool:
+        return self.next_token is None
+
+
+@torch.no_grad()
+def decode_step(
+    model: MobilintEagle3GenerationProtocol,
+    cache: MobilintEagle3Cache,
+    logits_processor: Optional[LogitsProcessorList],
+    *,
+    remaining_tokens: Optional[int] = None,
+    eos_token_id: Optional[int | list[int]] = None,
+    count_npu_time: bool = False,
+) -> Eagle3DecodeStep:
+    """Run one round on the draft tree ``cache`` holds (built by :func:`initialize_tree` or the previous round).
+
+    ``remaining_tokens`` caps the tokens the round settles, counting the root, so it is at least 1. A round that ends
+    generation keeps its accepted tokens unfed (see :class:`MobilintEagle3Cache`) and leaves no tree in the cache.
+    """
+    if remaining_tokens is not None and remaining_tokens < 1:
+        # The root was already returned; a round that settled nothing would drop it with the tree.
+        raise ValueError(f"A round settles at least its root, so remaining_tokens must be >= 1, got {remaining_tokens}.")
+    draft_tokens = cache.pending_draft_tokens
+    if draft_tokens is None:
+        raise RuntimeError("The EAGLE-3 cache holds no draft tree: run initialize_tree before decode_step.")
+    retrieve_indices = cache.retrieve_indices
+    logits, hidden_state_new = tree_decoding(
+        model,
+        cache,
+        draft_tokens,
+        None,
+        retrieve_indices,
+        cache.tree_position_ids,
+        count_npu_time=count_npu_time,
+    )
+    padding = torch.full((1, 1), -1, dtype=torch.long, device=draft_tokens.device)
+    candidates = torch.cat((draft_tokens, padding), dim=1)[0, retrieve_indices].contiguous()
+    best_candidate, accepted_draft_count, sample_p, sampled_indices = evaluate_posterior(
+        logits,
+        candidates,
+        logits_processor,
+        retrieve_indices,
+    )
+    candidate_width = int(candidates.shape[-1]) if candidates.ndim >= 2 else 1
+    tokens, next_draft_tokens, _, _, _, _, stopped = update_inference_inputs(
+        draft_tokens.new_empty((1, 0)),
+        candidates,
+        best_candidate,
+        accepted_draft_count,
+        retrieve_indices,
+        logits_processor,
+        0,
+        model,
+        cache,
+        hidden_state_new,
+        sample_p,
+        sampled_indices,
+        remaining_tokens=remaining_tokens,
+        eos_token_id=eos_token_id,
+        count_npu_time=count_npu_time,
+    )
+    if stopped:
+        # The tree just verified must not be verified again.
+        cache.clear_tree_state()
+    return Eagle3DecodeStep(
+        tokens=tokens,
+        next_token=None if stopped else next_draft_tokens[:, :1],
+        logits=logits,
+        # The budget or an EOS can cut the accepted path; an EOS sampled after the whole path adds a token.
+        accepted_draft_tokens=max(0, min(int(accepted_draft_count), int(tokens.shape[1]) - 1)),
+        candidate_draft_tokens=max(1, candidate_width - 1),
+    )

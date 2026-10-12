@@ -43,7 +43,7 @@ def _attach_minimal_eagle3_modules(model: MobilintQwen2Eagle3ForCausalLM) -> Non
     object.__setattr__(model, "_modules", {"model": eagle3_model})
 
 
-def _patch_minimal_generate_dependencies(monkeypatch) -> None:
+def _patch_minimal_generate_dependencies(monkeypatch, decode_rounds) -> None:
     monkeypatch.setattr(
         decoding_module,
         "initialize_tree",
@@ -55,37 +55,7 @@ def _patch_minimal_generate_dependencies(monkeypatch) -> None:
             None,
         ),
     )
-    monkeypatch.setattr(
-        decoding_module,
-        "tree_decoding",
-        lambda *_args, **_kwargs: (
-            torch.zeros((1, 1, 16), dtype=torch.float32),
-            torch.zeros((1, 1, 1), dtype=torch.float32),
-        ),
-    )
-    monkeypatch.setattr(
-        decoding_module,
-        "evaluate_posterior",
-        lambda *_args, **_kwargs: (
-            torch.tensor([4], dtype=torch.long),
-            1,
-            torch.tensor([0.0], dtype=torch.float32),
-            torch.tensor([0], dtype=torch.long),
-        ),
-    )
-    monkeypatch.setattr(
-        decoding_module,
-        "update_inference_inputs",
-        lambda *_args, **_kwargs: (
-            torch.tensor([[1, 2, 4]], dtype=torch.long),
-            torch.tensor([[3]], dtype=torch.long),
-            torch.tensor([0], dtype=torch.long),
-            None,
-            torch.tensor([[0]], dtype=torch.long),
-            1,
-            True,
-        ),
-    )
+    decode_rounds(([4], True))
 
 
 def test_evaluate_posterior_sampling_clean_accept_returns_raw_logits(monkeypatch) -> None:
@@ -291,7 +261,7 @@ def test_llm_forward_counts_single_token_first_call_as_prefill() -> None:
     assert model.logged_phases == ["prefill"]
 
 
-def test_generate_stops_with_eos_list(monkeypatch) -> None:
+def test_generate_stops_with_eos_list(monkeypatch, decode_rounds) -> None:
     """EOS list should stop generation when one of EOS ids appears."""
     model = object.__new__(MobilintQwen2Eagle3ForCausalLM)
     model.config = SimpleNamespace(vocab_size=16)
@@ -311,7 +281,7 @@ def test_generate_stops_with_eos_list(monkeypatch) -> None:
         sync_draft_seq_length_to_base=lambda: None,
     )
     model._get_cache = lambda *_args, **_kwargs: cache
-    _patch_minimal_generate_dependencies(monkeypatch)
+    _patch_minimal_generate_dependencies(monkeypatch, decode_rounds)
 
     out = model.generate(
         torch.tensor([[1, 2]], dtype=torch.long),
