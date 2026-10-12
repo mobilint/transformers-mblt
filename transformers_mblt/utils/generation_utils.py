@@ -983,6 +983,29 @@ class MobilintEagle3GenerationMixin(ABC, GenerationMixin):
         resolved_top_k = int(raw_top_k) if raw_top_k is not None else 0
         if not resolved_do_sample:
             resolved_temperature = 0.0
+        self.configure_eagle3_tree(
+            generation_config,
+            num_assistant_tokens=num_assistant_tokens,
+            eagle3_tree_depth=eagle3_tree_depth,
+            eagle3_tree_top_k=eagle3_tree_top_k,
+        )
+        return generation_config, resolved_max_new_tokens, resolved_temperature, resolved_top_p, resolved_top_k
+
+    def configure_eagle3_tree(
+        self,
+        generation_config: Optional[GenerationConfig] = None,
+        *,
+        num_assistant_tokens: Optional[int] = None,
+        eagle3_tree_depth: Optional[int] = None,
+        eagle3_tree_top_k: Optional[int] = None,
+    ) -> None:
+        """Set the draft tree the next rounds build: its size, depth and per-level fan-out.
+
+        Each value comes from the argument, else ``generation_config`` (default: the model's), else ``config.json``.
+        ``generate`` calls this on every call; callers that run rounds through :meth:`eagle3_prefill` and
+        :meth:`eagle3_decode_step` call it once before them.
+        """
+        generation_config = self.generation_config if generation_config is None else generation_config
         # Explicit ``num_assistant_tokens`` kwarg to ``generate`` overrides the value on
         # ``generation_config``; fall back to the config, then to the historical default of 64.
         if num_assistant_tokens is not None:
@@ -999,7 +1022,6 @@ class MobilintEagle3GenerationMixin(ABC, GenerationMixin):
             )
         self.eagle3_draft_model.max_draft_tokens = resolved_num_assistant_tokens - 1
         self._apply_eagle3_tree_shape(generation_config, depth=eagle3_tree_depth, top_k=eagle3_tree_top_k)
-        return generation_config, resolved_max_new_tokens, resolved_temperature, resolved_top_p, resolved_top_k
 
     def _apply_eagle3_tree_shape(
         self,
@@ -1051,6 +1073,67 @@ class MobilintEagle3GenerationMixin(ABC, GenerationMixin):
         if callable(reset_draft_mask):
             reset_draft_mask()
         return cache
+
+    @torch.no_grad()
+    def eagle3_prefill(
+        self,
+        input_ids: torch.LongTensor,
+        cache: MobilintEagle3Cache,
+        *,
+        logits_processor: Optional[Any] = None,
+        max_new_tokens: Optional[int] = None,
+        count_npu_time: bool = False,
+    ) -> torch.LongTensor:
+        """Feed ``input_ids`` to ``cache`` and draft the first tree; return its root, the next token ``[1, 1]``.
+
+        ``input_ids`` is the whole sequence or, for a cache that already holds a prefix, the tokens after it.
+        ``logits_processor`` (see :func:`~transformers_mblt.utils.eagle3.decoding.prepare_logits_processor`) samples
+        the tokens; ``None`` is greedy. ``max_new_tokens`` caps the draft tree for a short generation. Continue with
+        :meth:`eagle3_decode_step`. Uses the tree that :meth:`configure_eagle3_tree` set.
+        """
+        from ..utils.eagle3.decoding import initialize_tree
+
+        if cache is None:
+            raise TypeError("eagle3_prefill needs the request's MobilintEagle3Cache; the next rounds run on it.")
+        cache = self._prepare_eagle3_cache(cache)
+        draft_tokens, _, _, _, _ = initialize_tree(
+            input_ids,
+            self,
+            cache,
+            logits_processor,
+            remaining_tokens=max_new_tokens,
+            count_npu_time=count_npu_time,
+        )
+        return draft_tokens[:, :1]
+
+    @torch.no_grad()
+    def eagle3_decode_step(
+        self,
+        cache: MobilintEagle3Cache,
+        *,
+        logits_processor: Optional[Any] = None,
+        max_new_tokens: Optional[int] = None,
+        eos_token_id: Optional[int | list[int]] = None,
+        count_npu_time: bool = False,
+    ) -> Any:
+        """Verify the draft tree in ``cache`` and draft the next one.
+
+        Returns an :class:`~transformers_mblt.utils.eagle3.decoding.Eagle3DecodeStep`. Its ``tokens`` start with
+        the root that :meth:`eagle3_prefill` or the previous step returned as ``next_token``, followed by the
+        accepted draft tokens. A caller that already emitted the root emits ``tokens[:, 1:]`` and then
+        ``next_token``. ``max_new_tokens`` caps ``tokens``, counting the root. Each request needs its own cache;
+        rounds of different caches can interleave.
+        """
+        from ..utils.eagle3.decoding import decode_step
+
+        return decode_step(
+            self,
+            cache,
+            logits_processor,
+            remaining_tokens=max_new_tokens,
+            eos_token_id=eos_token_id,
+            count_npu_time=count_npu_time,
+        )
 
     @staticmethod
     def _eagle3_stopping_scores_adapter(
@@ -1164,14 +1247,9 @@ class MobilintEagle3GenerationMixin(ABC, GenerationMixin):
         count_npu_time: bool,
     ) -> torch.LongTensor:
         """Execute the EAGLE-3 speculative decode loop and update acceptance stats."""
-        from ..utils.eagle3.decoding import (
-            evaluate_posterior,
-            initialize_tree,
-            tree_decoding,
-            update_inference_inputs,
-        )
+        from ..utils.eagle3.decoding import decode_step, initialize_tree
 
-        draft_tokens, retrieve_indices, tree_mask, tree_position_ids, _ = initialize_tree(
+        initialize_tree(
             generated,
             self,
             cache,
@@ -1185,61 +1263,27 @@ class MobilintEagle3GenerationMixin(ABC, GenerationMixin):
         acceptance_ratio_sum = 0.0
 
         while new_token_count < max_tokens:
-            remaining_tokens = max_tokens - new_token_count
-            logits, hidden_state_new = tree_decoding(
+            step = decode_step(
                 self,
                 cache,
-                draft_tokens.to(generated.device),
-                generated,
-                retrieve_indices,
-                tree_position_ids,
+                logits_processor,
+                remaining_tokens=max_tokens - new_token_count,
+                eos_token_id=eos_token_id,
                 count_npu_time=count_npu_time,
             )
-            padding = torch.full((1, 1), -1, dtype=torch.long, device=generated.device)
-            padded_draft_tokens = torch.cat((draft_tokens.to(generated.device), padding), dim=1)
-            candidates = padded_draft_tokens[0, retrieve_indices].contiguous()
-            best_candidate, accepted_draft_count, sample_p, sampled_indices = evaluate_posterior(
-                logits,
-                candidates,
-                logits_processor,
-                retrieve_indices,
-            )
-            candidate_width = int(candidates.shape[-1]) if candidates.ndim >= 2 else 1
-            candidate_draft_tokens = max(1, candidate_width - 1)
-            prev_len = generated.shape[1]
-            generated, draft_tokens, retrieve_indices, tree_mask, tree_position_ids, new_token_count, should_stop = (
-                update_inference_inputs(
-                    generated,
-                    candidates,
-                    best_candidate,
-                    accepted_draft_count,
-                    retrieve_indices,
-                    logits_processor,
-                    new_token_count,
-                    self,
-                    cache,
-                    hidden_state_new,
-                    sample_p,
-                    sampled_indices,
-                    remaining_tokens=remaining_tokens,
-                    eos_token_id=eos_token_id,
-                    count_npu_time=count_npu_time,
-                )
-            )
-            # Count accepted drafts from the actual emitted-length delta so EOS
-            # and remaining-token truncation inside ``update_inference_inputs``
-            # do not inflate the tally. Each iteration emits at most one root
-            # token plus its accepted drafts; ``emitted - 1`` recovers the
-            # draft count (clamped at zero when the iteration emits nothing).
-            emitted = int(generated.shape[1] - prev_len)
+            emitted = int(step.tokens.shape[1])
+            generated = torch.cat((generated, step.tokens.to(generated.device)), dim=1)
+            new_token_count += emitted
+            # A round emits its root token plus the accepted drafts, already cut at EOS and the remaining budget, so
+            # ``emitted - 1`` is the accepted draft count (zero when the round emits nothing).
             accepted_tokens = max(0, emitted - 1)
             acceptance_steps += 1
             acceptance_tokens_sum += accepted_tokens
-            acceptance_ratio_sum += float(accepted_tokens) / float(candidate_draft_tokens)
+            acceptance_ratio_sum += float(accepted_tokens) / float(step.candidate_draft_tokens)
             if streamer is not None:
-                for token_id in generated[0, prev_len:]:
+                for token_id in step.tokens[0]:
                     streamer.put(token_id.unsqueeze(0))
-            stopping_scores = self._eagle3_stopping_scores_adapter(logits, generated=generated)
+            stopping_scores = self._eagle3_stopping_scores_adapter(step.logits, generated=generated)
             if stopping_criteria_list(generated, stopping_scores):
                 # The accepted tokens were returned but never fed: keep them for the next call (see
                 # MobilintEagle3Cache.unfed_tokens) instead of counting their stale KV positions as cached.
@@ -1247,7 +1291,7 @@ class MobilintEagle3GenerationMixin(ABC, GenerationMixin):
                 # A non-final step already fed the accepted tokens to the draft; the base has not seen them.
                 cache.sync_draft_seq_length_to_base()
                 break
-            if should_stop:
+            if step.stopped:
                 break
 
         acceptance_avg = (float(acceptance_tokens_sum) / float(acceptance_steps)) if acceptance_steps > 0 else 0.0

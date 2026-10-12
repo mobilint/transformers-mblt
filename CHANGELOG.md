@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Added
+
+- EAGLE-3 models can run one speculative round at a time, for a serving engine that interleaves requests:
+  `eagle3_prefill(input_ids, cache)` feeds the prompt and returns the first token, and each
+  `eagle3_decode_step(cache)` verifies the draft tree and returns an `Eagle3DecodeStep` (the round's tokens and the
+  next tree's root). Each request keeps its own `MobilintEagle3Cache`, which holds its draft tree between rounds.
+  `configure_eagle3_tree()` sets the tree size that `generate()` otherwise resolves per call. `generate()` now runs
+  its loop on the same `decode_step`, so its outputs are unchanged.
+
 ### Changed
 
 - Batched forward with `logits_to_keep=1` copies each row's last-token logits once into the returned tensor, instead

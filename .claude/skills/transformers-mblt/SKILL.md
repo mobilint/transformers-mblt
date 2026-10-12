@@ -158,6 +158,12 @@ description: >-
   acceptance recovers. Override by editing the shipped `generation_config.json`, by setting
   `model.generation_config.num_assistant_tokens = ...` before `generate`, or by passing
   `num_assistant_tokens=<value>` directly to `generate(...)` for a per-call override.
+- `generate` runs its loop on `utils/eagle3/tree_decoding.py::decode_step`, one round per call: verify the
+  draft tree the cache holds, accept, sample the next root, and draft the next tree. Serving engines call the same
+  round through `eagle3_prefill` / `eagle3_decode_step` with one `MobilintEagle3Cache` per request, so keep the
+  tree state (`pending_draft_tokens`, `retrieve_indices`, `tree_position_ids`, `accept_tokens`) on the cache, never
+  on the model. Generate-loop tests replace `decode_step` through the `decode_rounds` fixture in
+  `tests/transformers/text_generation/eagle3/conftest.py`.
 - The tree shape lives in `generation_config.json` too: `eagle3_tree_depth` (expansion steps) and
   `eagle3_tree_top_k` (fan-out per level), resolved per `generate` call with the same override
   paths. The same-named `config.json` fields are a legacy fallback for older releases. Tune all

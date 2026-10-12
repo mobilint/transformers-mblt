@@ -114,14 +114,14 @@ def test_tree_fields_fall_back_per_field_and_keep_current_when_unset() -> None:
     assert (draft.depth, draft.top_k) == (5, 2)
 
 
-def test_explicit_generate_kwargs_override_generation_config(monkeypatch) -> None:
+def test_explicit_generate_kwargs_override_generation_config(monkeypatch, decode_rounds) -> None:
     draft = _make_draft()
     model = _make_model(
         config=SimpleNamespace(vocab_size=16, max_position_embeddings=4096),
         generation_config=_generation_config(eagle3_tree_depth=3, eagle3_tree_top_k=4),
         draft=draft,
     )
-    _patch_minimal_generate_dependencies(monkeypatch)
+    _patch_minimal_generate_dependencies(monkeypatch, decode_rounds)
 
     model.generate(torch.tensor([[1, 2]], dtype=torch.long), eagle3_tree_depth=7, eagle3_tree_top_k=5)
 
@@ -149,7 +149,7 @@ def test_set_tree_shape_rejects_non_positive_values(depth: int, top_k: int) -> N
         draft.set_tree_shape(depth=depth, top_k=top_k)
 
 
-def test_generate_stages_npu_prefill_chunk_size_on_base_and_draft_for_the_call(monkeypatch) -> None:
+def test_generate_stages_npu_prefill_chunk_size_on_base_and_draft_for_the_call(monkeypatch, decode_rounds) -> None:
     draft = _make_draft()
     model = _make_model(
         config=SimpleNamespace(vocab_size=16, max_position_embeddings=4096),
@@ -157,7 +157,7 @@ def test_generate_stages_npu_prefill_chunk_size_on_base_and_draft_for_the_call(m
         draft=draft,
     )
     base = model.eagle3_base_model
-    _patch_minimal_generate_dependencies(monkeypatch)
+    _patch_minimal_generate_dependencies(monkeypatch, decode_rounds)
     seen: dict[str, object] = {}
     original_loop = model._run_eagle3_decode_loop
 
@@ -175,14 +175,14 @@ def test_generate_stages_npu_prefill_chunk_size_on_base_and_draft_for_the_call(m
     assert draft.npu_prefill_chunk_size_override is None
 
 
-def test_generate_restores_npu_prefill_chunk_size_override_on_error(monkeypatch) -> None:
+def test_generate_restores_npu_prefill_chunk_size_override_on_error(monkeypatch, decode_rounds) -> None:
     draft = _make_draft()
     model = _make_model(
         config=SimpleNamespace(vocab_size=16, max_position_embeddings=4096),
         generation_config=_generation_config(),
         draft=draft,
     )
-    _patch_minimal_generate_dependencies(monkeypatch)
+    _patch_minimal_generate_dependencies(monkeypatch, decode_rounds)
 
     def _boom(**_kwargs):
         raise RuntimeError("decode failed")

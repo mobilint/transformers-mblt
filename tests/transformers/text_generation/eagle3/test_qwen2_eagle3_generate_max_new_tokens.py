@@ -28,7 +28,7 @@ def _attach_minimal_eagle3_modules(model: MobilintQwen2Eagle3ForCausalLM) -> Non
     object.__setattr__(model, "_modules", {"model": eagle3_model})
 
 
-def _patch_minimal_generate_dependencies(monkeypatch) -> None:
+def _patch_minimal_generate_dependencies(monkeypatch, decode_rounds) -> None:
     """Patch EAGLE-3 decoding functions with deterministic single-step stubs."""
     monkeypatch.setattr(
         decoding_module,
@@ -41,40 +41,10 @@ def _patch_minimal_generate_dependencies(monkeypatch) -> None:
             None,
         ),
     )
-    monkeypatch.setattr(
-        decoding_module,
-        "tree_decoding",
-        lambda *_args, **_kwargs: (
-            torch.zeros((1, 1, 16), dtype=torch.float32),
-            torch.zeros((1, 1, 1), dtype=torch.float32),
-        ),
-    )
-    monkeypatch.setattr(
-        decoding_module,
-        "evaluate_posterior",
-        lambda *_args, **_kwargs: (
-            torch.tensor([4], dtype=torch.long),
-            1,
-            torch.tensor([0.0], dtype=torch.float32),
-            torch.tensor([0], dtype=torch.long),
-        ),
-    )
-    monkeypatch.setattr(
-        decoding_module,
-        "update_inference_inputs",
-        lambda *_args, **_kwargs: (
-            torch.tensor([[1, 2, 4]], dtype=torch.long),
-            torch.tensor([[3]], dtype=torch.long),
-            torch.tensor([0], dtype=torch.long),
-            None,
-            torch.tensor([[0]], dtype=torch.long),
-            1,
-            True,
-        ),
-    )
+    decode_rounds(([4], True))
 
 
-def test_qwen2_eagle3_generate_resolves_max_new_tokens_from_max_length(monkeypatch) -> None:
+def test_qwen2_eagle3_generate_resolves_max_new_tokens_from_max_length(monkeypatch, decode_rounds) -> None:
     """Resolve token budget from max_length - prompt_length when max_new_tokens is unset."""
     model = object.__new__(MobilintQwen2Eagle3ForCausalLM)
     model.config = SimpleNamespace(vocab_size=16, max_position_embeddings=4096)
@@ -94,13 +64,13 @@ def test_qwen2_eagle3_generate_resolves_max_new_tokens_from_max_length(monkeypat
         sync_draft_seq_length_to_base=lambda: None,
     )
     model._get_cache = lambda *_args, **_kwargs: cache
-    _patch_minimal_generate_dependencies(monkeypatch)
+    _patch_minimal_generate_dependencies(monkeypatch, decode_rounds)
 
     output = model.generate(torch.tensor([[1, 2]], dtype=torch.long), return_dict_in_generate=True)
     assert torch.equal(output.sequences, torch.tensor([[1, 2, 4]], dtype=torch.long))
 
 
-def test_qwen2_eagle3_generate_resolves_max_new_tokens_from_model_max_position(monkeypatch) -> None:
+def test_qwen2_eagle3_generate_resolves_max_new_tokens_from_model_max_position(monkeypatch, decode_rounds) -> None:
     """Fallback to config.max_position_embeddings when max_length and max_new_tokens are unset."""
     model = object.__new__(MobilintQwen2Eagle3ForCausalLM)
     model.config = SimpleNamespace(vocab_size=16, max_position_embeddings=3)
@@ -120,13 +90,13 @@ def test_qwen2_eagle3_generate_resolves_max_new_tokens_from_model_max_position(m
         sync_draft_seq_length_to_base=lambda: None,
     )
     model._get_cache = lambda *_args, **_kwargs: cache
-    _patch_minimal_generate_dependencies(monkeypatch)
+    _patch_minimal_generate_dependencies(monkeypatch, decode_rounds)
 
     output = model.generate(torch.tensor([[1, 2]], dtype=torch.long), return_dict_in_generate=True)
     assert torch.equal(output.sequences, torch.tensor([[1, 2, 4]], dtype=torch.long))
 
 
-def test_qwen2_eagle3_generate_raises_when_resolved_max_new_tokens_non_positive(monkeypatch) -> None:
+def test_qwen2_eagle3_generate_raises_when_resolved_max_new_tokens_non_positive(monkeypatch, decode_rounds) -> None:
     """Raise clear error when resolved max_new_tokens becomes zero or negative."""
     model = object.__new__(MobilintQwen2Eagle3ForCausalLM)
     model.config = SimpleNamespace(vocab_size=16, max_position_embeddings=2)
@@ -146,7 +116,7 @@ def test_qwen2_eagle3_generate_raises_when_resolved_max_new_tokens_non_positive(
         sync_draft_seq_length_to_base=lambda: None,
     )
     model._get_cache = lambda *_args, **_kwargs: cache
-    _patch_minimal_generate_dependencies(monkeypatch)
+    _patch_minimal_generate_dependencies(monkeypatch, decode_rounds)
 
     with pytest.raises(ValueError, match="Resolved max_new_tokens must be > 0"):
         model.generate(torch.tensor([[1, 2]], dtype=torch.long))

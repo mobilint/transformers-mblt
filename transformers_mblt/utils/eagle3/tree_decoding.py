@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from typing import Any, Literal, Optional, Protocol, TypeAlias
 
 import torch
@@ -460,7 +461,7 @@ def tree_decoding(
     model: MobilintEagle3GenerationProtocol,
     cache: MobilintEagle3Cache,
     tree_candidates: torch.LongTensor,
-    input_ids: torch.LongTensor,
+    input_ids: Optional[torch.LongTensor],
     retrieve_indices: torch.LongTensor,
     tree_position_ids: torch.LongTensor,
     *,
@@ -718,3 +719,90 @@ def update_inference_inputs(
     cache.tree_mask = tree_mask
     cache.tree_position_ids = tree_position_ids
     return input_ids, draft_tokens, retrieve_indices, tree_mask, tree_position_ids, new_token_count, False
+
+
+@dataclass(frozen=True)
+class Eagle3DecodeStep:
+    """One EAGLE-3 round: the base model verifies the draft tree, then the draft builds the next tree.
+
+    Attributes:
+        tokens: ``[1, n]`` tokens the round settles: the tree root, then the accepted draft tokens.
+        next_token: ``[1, 1]`` root of the next tree, sampled from the base logits after ``tokens``. ``None`` when
+            the round ended generation (EOS or the token budget) and built no tree.
+        logits: Base-model logits over the verified tree nodes.
+        candidate_draft_tokens: Draft tokens on the tree's longest path, the most the round could accept.
+    """
+
+    tokens: torch.LongTensor
+    next_token: Optional[torch.LongTensor]
+    logits: torch.Tensor
+    candidate_draft_tokens: int
+
+    @property
+    def stopped(self) -> bool:
+        return self.next_token is None
+
+
+@torch.no_grad()
+def decode_step(
+    model: MobilintEagle3GenerationProtocol,
+    cache: MobilintEagle3Cache,
+    logits_processor: Optional[LogitsProcessorList],
+    *,
+    remaining_tokens: Optional[int] = None,
+    eos_token_id: Optional[int | list[int]] = None,
+    count_npu_time: bool = False,
+) -> Eagle3DecodeStep:
+    """Run one round on the draft tree ``cache`` holds (built by :func:`initialize_tree` or the previous round).
+
+    ``remaining_tokens`` caps the tokens the round settles, counting the root. A round that ends generation keeps
+    its accepted tokens unfed (see :class:`MobilintEagle3Cache`) and leaves no tree in the cache.
+    """
+    draft_tokens = cache.pending_draft_tokens
+    if draft_tokens is None:
+        raise RuntimeError("The EAGLE-3 cache holds no draft tree: run initialize_tree before decode_step.")
+    retrieve_indices = cache.retrieve_indices
+    logits, hidden_state_new = tree_decoding(
+        model,
+        cache,
+        draft_tokens,
+        None,
+        retrieve_indices,
+        cache.tree_position_ids,
+        count_npu_time=count_npu_time,
+    )
+    padding = torch.full((1, 1), -1, dtype=torch.long, device=draft_tokens.device)
+    candidates = torch.cat((draft_tokens, padding), dim=1)[0, retrieve_indices].contiguous()
+    best_candidate, accepted_draft_count, sample_p, sampled_indices = evaluate_posterior(
+        logits,
+        candidates,
+        logits_processor,
+        retrieve_indices,
+    )
+    candidate_width = int(candidates.shape[-1]) if candidates.ndim >= 2 else 1
+    tokens, next_draft_tokens, _, _, _, _, stopped = update_inference_inputs(
+        draft_tokens.new_empty((1, 0)),
+        candidates,
+        best_candidate,
+        accepted_draft_count,
+        retrieve_indices,
+        logits_processor,
+        0,
+        model,
+        cache,
+        hidden_state_new,
+        sample_p,
+        sampled_indices,
+        remaining_tokens=remaining_tokens,
+        eos_token_id=eos_token_id,
+        count_npu_time=count_npu_time,
+    )
+    if stopped:
+        # The tree just verified must not be verified again.
+        cache.clear_tree_state()
+    return Eagle3DecodeStep(
+        tokens=tokens,
+        next_token=None if stopped else next_draft_tokens[:, :1],
+        logits=logits,
+        candidate_draft_tokens=max(1, candidate_width - 1),
+    )

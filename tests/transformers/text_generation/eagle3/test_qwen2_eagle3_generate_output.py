@@ -37,7 +37,7 @@ def _attach_minimal_eagle3_modules(model: MobilintQwen2Eagle3ForCausalLM) -> Non
     object.__setattr__(model, "_modules", {"model": eagle3_model})
 
 
-def test_qwen2_eagle3_generate_returns_hf_output_when_requested(monkeypatch) -> None:
+def test_qwen2_eagle3_generate_returns_hf_output_when_requested(monkeypatch, decode_rounds) -> None:
     """Return a HF generation object when `return_dict_in_generate=True`."""
     model = object.__new__(MobilintQwen2Eagle3ForCausalLM)
     model.config = SimpleNamespace(vocab_size=16)
@@ -68,44 +68,14 @@ def test_qwen2_eagle3_generate_returns_hf_output_when_requested(monkeypatch) -> 
             None,
         ),
     )
-    monkeypatch.setattr(
-        decoding_module,
-        "tree_decoding",
-        lambda *_args, **_kwargs: (
-            torch.zeros((1, 1, 16), dtype=torch.float32),
-            torch.zeros((1, 1, 1), dtype=torch.float32),
-        ),
-    )
-    monkeypatch.setattr(
-        decoding_module,
-        "evaluate_posterior",
-        lambda *_args, **_kwargs: (
-            torch.tensor([4], dtype=torch.long),
-            1,
-            torch.tensor([0.0], dtype=torch.float32),
-            torch.tensor([0], dtype=torch.long),
-        ),
-    )
-    monkeypatch.setattr(
-        decoding_module,
-        "update_inference_inputs",
-        lambda *_args, **_kwargs: (
-            torch.tensor([[1, 2, 4]], dtype=torch.long),
-            torch.tensor([[3]], dtype=torch.long),
-            torch.tensor([0], dtype=torch.long),
-            None,
-            torch.tensor([[0]], dtype=torch.long),
-            1,
-            False,
-        ),
-    )
+    decode_rounds(([4], False))
 
     output = model.generate(torch.tensor([[1, 2]], dtype=torch.long), return_dict_in_generate=True)
 
     assert torch.equal(output.sequences, torch.tensor([[1, 2, 4]], dtype=torch.long))
 
 
-def test_qwen2_eagle3_acceptance_stats_getter_defaults_and_updates(monkeypatch) -> None:
+def test_qwen2_eagle3_acceptance_stats_getter_defaults_and_updates(monkeypatch, decode_rounds) -> None:
     """Expose acceptance stats through read-only getter with safe defaults."""
     model = object.__new__(MobilintQwen2Eagle3ForCausalLM)
     assert model.last_eagle3_acceptance_stats == {
@@ -143,54 +113,20 @@ def test_qwen2_eagle3_acceptance_stats_getter_defaults_and_updates(monkeypatch) 
             None,
         ),
     )
-    monkeypatch.setattr(
-        decoding_module,
-        "tree_decoding",
-        lambda *_args, **_kwargs: (
-            torch.zeros((1, 1, 16), dtype=torch.float32),
-            torch.zeros((1, 1, 1), dtype=torch.float32),
-        ),
-    )
-    monkeypatch.setattr(
-        decoding_module,
-        "evaluate_posterior",
-        lambda *_args, **_kwargs: (
-            torch.tensor([4], dtype=torch.long),
-            1,
-            torch.tensor([0.0], dtype=torch.float32),
-            torch.tensor([0], dtype=torch.long),
-        ),
-    )
-    # Emit two tokens (root + one accepted draft) so acceptance accounting —
-    # which derives drafts from ``emitted_length - 1`` after truncation — sees
-    # one accepted draft. ``evaluate_posterior`` above still reports one draft
-    # accepted; that matches the emitted delta.
-    monkeypatch.setattr(
-        decoding_module,
-        "update_inference_inputs",
-        lambda *_args, **_kwargs: (
-            torch.tensor([[1, 2, 4, 5]], dtype=torch.long),
-            torch.tensor([[3]], dtype=torch.long),
-            torch.tensor([0], dtype=torch.long),
-            None,
-            torch.tensor([[0]], dtype=torch.long),
-            2,
-            True,
-        ),
-    )
+    # The round emits the root and one accepted draft; acceptance accounting derives drafts from the emitted length.
+    decode_rounds(([4, 5], True))
 
     output = model.generate(torch.tensor([[1, 2]], dtype=torch.long), return_dict_in_generate=True)
     stats = model.last_eagle3_acceptance_stats
     assert stats["steps"] == 1
     assert stats["accepted_tokens_sum"] == 1
     assert stats["accepted_tokens_avg"] == 1.0
-    # candidate_draft_tokens == retrieve_indices.shape[-1] - 1 == 0 → clamped to 1;
-    # 1 accepted draft / 1 candidate slot == 1.0.
+    # 1 accepted draft / 1 candidate draft token (the decode_rounds default) == 1.0.
     assert stats["acceptance_ratio"] == 1.0
     assert output.past_key_values is cache
 
 
-def test_qwen2_eagle3_generate_accepts_past_key_values(monkeypatch) -> None:
+def test_qwen2_eagle3_generate_accepts_past_key_values(monkeypatch, decode_rounds) -> None:
     """Accept a prefilled EAGLE-3 cache passed through Hugging Face chat serving."""
 
     class FakeEagle3Cache(MobilintEagle3Cache):
@@ -233,37 +169,7 @@ def test_qwen2_eagle3_generate_accepts_past_key_values(monkeypatch) -> None:
             None,
         ),
     )
-    monkeypatch.setattr(
-        decoding_module,
-        "tree_decoding",
-        lambda *_args, **_kwargs: (
-            torch.zeros((1, 1, 16), dtype=torch.float32),
-            torch.zeros((1, 1, 1), dtype=torch.float32),
-        ),
-    )
-    monkeypatch.setattr(
-        decoding_module,
-        "evaluate_posterior",
-        lambda *_args, **_kwargs: (
-            torch.tensor([4], dtype=torch.long),
-            1,
-            torch.tensor([0.0], dtype=torch.float32),
-            torch.tensor([0], dtype=torch.long),
-        ),
-    )
-    monkeypatch.setattr(
-        decoding_module,
-        "update_inference_inputs",
-        lambda *_args, **_kwargs: (
-            torch.tensor([[1, 2, 4]], dtype=torch.long),
-            torch.tensor([[3]], dtype=torch.long),
-            torch.tensor([0], dtype=torch.long),
-            None,
-            torch.tensor([[0]], dtype=torch.long),
-            1,
-            False,
-        ),
-    )
+    decode_rounds(([4], False))
 
     output = model.generate(
         torch.tensor([[1, 2]], dtype=torch.long),
@@ -275,7 +181,7 @@ def test_qwen2_eagle3_generate_accepts_past_key_values(monkeypatch) -> None:
     assert output.past_key_values is cache
 
 
-def test_qwen2_eagle3_generate_clears_stale_tree_state(monkeypatch) -> None:
+def test_qwen2_eagle3_generate_clears_stale_tree_state(monkeypatch, decode_rounds) -> None:
     """Drop speculative tree state before starting a new generation call."""
 
     class FakeEagle3Cache(MobilintEagle3Cache):
@@ -324,37 +230,7 @@ def test_qwen2_eagle3_generate_clears_stale_tree_state(monkeypatch) -> None:
         )
 
     monkeypatch.setattr(decoding_module, "initialize_tree", _initialize_tree)
-    monkeypatch.setattr(
-        decoding_module,
-        "tree_decoding",
-        lambda *_args, **_kwargs: (
-            torch.zeros((1, 1, 16), dtype=torch.float32),
-            torch.zeros((1, 1, 1), dtype=torch.float32),
-        ),
-    )
-    monkeypatch.setattr(
-        decoding_module,
-        "evaluate_posterior",
-        lambda *_args, **_kwargs: (
-            torch.tensor([4], dtype=torch.long),
-            1,
-            torch.tensor([0.0], dtype=torch.float32),
-            torch.tensor([0], dtype=torch.long),
-        ),
-    )
-    monkeypatch.setattr(
-        decoding_module,
-        "update_inference_inputs",
-        lambda *_args, **_kwargs: (
-            torch.tensor([[1, 2, 4]], dtype=torch.long),
-            torch.tensor([[3]], dtype=torch.long),
-            torch.tensor([0], dtype=torch.long),
-            None,
-            torch.tensor([[0]], dtype=torch.long),
-            1,
-            False,
-        ),
-    )
+    decode_rounds(([4], False))
 
     output = model.generate(
         torch.tensor([[1, 2]], dtype=torch.long),
@@ -371,7 +247,7 @@ def test_qwen2_eagle3_generate_clears_stale_tree_state(monkeypatch) -> None:
     assert cache.pending_draft_tokens is None
 
 
-def test_qwen2_eagle3_generate_resets_draft_length_to_committed_base(monkeypatch) -> None:
+def test_qwen2_eagle3_generate_resets_draft_length_to_committed_base(monkeypatch, decode_rounds) -> None:
     """Use the committed base length as the draft starting point for the next turn."""
 
     class FakeEagle3Cache(MobilintEagle3Cache):
@@ -415,37 +291,7 @@ def test_qwen2_eagle3_generate_resets_draft_length_to_committed_base(monkeypatch
         )
 
     monkeypatch.setattr(decoding_module, "initialize_tree", _initialize_tree)
-    monkeypatch.setattr(
-        decoding_module,
-        "tree_decoding",
-        lambda *_args, **_kwargs: (
-            torch.zeros((1, 1, 16), dtype=torch.float32),
-            torch.zeros((1, 1, 1), dtype=torch.float32),
-        ),
-    )
-    monkeypatch.setattr(
-        decoding_module,
-        "evaluate_posterior",
-        lambda *_args, **_kwargs: (
-            torch.tensor([4], dtype=torch.long),
-            1,
-            torch.tensor([0.0], dtype=torch.float32),
-            torch.tensor([0], dtype=torch.long),
-        ),
-    )
-    monkeypatch.setattr(
-        decoding_module,
-        "update_inference_inputs",
-        lambda *_args, **_kwargs: (
-            torch.tensor([[1, 2, 4]], dtype=torch.long),
-            torch.tensor([[3]], dtype=torch.long),
-            torch.tensor([0], dtype=torch.long),
-            None,
-            torch.tensor([[0]], dtype=torch.long),
-            1,
-            False,
-        ),
-    )
+    decode_rounds(([4], False))
 
     output = model.generate(
         torch.tensor([[1, 2]], dtype=torch.long),
@@ -457,7 +303,7 @@ def test_qwen2_eagle3_generate_resets_draft_length_to_committed_base(monkeypatch
     assert cache.get_draft_seq_length() == cache.get_base_seq_length()
 
 
-def test_qwen2_eagle3_generate_primes_streamer_with_prompt(monkeypatch) -> None:
+def test_qwen2_eagle3_generate_primes_streamer_with_prompt(monkeypatch, decode_rounds) -> None:
     """Prime the streamer with the prompt so the first generated token is not skipped."""
 
     class FakeEagle3Cache(MobilintEagle3Cache):
@@ -506,37 +352,7 @@ def test_qwen2_eagle3_generate_primes_streamer_with_prompt(monkeypatch) -> None:
             None,
         ),
     )
-    monkeypatch.setattr(
-        decoding_module,
-        "tree_decoding",
-        lambda *_args, **_kwargs: (
-            torch.zeros((1, 1, 16), dtype=torch.float32),
-            torch.zeros((1, 1, 1), dtype=torch.float32),
-        ),
-    )
-    monkeypatch.setattr(
-        decoding_module,
-        "evaluate_posterior",
-        lambda *_args, **_kwargs: (
-            torch.tensor([4], dtype=torch.long),
-            1,
-            torch.tensor([0.0], dtype=torch.float32),
-            torch.tensor([0], dtype=torch.long),
-        ),
-    )
-    monkeypatch.setattr(
-        decoding_module,
-        "update_inference_inputs",
-        lambda *_args, **_kwargs: (
-            torch.tensor([[1, 2, 4]], dtype=torch.long),
-            torch.tensor([[3]], dtype=torch.long),
-            torch.tensor([0], dtype=torch.long),
-            None,
-            torch.tensor([[0]], dtype=torch.long),
-            1,
-            False,
-        ),
-    )
+    decode_rounds(([4], False))
 
     output = model.generate(
         torch.tensor([[1, 2]], dtype=torch.long),
@@ -561,7 +377,7 @@ def test_qwen2_eagle3_generate_signature_exposes_benchmark_kwargs() -> None:
     assert "npu_prefill_chunk_size" in signature.parameters
 
 
-def test_qwen2_eagle3_generate_calls_stopping_criteria(monkeypatch) -> None:
+def test_qwen2_eagle3_generate_calls_stopping_criteria(monkeypatch, decode_rounds) -> None:
     """Run custom stopping criteria after EAGLE-3 appends generated tokens."""
 
     class RecordingCriteria(StoppingCriteria):
@@ -601,29 +417,7 @@ def test_qwen2_eagle3_generate_calls_stopping_criteria(monkeypatch) -> None:
         "initialize_tree",
         lambda *_args, **_kwargs: (torch.tensor([[3]]), torch.tensor([0]), None, torch.tensor([[0]]), None),
     )
-    monkeypatch.setattr(
-        decoding_module,
-        "tree_decoding",
-        lambda *_args, **_kwargs: (torch.zeros((1, 1, 16)), torch.zeros((1, 1, 1))),
-    )
-    monkeypatch.setattr(
-        decoding_module,
-        "evaluate_posterior",
-        lambda *_args, **_kwargs: (torch.tensor(0), torch.tensor(0), torch.zeros(16), None),
-    )
-    monkeypatch.setattr(
-        decoding_module,
-        "update_inference_inputs",
-        lambda *_args, **_kwargs: (
-            torch.tensor([[1, 2, 4]], dtype=torch.long),
-            torch.tensor([[3]], dtype=torch.long),
-            torch.tensor([0]),
-            None,
-            torch.tensor([[0]]),
-            1,
-            False,
-        ),
-    )
+    decode_rounds(([4], False))
 
     output = model.generate(torch.tensor([[1, 2]], dtype=torch.long), stopping_criteria=[criteria])
 
@@ -633,7 +427,7 @@ def test_qwen2_eagle3_generate_calls_stopping_criteria(monkeypatch) -> None:
     assert criteria.score_shapes == [(1, 16)]
 
 
-def test_qwen2_eagle3_generate_defers_pending_accept_tokens_on_stopping_criteria(monkeypatch) -> None:
+def test_qwen2_eagle3_generate_defers_pending_accept_tokens_on_stopping_criteria(monkeypatch, decode_rounds) -> None:
     """Keep accepted-but-unfed tokens for the next call when breaking on custom stopping criteria.
 
     Their KV positions still hold the last tree's nodes, so they must not count as cached.
@@ -674,30 +468,12 @@ def test_qwen2_eagle3_generate_defers_pending_accept_tokens_on_stopping_criteria
         "initialize_tree",
         lambda *_args, **_kwargs: (torch.tensor([[3]]), torch.tensor([0]), None, torch.tensor([[0]]), None),
     )
-    monkeypatch.setattr(
-        decoding_module,
-        "tree_decoding",
-        lambda *_args, **_kwargs: (torch.zeros((1, 1, 16)), torch.zeros((1, 1, 1))),
-    )
-    monkeypatch.setattr(
-        decoding_module,
-        "evaluate_posterior",
-        lambda *_args, **_kwargs: (torch.tensor(0), torch.tensor(0), torch.zeros(16), None),
-    )
 
-    def _update_inference_inputs(*_args, **_kwargs):
-        cache.accept_tokens = torch.tensor([[4]], dtype=torch.long)
-        return (
-            torch.tensor([[1, 2, 4]], dtype=torch.long),
-            torch.tensor([[3]], dtype=torch.long),
-            torch.tensor([0]),
-            None,
-            torch.tensor([[0]]),
-            1,
-            False,
-        )
+    def _round(round_cache):
+        round_cache.accept_tokens = torch.tensor([[4]], dtype=torch.long)
+        return [4], False
 
-    monkeypatch.setattr(decoding_module, "update_inference_inputs", _update_inference_inputs)
+    decode_rounds(_round)
 
     output = model.generate(
         torch.tensor([[1, 2]], dtype=torch.long),
@@ -741,7 +517,7 @@ def test_qwen2_eagle3_generation_config_updates_max_draft_tokens() -> None:
     assert draft_model.max_draft_tokens == 8
 
 
-def test_qwen2_eagle3_generate_resolves_greedy_and_sampling_processors(monkeypatch) -> None:
+def test_qwen2_eagle3_generate_resolves_greedy_and_sampling_processors(monkeypatch, decode_rounds) -> None:
     """Use greedy by default and sampling only when explicitly enabled."""
     temperatures: list[float] = []
 
@@ -777,29 +553,7 @@ def test_qwen2_eagle3_generate_resolves_greedy_and_sampling_processors(monkeypat
         "initialize_tree",
         lambda *_args, **_kwargs: (torch.tensor([[3]]), torch.tensor([0]), None, torch.tensor([[0]]), None),
     )
-    monkeypatch.setattr(
-        decoding_module,
-        "tree_decoding",
-        lambda *_args, **_kwargs: (torch.zeros((1, 1, 16)), torch.zeros((1, 1, 1))),
-    )
-    monkeypatch.setattr(
-        decoding_module,
-        "evaluate_posterior",
-        lambda *_args, **_kwargs: (torch.tensor(0), torch.tensor(0), torch.zeros(16), None),
-    )
-    monkeypatch.setattr(
-        decoding_module,
-        "update_inference_inputs",
-        lambda *_args, **_kwargs: (
-            torch.tensor([[1, 2, 4]], dtype=torch.long),
-            torch.tensor([[3]], dtype=torch.long),
-            torch.tensor([0]),
-            None,
-            torch.tensor([[0]]),
-            1,
-            True,
-        ),
-    )
+    decode_rounds(([4], True))
 
     _run_once(None, False)
     _run_once(True, False)
@@ -938,7 +692,7 @@ def test_qwen2_eagle3_evaluate_posterior_sampling_accepts_with_torch_rng(monkeyp
     assert torch.equal(sample_p, torch.zeros(8, dtype=torch.float32))
 
 
-def test_qwen2_eagle3_generate_multi_turn_reuses_cache_safely(monkeypatch) -> None:
+def test_qwen2_eagle3_generate_multi_turn_reuses_cache_safely(monkeypatch, decode_rounds) -> None:
     """Reuse a single cache across turns while clearing tree state and resyncing draft length."""
 
     class FakeEagle3Cache(MobilintEagle3Cache):
@@ -1000,37 +754,7 @@ def test_qwen2_eagle3_generate_multi_turn_reuses_cache_safely(monkeypatch) -> No
         )
 
     monkeypatch.setattr(decoding_module, "initialize_tree", _initialize_tree)
-    monkeypatch.setattr(
-        decoding_module,
-        "tree_decoding",
-        lambda *_args, **_kwargs: (
-            torch.zeros((1, 1, 16), dtype=torch.float32),
-            torch.zeros((1, 1, 1), dtype=torch.float32),
-        ),
-    )
-    monkeypatch.setattr(
-        decoding_module,
-        "evaluate_posterior",
-        lambda *_args, **_kwargs: (
-            torch.tensor([4], dtype=torch.long),
-            1,
-            torch.tensor([0.0], dtype=torch.float32),
-            torch.tensor([0], dtype=torch.long),
-        ),
-    )
-    monkeypatch.setattr(
-        decoding_module,
-        "update_inference_inputs",
-        lambda *_args, **_kwargs: (
-            torch.tensor([[1, 2, 4]], dtype=torch.long),
-            torch.tensor([[3]], dtype=torch.long),
-            torch.tensor([0], dtype=torch.long),
-            None,
-            torch.tensor([[0]], dtype=torch.long),
-            1,
-            True,
-        ),
-    )
+    decode_rounds(([4], True))
 
     first = model.generate(
         torch.tensor([[1, 2]], dtype=torch.long),
@@ -1229,7 +953,7 @@ def test_llm_eagle3_forward_accepts_object_hidden_states_and_missing_hidden_stat
     assert without_hidden.hidden_states is None
 
 
-def test_qwen2_eagle3_generate_ignored_args_emit_stable_warning_messages(monkeypatch, caplog) -> None:
+def test_qwen2_eagle3_generate_ignored_args_emit_stable_warning_messages(monkeypatch, caplog, decode_rounds) -> None:
     """Warn with explicit ignored-argument policy messages for unsupported soft options."""
     model = object.__new__(MobilintQwen2Eagle3ForCausalLM)
     model.config = SimpleNamespace(vocab_size=16)
@@ -1260,37 +984,7 @@ def test_qwen2_eagle3_generate_ignored_args_emit_stable_warning_messages(monkeyp
             None,
         ),
     )
-    monkeypatch.setattr(
-        decoding_module,
-        "tree_decoding",
-        lambda *_args, **_kwargs: (
-            torch.zeros((1, 1, 16), dtype=torch.float32),
-            torch.zeros((1, 1, 1), dtype=torch.float32),
-        ),
-    )
-    monkeypatch.setattr(
-        decoding_module,
-        "evaluate_posterior",
-        lambda *_args, **_kwargs: (
-            torch.tensor([4], dtype=torch.long),
-            1,
-            torch.tensor([0.0], dtype=torch.float32),
-            torch.tensor([0], dtype=torch.long),
-        ),
-    )
-    monkeypatch.setattr(
-        decoding_module,
-        "update_inference_inputs",
-        lambda *_args, **_kwargs: (
-            torch.tensor([[1, 2, 4]], dtype=torch.long),
-            torch.tensor([[3]], dtype=torch.long),
-            torch.tensor([0], dtype=torch.long),
-            None,
-            torch.tensor([[0]], dtype=torch.long),
-            1,
-            True,
-        ),
-    )
+    decode_rounds(([4], True))
 
     with caplog.at_level("WARNING"):
         model.generate(
