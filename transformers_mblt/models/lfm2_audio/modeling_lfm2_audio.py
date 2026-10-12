@@ -511,15 +511,26 @@ class MobilintLfm2AudioForConditionalGeneration(
         before continuing from the generated token ids. Called with ``input_features`` only, as the ASR pipeline
         does, the default transcription prompt is built and only the generated tokens are returned; the
         ``attention_mask`` the pipeline forwards belongs to the features in that case. Audio longer than the
-        encoder window is then transcribed window by window and the generated tokens are joined.
+        encoder window is then transcribed window by window and the generated tokens are joined. Structured
+        generation output is not supported for audio that spans multiple encoder windows.
         """
+        generation_config = kwargs.get("generation_config")
         pipeline_invocation = input_ids is None and input_features is not None
         if pipeline_invocation:
             if feature_attention_mask is None and attention_mask is not None:
                 feature_attention_mask = attention_mask
             attention_mask = None
             windows = self._feature_windows(input_features, feature_attention_mask)
-            if len(windows) > 1 and not kwargs.get("return_dict_in_generate"):
+            return_dict_in_generate = kwargs.get("return_dict_in_generate")
+            if return_dict_in_generate is None:
+                return_dict_in_generate = getattr(generation_config, "return_dict_in_generate", None)
+            if return_dict_in_generate is None:
+                return_dict_in_generate = getattr(self.generation_config, "return_dict_in_generate", False)
+            if len(windows) > 1 and return_dict_in_generate:
+                raise ValueError(
+                    "return_dict_in_generate=True is not supported for audio that spans multiple encoder windows"
+                )
+            if len(windows) > 1:
                 return self._generate_windows(windows, **kwargs)
             input_ids = self.default_prompt_ids(self.audio_embedding_count(input_features, feature_attention_mask))
         if input_ids is None:
@@ -532,7 +543,6 @@ class MobilintLfm2AudioForConditionalGeneration(
             )
 
         # The model decodes one sequence at a time; prevent generation from expanding the NPU cache batch.
-        generation_config = kwargs.get("generation_config")
         num_beams = kwargs.get("num_beams")
         if num_beams is None:
             num_beams = getattr(generation_config, "num_beams", None)
