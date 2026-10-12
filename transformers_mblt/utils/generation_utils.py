@@ -21,6 +21,7 @@ from ..utils.cache_utils import (
     build_mobilint_cache_from_model,
     cache_matches_backend_topology,
     cache_rope_deltas,
+    rope_deltas_lock,
     stage_new_cache_rope_deltas,
     defer_eagle3_accept_tokens,
     defer_eagle3_round_tokens,
@@ -467,11 +468,12 @@ class MobilintCacheRopeDeltasMixin:
             if holder is None:
                 return super().prepare_inputs_for_generation(*args, **kwargs)  # type: ignore[misc]
             # The first step before the cache exists: no offset to load. If it computes the prompt's offset, that goes
-            # to the cache the forward builds.
-            used = holder.rope_deltas
-            model_inputs = super().prepare_inputs_for_generation(*args, **kwargs)  # type: ignore[misc]
-            if holder.rope_deltas is not used:
-                stage_new_cache_rope_deltas(holder, holder.rope_deltas)
+            # to the cache the forward builds. Upstream writes the shared attribute, so read it back under the lock.
+            with rope_deltas_lock(holder):
+                used = holder.rope_deltas
+                model_inputs = super().prepare_inputs_for_generation(*args, **kwargs)  # type: ignore[misc]
+                if holder.rope_deltas is not used:
+                    stage_new_cache_rope_deltas(holder, holder.rope_deltas)
             return model_inputs
         with cache_rope_deltas(self.model, cache) as keep:
             used = self.model.rope_deltas

@@ -14,6 +14,7 @@ from transformers import GenerationMixin
 
 from tests.transformers.image_text_to_text.qwen3_vl_compat import transformers_supports_qwen3_vl
 from transformers_mblt.models.qwen2_vl.modeling_qwen2_vl import MobilintQwen2VLForConditionalGeneration
+from transformers_mblt.utils import cache_utils
 from transformers_mblt.utils.cache_utils import (
     MobilintCache,
     MobilintDeepStackCache,
@@ -203,6 +204,39 @@ def test_a_first_step_without_a_cache_hands_its_offset_to_the_cache_the_forward_
     # The staged offset served that one forward: a later forward without a cache starts a new sequence from none.
     wrapper.forward(input_ids=_ids(5), position_ids=first["position_ids"])
     assert wrapper.model.seen == [-3, None]
+
+
+def test_concurrent_first_steps_without_a_cache_stage_their_own_offsets(monkeypatch) -> None:
+    import threading
+    import time
+
+    from transformers_mblt.utils.generation_utils import MobilintGenerationMixin
+
+    in_prepare = threading.Event()
+
+    def upstream_prepare(self, input_ids, past_key_values=None, cache_position=None, **kwargs):
+        del past_key_values, cache_position, kwargs
+        _, self.model.rope_deltas = self.model.get_rope_index(input_ids)
+        if int(input_ids.shape[1]) == 5:
+            in_prepare.set()
+            time.sleep(0.05)  # the other prompt tries to set the shared offset meanwhile
+        return {"position_ids": None}
+
+    monkeypatch.setattr(MobilintGenerationMixin, "prepare_inputs_for_generation", upstream_prepare)
+    wrapper = _wrapper(MobilintQwen2VLForConditionalGeneration)
+    staged: dict[int, int] = {}
+
+    def first_step(length: int) -> None:
+        wrapper.prepare_inputs_for_generation(_ids(length), past_key_values=None, cache_position=torch.arange(length))
+        staged[length] = int(cache_utils._take_staged_rope_deltas(wrapper.model))
+
+    thread = threading.Thread(target=first_step, args=(5,))
+    thread.start()
+    in_prepare.wait()
+    first_step(7)
+    thread.join()
+
+    assert staged == {5: -3, 7: -11}
 
 
 @needs_position_ids_hook

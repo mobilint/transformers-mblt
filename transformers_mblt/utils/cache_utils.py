@@ -774,13 +774,18 @@ def cache_rope_deltas(holder: Any, cache: Any) -> Iterator[Callable[[Any], None]
     that reads or recomputes it, and storing it back happen under one lock. Yields ``keep(target)``, which stores
     the holder's offset on ``target`` (the cache the step filled, which a forward without a cache builds itself).
     """
+    with rope_deltas_lock(holder):
+        use_cache_rope_deltas(holder, cache)
+        yield lambda target: keep_cache_rope_deltas(holder, target)
+
+
+def rope_deltas_lock(holder: Any) -> threading.RLock:
+    """The lock that serializes every read and write of ``holder.rope_deltas`` (see :func:`cache_rope_deltas`)."""
     with _ROPE_DELTAS_LOCKS_GUARD:
         lock = _ROPE_DELTAS_LOCKS.get(holder)
         if lock is None:
             lock = _ROPE_DELTAS_LOCKS[holder] = threading.RLock()
-    with lock:
-        use_cache_rope_deltas(holder, cache)
-        yield lambda target: keep_cache_rope_deltas(holder, target)
+    return lock
 
 
 def keep_cache_rope_deltas(holder: Any, cache: Any) -> None:
