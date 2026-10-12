@@ -460,6 +460,38 @@ When another cache or a forward without a cache uses the decoder slot, or the ca
 beam cache forgets that history and replays it from the start on its next forward. `offload()` frees the slot,
 `is_resident` reports whether the slot still holds the history, and `host_nbytes` is always 0.
 
+### LFM2-Audio
+
+`mobilint-lfm2_audio` runs LiquidAI LFM2-Audio as three NPU graphs: the Conformer encoder, the LFM2 backbone and the
+depthformer, with the token embeddings, the tied text head and the codebook heads on the host. The model folder holds
+one `.mxq` per graph, `model.safetensors` with the host weights, and the usual tokenizer and processor files.
+
+Speech recognition uses the standard ASR pipeline or `generate()`. `MobilintLfm2AudioProcessor` builds the chat prompt
+around an audio placeholder token when `text` is omitted; beam search is replaced by greedy decoding because the model
+decodes one sequence at a time.
+
+```python
+import transformers_mblt
+from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
+
+transformers_mblt.register()
+pipe = pipeline("automatic-speech-recognition", model="mobilint/LFM2-Audio-1.5B", device="cpu")
+print(pipe({"raw": waveform, "sampling_rate": 16000})["text"])
+
+processor = AutoProcessor.from_pretrained("mobilint/LFM2-Audio-1.5B")
+model = AutoModelForSpeechSeq2Seq.from_pretrained("mobilint/LFM2-Audio-1.5B")
+inputs = processor(audio=waveform, sampling_rate=16000)
+tokens = model.generate(**inputs, max_new_tokens=256)
+print(processor.decode(tokens[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True))
+```
+
+Only sequential generation from audio to text (speech recognition) is supported. `generate_interleaved(...)` exists and
+returns `{"text_ids": (1, tokens), "audio_codes": (codebooks, frames)}` (Mimi codec tokens), but speech output is
+not validated on NPU builds: the decoded audio of the Aries-RB build is not intelligible and a TTS run does not reach
+the end-of-audio code. When `generate()` receives only `input_features` (the pipeline path), audio longer
+than the encoder window (10 s) is transcribed window by window and the tokens are joined; a prompt built by the
+processor for such a clip concatenates the windows' embeddings into one sequence instead.
+
 ## Listing Available Models
 
 **transformers-mblt** offers a function to list all available models. You can use the following code snippet to list the models for a specific task (e.g., `text-generation`, `automatic-speech-recognition`, etc.):
@@ -546,6 +578,10 @@ Some architectures have multiple `mxq` files (e.g. encoder-decoder models, or vi
 
 - Mixture-of-Experts prefixes:
   - `shared_...`, `expert_...`, and `lm_head_...` variants, e.g. `expert_target_cores`, `lm_head_target_cores`. Unprefixed NPU settings are not applied to these roles; see [Mixture-of-Experts release contract](#mixture-of-experts-release-contract).
+
+- LFM2-Audio prefixes:
+  - `encoder_...` (Conformer encoder), `decoder_...` (LFM2 backbone) and `depthformer_...` (audio head) variants of the
+    NPU settings above, e.g. `depthformer_target_cores`.
 
 For example, you can override only the encoder `mxq` file:
 

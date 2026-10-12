@@ -17,6 +17,8 @@ def test_register_is_idempotent_and_covers_every_importable_architecture() -> No
     assert transformers_mblt.register() is first
 
     expected = set(_registry.registered_architectures())
+    if importlib.util.find_spec("transformers.models.qwen3_vl") is None:
+        expected.discard("qwen3_vl")
     if importlib.util.find_spec("qwen_asr") is None:
         expected.discard("qwen3_asr")
     assert expected <= set(first)
@@ -28,6 +30,21 @@ def test_register_exposes_mobilint_model_types_to_auto_config() -> None:
     transformers_mblt.register()
     for model_type in ("mobilint-llama", "mobilint-qwen2", "mobilint-qwen2_vl", "mobilint-whisper", "mobilint-bert"):
         assert model_type in CONFIG_MAPPING
+
+
+def test_register_exposes_lfm2_audio_to_auto_models() -> None:
+    from transformers import AutoModel, AutoModelForSpeechSeq2Seq
+
+    registered = transformers_mblt.register()
+    assert "lfm2_audio" in registered
+
+    from transformers_mblt.models.lfm2_audio.configuration_lfm2_audio import MobilintLfm2AudioConfig
+    from transformers_mblt.models.lfm2_audio.modeling_lfm2_audio import MobilintLfm2AudioForConditionalGeneration
+
+    assert AutoModel._model_mapping[MobilintLfm2AudioConfig] is MobilintLfm2AudioForConditionalGeneration
+    assert (
+        AutoModelForSpeechSeq2Seq._model_mapping[MobilintLfm2AudioConfig] is MobilintLfm2AudioForConditionalGeneration
+    )
 
 
 def _fresh_registry(monkeypatch: pytest.MonkeyPatch, failing: set[str]) -> None:
@@ -106,6 +123,8 @@ def test_npu_module_installs_dispatcher_property() -> None:
 @pytest.mark.parametrize("arch", _registry.registered_architectures())
 def test_model_package_exports_resolve(arch: str) -> None:
     """Every name a model package advertises in ``__all__`` resolves through its lazy ``__getattr__``."""
+    if arch == "qwen3_vl" and importlib.util.find_spec("transformers.models.qwen3_vl") is None:
+        pytest.skip("qwen3_vl requires a newer Transformers release")
     if arch == "qwen3_asr" and importlib.util.find_spec("qwen_asr") is None:
         pytest.skip("qwen3_asr requires the qwen-asr extra")
 

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.6.0
+
+### Added
+
+- LFM2-Audio (`mobilint-lfm2_audio`): `MobilintLfm2AudioForConditionalGeneration` runs the Conformer encoder, the
+  LFM2 backbone and the depthformer as three NPU graphs with the embedding tables and heads on the host. Speech
+  recognition (sequential generation, audio to text) goes through `pipeline("automatic-speech-recognition", ...)`
+  and `generate()` and is the only supported path. `generate_interleaved()` returns text and audio codes, but
+  speech output is not validated on NPU builds. `MobilintLfm2AudioFeatureExtractor` and
+  `MobilintLfm2AudioProcessor` provide the log-mel front end and the chat prompt with audio placeholders. NPU
+  settings take the `encoder_`, `decoder_` (backbone) and `depthformer_` prefixes.
+
 ## 0.5.0
 
 ### Added
