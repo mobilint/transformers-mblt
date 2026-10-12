@@ -202,3 +202,16 @@ def test_helper_processor_order_matches_prepared_list() -> None:
     warper_types = [type(w) for w in processor]
     assert warper_types.index(TemperatureLogitsWarper) < warper_types.index(TopKLogitsWarper)
     assert warper_types.index(TopKLogitsWarper) < warper_types.index(TopPLogitsWarper)
+
+
+def test_prepare_logits_processor_samples_at_temperature_one_without_top_k_or_top_p() -> None:
+    """Plain sampling (temperature 1.0, no top-k / top-p) must not turn into greedy decoding."""
+    processor = prepare_logits_processor(temperature=1.0)
+
+    assert processor is not None
+    assert len(processor) == 0
+    assert prepare_logits_processor(temperature=0.0) is None
+    torch.manual_seed(0)
+    logits = torch.tensor([0.0, 0.0, 0.1])
+    sampled = {int(_sample_next_token_from_processor(logits, processor)) for _ in range(200)}
+    assert sampled == {0, 1, 2}

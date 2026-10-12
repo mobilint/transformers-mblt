@@ -173,6 +173,9 @@ def prepare_logits_processor(
     Ordering matches Hugging Face's ``_get_logits_processor``/``_get_logits_warper`` contract
     (repetition penalty → temperature → top-k → top-p) so that :func:`softmax_topk_cpu_torch`
     can safely apply the list on top of a top-k slice when a ``TopKLogitsWarper`` is present.
+
+    Returns ``None`` (greedy) when ``temperature`` is zero. Any other temperature returns a list, empty for plain
+    sampling at temperature 1.0 without top-k or top-p.
     """
     processor_list = LogitsProcessorList()
     if temperature <= 1e-5:
@@ -185,7 +188,8 @@ def prepare_logits_processor(
         processor_list.append(TopKLogitsWarper(top_k))
     if 1e-8 <= top_p < 1.0:
         processor_list.append(TopPLogitsWarper(top_p))
-    return processor_list or None
+    # An empty list still means sampling: ``None`` would make the caller decode greedily.
+    return processor_list
 
 
 def _extract_top_k_from_processor(
