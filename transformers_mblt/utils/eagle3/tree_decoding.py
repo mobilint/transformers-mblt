@@ -778,9 +778,12 @@ def decode_step(
 ) -> Eagle3DecodeStep:
     """Run one round on the draft tree ``cache`` holds (built by :func:`initialize_tree` or the previous round).
 
-    ``remaining_tokens`` caps the tokens the round settles, counting the root. A round that ends generation keeps
-    its accepted tokens unfed (see :class:`MobilintEagle3Cache`) and leaves no tree in the cache.
+    ``remaining_tokens`` caps the tokens the round settles, counting the root, so it is at least 1. A round that ends
+    generation keeps its accepted tokens unfed (see :class:`MobilintEagle3Cache`) and leaves no tree in the cache.
     """
+    if remaining_tokens is not None and remaining_tokens < 1:
+        # The root was already returned; a round that settled nothing would drop it with the tree.
+        raise ValueError(f"A round settles at least its root, so remaining_tokens must be >= 1, got {remaining_tokens}.")
     draft_tokens = cache.pending_draft_tokens
     if draft_tokens is None:
         raise RuntimeError("The EAGLE-3 cache holds no draft tree: run initialize_tree before decode_step.")

@@ -176,6 +176,18 @@ def test_decode_step_ends_the_round_when_the_next_token_is_eos() -> None:
     assert cache.get_base_seq_length() == 4
 
 
+def test_decode_step_refuses_a_budget_without_room_for_the_root_and_keeps_the_tree() -> None:
+    model, cache = _model_with_tree([6, 7, 9])
+
+    for budget in (0, -1):
+        with pytest.raises(ValueError, match="remaining_tokens must be >= 1"):
+            decode_step(model, cache, None, remaining_tokens=budget)
+
+    assert model.eagle3_base_model.calls == []
+    assert torch.equal(cache.pending_draft_tokens, torch.tensor([[5, 6, 7]]))
+    assert torch.equal(decode_step(model, cache, None, remaining_tokens=1).tokens, torch.tensor([[5]]))
+
+
 def test_decode_step_reports_the_drafts_it_accepted() -> None:
     model, cache = _model_with_tree([6, 7, 9])
     assert decode_step(model, cache, None).accepted_draft_tokens == 2
