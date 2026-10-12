@@ -157,6 +157,54 @@ def test_steps_built_in_prepare_inputs_use_their_cache_offset(monkeypatch, cache
     assert a.rope_deltas.tolist() == [[-3]] and b.rope_deltas.tolist() == [[-11]]
 
 
+class _GivenPositionsModel(_PromptModel):
+    """Like upstream's forward: positions passed in are used as they are, so the offset is not recomputed."""
+
+    def __call__(self, *, input_ids, position_ids=None, past_key_values=None, **kwargs):
+        if position_ids is None:
+            return super().__call__(input_ids=input_ids, past_key_values=past_key_values, **kwargs)
+        if past_key_values is None:
+            past_key_values = MobilintCache(object())
+        self.seen.append(None if self.rope_deltas is None else int(self.rope_deltas))
+        past_key_values.update_seen_tokens(past_key_values.get_seq_length() + int(input_ids.shape[1]))
+        return SimpleNamespace(
+            last_hidden_state=torch.zeros(1, int(input_ids.shape[1]), 4),
+            past_key_values=past_key_values,
+            hidden_states=None,
+            attentions=None,
+            rope_deltas=self.rope_deltas,
+        )
+
+
+def test_a_first_step_without_a_cache_hands_its_offset_to_the_cache_the_forward_builds(monkeypatch) -> None:
+    """transformers < 5.2 can run generate()'s first step with no cache: prepare computes the offset, then the
+    forward builds the cache. The next step must find the offset there instead of recomputing it from one token."""
+    from transformers_mblt.utils.generation_utils import MobilintGenerationMixin
+
+    def upstream_prepare(self, input_ids, past_key_values=None, cache_position=None, **kwargs):
+        del past_key_values, kwargs
+        if cache_position[0] == 0 or self.model.rope_deltas is None:
+            positions, self.model.rope_deltas = self.model.get_rope_index(input_ids)
+            return {"position_ids": positions, "recomputed_from": int(input_ids.shape[1])}
+        return {"delta": int(self.model.rope_deltas)}
+
+    monkeypatch.setattr(MobilintGenerationMixin, "prepare_inputs_for_generation", upstream_prepare)
+    wrapper = _wrapper(MobilintQwen2VLForConditionalGeneration)
+    wrapper.model = _GivenPositionsModel()
+    wrapper.model.rope_deltas = torch.tensor([[-11]])  # left by another conversation
+
+    first = wrapper.prepare_inputs_for_generation(_ids(5), past_key_values=None, cache_position=torch.arange(5))
+    outputs = wrapper.forward(input_ids=_ids(5), position_ids=first["position_ids"])
+    cache = outputs.past_key_values
+    second = wrapper.prepare_inputs_for_generation(_ids(1), past_key_values=cache, cache_position=torch.tensor([5]))
+
+    assert cache.rope_deltas.tolist() == [[-3]]
+    assert second["delta"] == -3
+    # The staged offset served that one forward: a later forward without a cache starts a new sequence from none.
+    wrapper.forward(input_ids=_ids(5), position_ids=first["position_ids"])
+    assert wrapper.model.seen == [-3, None]
+
+
 @needs_position_ids_hook
 def test_generate_without_a_cache_hands_the_prompt_offset_to_the_cache_it_builds() -> None:
     wrapper = _wrapper(MobilintQwen2VLForConditionalGeneration)

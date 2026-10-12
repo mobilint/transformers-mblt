@@ -713,13 +713,14 @@ def use_cache_rope_deltas(holder: Any, cache: Any) -> None:
       this cache and shift every later position.
     - a cache with tokens but no offset (from an older release, or a file without one) recomputes it from the full
       input instead of borrowing another sequence's.
-    - no cache means the forward starts a new sequence and builds its cache: the same as an empty one.
+    - no cache means the forward starts a new sequence and builds its cache: the same as an empty one, unless the
+      generation step that prepared this forward computed the prompt's offset (see :func:`stage_new_cache_rope_deltas`).
 
     ``generate()`` computes a prompt's offset before its forward and gives it to the cache first (see
     :class:`~transformers_mblt.utils.generation_utils.MobilintCacheRopeDeltasMixin`), so the forward finds it there.
     """
     if cache is None:
-        holder.rope_deltas = None
+        holder.rope_deltas = _take_staged_rope_deltas(holder)
         return
     if not hasattr(cache, "get_seq_length"):
         return
@@ -736,6 +737,33 @@ def _cache_holds_tokens(cache: Any) -> bool:
 
 _ROPE_DELTAS_LOCKS: "weakref.WeakKeyDictionary[Any, threading.RLock]" = weakref.WeakKeyDictionary()
 _ROPE_DELTAS_LOCKS_GUARD = threading.Lock()
+# holder -> per-thread offset for the next forward on that thread that runs without a cache.
+_STAGED_ROPE_DELTAS: "weakref.WeakKeyDictionary[Any, threading.local]" = weakref.WeakKeyDictionary()
+
+
+def stage_new_cache_rope_deltas(holder: Any, rope_deltas: Optional[torch.Tensor]) -> None:
+    """Hand ``rope_deltas`` to the next forward on this thread that runs ``holder`` without a cache.
+
+    Before transformers 5.2, ``generate()``'s first step computes the prompt's offset in
+    ``prepare_inputs_for_generation`` while it has no cache yet; the forward then builds one. Without this, that
+    forward would start from no offset (see :func:`use_cache_rope_deltas`) and store ``None`` on the new cache, and the
+    next step would recompute the offset from its single token.
+    """
+    with _ROPE_DELTAS_LOCKS_GUARD:
+        staged = _STAGED_ROPE_DELTAS.get(holder)
+        if staged is None:
+            staged = _STAGED_ROPE_DELTAS[holder] = threading.local()
+    staged.value = rope_deltas
+
+
+def _take_staged_rope_deltas(holder: Any) -> Optional[torch.Tensor]:
+    with _ROPE_DELTAS_LOCKS_GUARD:
+        staged = _STAGED_ROPE_DELTAS.get(holder)
+    if staged is None:
+        return None
+    value = getattr(staged, "value", None)
+    staged.value = None
+    return value
 
 
 @contextmanager
