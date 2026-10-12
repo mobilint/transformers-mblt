@@ -14,6 +14,7 @@ from transformers import GenerationMixin
 
 from tests.transformers.image_text_to_text.qwen3_vl_compat import transformers_supports_qwen3_vl
 from transformers_mblt.models.qwen2_vl.modeling_qwen2_vl import MobilintQwen2VLForConditionalGeneration
+from transformers_mblt.utils import cache_utils
 from transformers_mblt.utils.cache_utils import (
     MobilintCache,
     MobilintDeepStackCache,
@@ -155,6 +156,87 @@ def test_steps_built_in_prepare_inputs_use_their_cache_offset(monkeypatch, cache
     assert step(a, 1) == -3  # upstream alone would add b's -11
     assert step(b, 1) == -11
     assert a.rope_deltas.tolist() == [[-3]] and b.rope_deltas.tolist() == [[-11]]
+
+
+class _GivenPositionsModel(_PromptModel):
+    """Like upstream's forward: positions passed in are used as they are, so the offset is not recomputed."""
+
+    def __call__(self, *, input_ids, position_ids=None, past_key_values=None, **kwargs):
+        if position_ids is None:
+            return super().__call__(input_ids=input_ids, past_key_values=past_key_values, **kwargs)
+        if past_key_values is None:
+            past_key_values = MobilintCache(object())
+        self.seen.append(None if self.rope_deltas is None else int(self.rope_deltas))
+        past_key_values.update_seen_tokens(past_key_values.get_seq_length() + int(input_ids.shape[1]))
+        return SimpleNamespace(
+            last_hidden_state=torch.zeros(1, int(input_ids.shape[1]), 4),
+            past_key_values=past_key_values,
+            hidden_states=None,
+            attentions=None,
+            rope_deltas=self.rope_deltas,
+        )
+
+
+def test_a_first_step_without_a_cache_hands_its_offset_to_the_cache_the_forward_builds(monkeypatch) -> None:
+    """transformers < 5.2 can run generate()'s first step with no cache: prepare computes the offset, then the
+    forward builds the cache. The next step must find the offset there instead of recomputing it from one token."""
+    from transformers_mblt.utils.generation_utils import MobilintGenerationMixin
+
+    def upstream_prepare(self, input_ids, past_key_values=None, cache_position=None, **kwargs):
+        del past_key_values, kwargs
+        if cache_position[0] == 0 or self.model.rope_deltas is None:
+            positions, self.model.rope_deltas = self.model.get_rope_index(input_ids)
+            return {"position_ids": positions, "recomputed_from": int(input_ids.shape[1])}
+        return {"delta": int(self.model.rope_deltas)}
+
+    monkeypatch.setattr(MobilintGenerationMixin, "prepare_inputs_for_generation", upstream_prepare)
+    wrapper = _wrapper(MobilintQwen2VLForConditionalGeneration)
+    wrapper.model = _GivenPositionsModel()
+    wrapper.model.rope_deltas = torch.tensor([[-11]])  # left by another conversation
+
+    first = wrapper.prepare_inputs_for_generation(_ids(5), past_key_values=None, cache_position=torch.arange(5))
+    outputs = wrapper.forward(input_ids=_ids(5), position_ids=first["position_ids"])
+    cache = outputs.past_key_values
+    second = wrapper.prepare_inputs_for_generation(_ids(1), past_key_values=cache, cache_position=torch.tensor([5]))
+
+    assert cache.rope_deltas.tolist() == [[-3]]
+    assert second["delta"] == -3
+    # The staged offset served that one forward: a later forward without a cache starts a new sequence from none.
+    wrapper.forward(input_ids=_ids(5), position_ids=first["position_ids"])
+    assert wrapper.model.seen == [-3, None]
+
+
+def test_concurrent_first_steps_without_a_cache_stage_their_own_offsets(monkeypatch) -> None:
+    import threading
+    import time
+
+    from transformers_mblt.utils.generation_utils import MobilintGenerationMixin
+
+    in_prepare = threading.Event()
+
+    def upstream_prepare(self, input_ids, past_key_values=None, cache_position=None, **kwargs):
+        del past_key_values, cache_position, kwargs
+        _, self.model.rope_deltas = self.model.get_rope_index(input_ids)
+        if int(input_ids.shape[1]) == 5:
+            in_prepare.set()
+            time.sleep(0.05)  # the other prompt tries to set the shared offset meanwhile
+        return {"position_ids": None}
+
+    monkeypatch.setattr(MobilintGenerationMixin, "prepare_inputs_for_generation", upstream_prepare)
+    wrapper = _wrapper(MobilintQwen2VLForConditionalGeneration)
+    staged: dict[int, int] = {}
+
+    def first_step(length: int) -> None:
+        wrapper.prepare_inputs_for_generation(_ids(length), past_key_values=None, cache_position=torch.arange(length))
+        staged[length] = int(cache_utils._take_staged_rope_deltas(wrapper.model))
+
+    thread = threading.Thread(target=first_step, args=(5,))
+    thread.start()
+    in_prepare.wait()
+    first_step(7)
+    thread.join()
+
+    assert staged == {5: -3, 7: -11}
 
 
 @needs_position_ids_hook

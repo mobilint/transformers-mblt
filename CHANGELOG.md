@@ -24,6 +24,10 @@
 
 ### Fixed
 
+- Qwen2-VL / Qwen3-VL `generate()` on transformers 5.0 and 5.1 no longer fails on its second step with an `IndexError`
+  in `get_rope_index`. When the first step ran without a cache, the forward that built the cache stored no M-RoPE
+  offset on it (0.4.0 resets the offset for a forward without a cache), so the next step recomputed the offset from
+  its single token. The offset that step computed now goes to the cache the forward builds.
 - EAGLE-3 sampling at temperature 1.0 without top-k or top-p no longer decodes greedily.
   `prepare_logits_processor` returned `None`, which means greedy, whenever no processor applied; it now returns an
   empty list, which samples from the plain softmax.
