@@ -22,7 +22,7 @@ import threading
 import time
 import weakref
 from concurrent.futures import Future, ThreadPoolExecutor, wait
-from typing import TYPE_CHECKING, Callable, List, Literal, Optional, Tuple, cast
+from typing import TYPE_CHECKING, Callable, List, Literal, Optional, Tuple, Union, cast
 
 import numpy as np
 import qbruntime
@@ -48,6 +48,46 @@ def _is_bindable_cache(past_key_values: object) -> bool:
 
 PhaseName = Literal["prefill", "decode"]
 LayoutName = Literal["n_items", "n_tokens"]
+
+
+class GroupedRows:
+    """Multi-slot output rows in caller order, read from each slot's output without merging.
+
+    A multi-group dispatch used to copy every slot's logits into one merged array before the caller
+    copied the rows it keeps out of that array again. For a 48-row Qwen3-0.6B decode step on three
+    cards that merge alone took about 9 ms. ``row(i)`` returns a view of caller row ``i`` in its
+    slot's output, so a caller that copies rows out pays for one copy. ``np.asarray`` still yields
+    the merged ``(n_rows, vocab)`` array for callers that need it whole.
+    """
+
+    def __init__(self, group_raw: List[np.ndarray], row_refs: List[Tuple[int, int]], vocab: int) -> None:
+        self._group_flat = [arr.reshape(-1, vocab) for arr in group_raw]
+        self._row_refs = row_refs
+        self.vocab = vocab
+        self.dtype = self._group_flat[0].dtype
+
+    @property
+    def shape(self) -> Tuple[int, int]:
+        return (len(self._row_refs), self.vocab)
+
+    @property
+    def ndim(self) -> int:
+        return 2
+
+    @property
+    def size(self) -> int:
+        return len(self._row_refs) * self.vocab
+
+    def row(self, i: int) -> np.ndarray:
+        """Caller row ``i`` as a view of its slot's output."""
+        gi, r = self._row_refs[i]
+        return self._group_flat[gi][r]
+
+    def __array__(self, dtype=None, copy=None) -> np.ndarray:
+        merged = np.empty(self.shape, dtype=self.dtype)
+        for i, (gi, r) in enumerate(self._row_refs):
+            merged[i] = self._group_flat[gi][r]
+        return merged if dtype is None else merged.astype(dtype, copy=False)
 
 
 class MultiSlotDispatcher:
@@ -219,7 +259,8 @@ class MultiSlotDispatcher:
         phase_override: Optional[PhaseName] = None,
         record_npu_time: Optional[Callable[[PhaseName, float], None]] = None,
         debug_enabled: bool = False,
-    ) -> Tuple[np.ndarray, Tuple[int, ...]]:
+        merge: bool = True,
+    ) -> Tuple[Union[np.ndarray, GroupedRows], Tuple[int, ...]]:
         """Dispatch a batched infer across the backend's Model slots.
 
         Args:
@@ -251,6 +292,9 @@ class MultiSlotDispatcher:
             record_npu_time: Called with ``(phase, elapsed)`` when
                 ``count_npu_time`` is ``True``.
             debug_enabled: Emit the ``[BATCH-LLM][PARALLEL]`` debug line.
+            merge: When ``False``, a multi-group dispatch returns a :class:`GroupedRows`
+                instead of copying every slot's output into one merged array. A single-group
+                dispatch always returns the slot's ndarray.
 
         Returns:
             A ``(merged_output, first_group_shape)`` tuple. ``merged_output``
@@ -457,13 +501,17 @@ class MultiSlotDispatcher:
 
         group_raw_arrs: List[np.ndarray] = [cast(np.ndarray, arr) for arr in group_raw]
         group_seq_lens: List[List[int]] = [payload[3] for payload in per_group_payload]
-        merged = self._merge_group_outputs(
-            group_raw_arrs,
-            groups,
-            group_seq_lens,
-            sequence_lengths,
-            n_items,
-        )
+        merged: Union[np.ndarray, GroupedRows]
+        if merge:
+            merged = self._merge_group_outputs(
+                group_raw_arrs,
+                groups,
+                group_seq_lens,
+                sequence_lengths,
+                n_items,
+            )
+        else:
+            merged = self._group_rows(group_raw_arrs, groups, group_seq_lens, sequence_lengths, n_items)
 
         # Return the first group's shape so the ``[BATCH-LLM]`` debug lines in
         # the caller keep printing something meaningful without synthesizing a
@@ -482,7 +530,18 @@ class MultiSlotDispatcher:
         sequence_lengths: List[int],
         n_items: int,
     ) -> np.ndarray:
-        """Merge per-group outputs into a single row-ordered ndarray.
+        """Merge per-group outputs into a single row-ordered ndarray (see :meth:`_group_rows`)."""
+        return np.asarray(self._group_rows(group_raw, groups, group_seq_lens, sequence_lengths, n_items))
+
+    def _group_rows(
+        self,
+        group_raw: List[np.ndarray],
+        groups: List[Tuple[int, List[int], List[int]]],
+        group_seq_lens: List[List[int]],
+        sequence_lengths: List[int],
+        n_items: int,
+    ) -> GroupedRows:
+        """Map caller-order output rows to ``(group, row)`` in the per-group outputs.
 
         Reads ``backend.output_layout``; falls back to inspecting an
         unambiguous group and pins the answer on the backend when the
@@ -521,7 +580,7 @@ class MultiSlotDispatcher:
                 "Re-issue a dispatch that includes at least one row with seq_len > 1."
             )
 
-        # Find the first non-empty group so we can size the merged buffer.
+        # Find the first non-empty group to read the vocab size.
         first_arr: Optional[np.ndarray] = None
         for arr in group_raw:
             if arr.size > 0:
@@ -532,29 +591,26 @@ class MultiSlotDispatcher:
         vocab = int(first_arr.shape[-1])
 
         if layout == "n_items":
-            merged = np.empty((n_items, vocab), dtype=first_arr.dtype)
+            row_refs: List[Tuple[int, int]] = [(-1, -1)] * n_items
             for gi, (_m, group_items, _local_ids) in enumerate(groups):
-                g_flat = group_raw[gi].reshape(-1, vocab)
                 for r, item_idx in enumerate(group_items):
-                    merged[item_idx] = g_flat[r]
-            return merged
+                    row_refs[item_idx] = (gi, r)
+            return GroupedRows(group_raw, row_refs, vocab)
 
         # ``"n_tokens"`` — per-token flat rows, indexed by caller-order offsets.
-        total_tokens = sum(sequence_lengths)
         offsets = [0] * n_items
         running = 0
         for k in range(n_items):
             offsets[k] = running
             running += sequence_lengths[k]
-        merged = np.empty((total_tokens, vocab), dtype=first_arr.dtype)
+        row_refs = [(-1, -1)] * running
         for gi, (_m, group_items, _local_ids) in enumerate(groups):
-            g_flat = group_raw[gi].reshape(-1, vocab)
             g_off = 0
             for item_idx in group_items:
-                len_k = sequence_lengths[item_idx]
-                merged[offsets[item_idx] : offsets[item_idx] + len_k] = g_flat[g_off : g_off + len_k]
-                g_off += len_k
-        return merged
+                for t in range(sequence_lengths[item_idx]):
+                    row_refs[offsets[item_idx] + t] = (gi, g_off + t)
+                g_off += sequence_lengths[item_idx]
+        return GroupedRows(group_raw, row_refs, vocab)
 
     @staticmethod
     def _observe_layout_from_groups(

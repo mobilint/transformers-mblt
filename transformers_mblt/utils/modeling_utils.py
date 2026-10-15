@@ -20,6 +20,7 @@ from .configuration_utils import (
     MobilintMixtureOfExpertsConfigMixin,
 )
 from .moe_utils import MobilintMixtureOfExpertsNPUBackend
+from .multi_slot_dispatch import GroupedRows
 
 logger = logging.getLogger(__name__)
 
@@ -1100,7 +1101,8 @@ class MobilintModelMixin(PretrainedOnlyMixin, PreTrainedModel):
             phase_override: Optional[Literal["prefill", "decode"]] = None,
             *,
             chunk_start: int = 0,
-        ) -> tuple[np.ndarray, tuple[int, ...]]:
+            merge: bool = True,
+        ) -> tuple[Union[np.ndarray, GroupedRows], tuple[int, ...]]:
             return dispatcher.dispatch(
                 cache_ids=cache_ids_l,
                 sequence_lengths=sequence_lengths_chunks_l,
@@ -1115,6 +1117,7 @@ class MobilintModelMixin(PretrainedOnlyMixin, PreTrainedModel):
                 phase_override=phase_override,
                 record_npu_time=_record_npu_time if count_npu_time else None,
                 debug_enabled=debug_enabled,
+                merge=merge,
             )
 
         # ------------------------------------------------------------------
@@ -1154,12 +1157,14 @@ class MobilintModelMixin(PretrainedOnlyMixin, PreTrainedModel):
                 if len(inputs_embeds_chunks) == 0:
                     continue
 
+                # Rows are copied out of the slots' outputs below, so a multi-slot dispatch skips merging them.
                 raw_output, inputs_embeds_numpy_shape = _run_batch_infer(
                     cache_ids,
                     sequence_lengths_chunks,
                     cache_sizes_chunks,
                     inputs_embeds_chunks,
                     chunk_start=start_index,
+                    merge=False,
                 )
                 # Two runtime layouts show up in practice for default-keep
                 # batched infer:
@@ -1180,7 +1185,8 @@ class MobilintModelMixin(PretrainedOnlyMixin, PreTrainedModel):
                 # fall back to ``config.vocab_size`` for the rare 1D
                 # buffer case. Layout is then chosen by comparing the row
                 # count to ``active`` vs ``total_tokens``.
-                raw_arr = np.asarray(raw_output)
+                grouped_rows = raw_output if isinstance(raw_output, GroupedRows) else None
+                raw_arr = raw_output if grouped_rows is not None else np.asarray(raw_output)
                 active = len(cache_ids)
                 total_tokens = sum(sequence_lengths_chunks)
                 if raw_arr.ndim >= 2 and raw_arr.shape[-1] > 0:
@@ -1229,8 +1235,21 @@ class MobilintModelMixin(PretrainedOnlyMixin, PreTrainedModel):
                         f"{total_tokens} (per-token flat).{hint}"
                     )
                 # A view of the MXQ output. Each item's row is copied into ``logits`` only when its last chunk
-                # finishes, so neither layout copies the logits more than once.
-                output_rows = torch.from_numpy(np.ascontiguousarray(raw_arr)).reshape([n_rows, vocab])
+                # finishes, so neither layout copies the logits more than once. A multi-slot output is read
+                # row by row from each slot's output; the merged view is built only for debug logging.
+                if grouped_rows is not None:
+
+                    def output_row(index: int, _rows: GroupedRows = grouped_rows) -> torch.Tensor:
+                        return torch.from_numpy(_rows.row(index))
+
+                    output_rows = (
+                        torch.from_numpy(np.asarray(grouped_rows)).reshape([n_rows, vocab]) if debug_enabled else None
+                    )
+                else:
+                    output_rows = torch.from_numpy(np.ascontiguousarray(raw_arr)).reshape([n_rows, vocab])
+
+                    def output_row(index: int, _rows: torch.Tensor = output_rows) -> torch.Tensor:
+                        return _rows[index]
 
                 if debug_enabled:
                     logits_chunks = output_rows[last_row_of].reshape([active, 1, vocab])
@@ -1328,7 +1347,7 @@ class MobilintModelMixin(PretrainedOnlyMixin, PreTrainedModel):
                         if logits is None:
                             # Filled on the host, where the MXQ output is, and moved to the input device once.
                             logits = torch.empty((batch_size, 1, vocab), dtype=inputs_embeds.dtype, device="cpu")
-                        logits[cache_ids[j]] = output_rows[last_row_of[j]]
+                        logits[cache_ids[j]] = output_row(last_row_of[j])
                         finished.add(cache_ids[j])
 
                 if past_key_values is not None:

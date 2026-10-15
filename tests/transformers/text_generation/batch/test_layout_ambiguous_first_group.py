@@ -193,3 +193,38 @@ def test_multi_slot_merge_preserves_longer_prompt_when_first_group_is_size_one()
     # Slot 0 saw a size-1 group (the ambiguous one); slot 1 saw a size-3 group.
     assert m0.calls[0]["batch"] == [(0, 1, 0)]
     assert m1.calls[0]["batch"] == [(0, 3, 0)]
+
+
+def test_default_keep_reads_multi_slot_rows_without_merging(monkeypatch) -> None:
+    """``logits_to_keep=1`` on a multi-slot backend copies each item's last row straight from its slot.
+
+    The merged array is never built (``GroupedRows.__array__`` would raise), and every item still gets
+    its own last-token row: slot offsets, per-slot local rows and per-row sequence lengths all differ.
+    """
+    from transformers_mblt.utils.multi_slot_dispatch import GroupedRows
+
+    def _no_merge(self, dtype=None, copy=None):
+        raise AssertionError("default-keep path must not merge multi-slot outputs")
+
+    monkeypatch.setattr(GroupedRows, "__array__", _no_merge)
+
+    ms = [_DynamicAxisMxq(vocab_size=4, max_width=8, token_offset=1000.0 * i) for i in range(3)]
+    model = _make_model(ms)
+    cache = MobilintCache(ms, per_model_batch=1)
+
+    seq_len = 3
+    inputs_embeds = torch.randn(3, seq_len, 4, dtype=torch.float32)
+    attention_mask = torch.tensor([[0, 0, 1], [1, 1, 1], [0, 1, 1]], dtype=torch.long)
+    logits = model.llm_forward(
+        inputs_embeds=inputs_embeds,
+        past_key_values=cache,
+        cache_position=torch.arange(seq_len),
+        attention_mask=attention_mask,
+        logits_to_keep=1,
+    )
+
+    assert logits.shape == (3, 1, 4)
+    # Each item is local row 0 of its own slot; its last active token index is seq_len_k - 1.
+    assert logits[0, 0].tolist() == [0.0] * 4
+    assert logits[1, 0].tolist() == [1002.0] * 4
+    assert logits[2, 0].tolist() == [2001.0] * 4

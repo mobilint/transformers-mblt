@@ -378,6 +378,57 @@ def test_dispatch_survives_concurrent_pool_growth_and_close() -> None:
     assert errors == []
 
 
+@pytest.mark.parametrize("layout_cls", [_StaticN1Mxq, _DynamicMxq])
+def test_dispatch_without_merge_returns_rows_equal_to_the_merged_output(layout_cls) -> None:
+    """``merge=False`` yields a GroupedRows whose rows and materialized array match the merged output."""
+    from transformers_mblt.utils.multi_slot_dispatch import GroupedRows
+
+    def make():
+        ms = [layout_cls(vocab_size=3) for _ in range(3)]
+        return MultiSlotDispatcher(_MockBackend(ms, k_per_model=2))
+
+    class _Routing:
+        n_models = 3
+        k_per_model = 2
+
+        def slot_of(self, row: int) -> Tuple[int, int]:
+            return divmod(row, 2)
+
+    # Rows deliberately out of slot order, with differing lengths for the per-token layout.
+    cache_ids = [4, 0, 3, 1, 5]
+    seq = [1, 2, 1, 3, 2] if layout_cls is _DynamicMxq else [1] * 5
+    kwargs = dict(
+        cache_ids=cache_ids,
+        sequence_lengths=seq,
+        cache_sizes=[0] * 5,
+        inputs_embeds_chunks=[_make_embed(n) for n in seq],
+        max_sequence_length=max(seq),
+        past_key_values=_Routing(),
+    )
+    merged, _ = make().dispatch(**kwargs)
+    grouped, _ = make().dispatch(merge=False, **kwargs)
+
+    assert isinstance(grouped, GroupedRows)
+    assert grouped.shape == merged.shape
+    np.testing.assert_array_equal(np.asarray(grouped), merged)
+    for i in range(merged.shape[0]):
+        np.testing.assert_array_equal(grouped.row(i), merged[i])
+
+
+def test_dispatch_without_merge_single_group_returns_the_slot_array() -> None:
+    """A single-group dispatch has nothing to merge and returns the slot's ndarray as before."""
+    dispatcher = MultiSlotDispatcher(_MockBackend([_StaticN1Mxq(vocab_size=3)], k_per_model=2))
+    out, _ = dispatcher.dispatch(
+        cache_ids=[0, 1],
+        sequence_lengths=[1, 1],
+        cache_sizes=[4, 4],
+        inputs_embeds_chunks=[_make_embed(1), _make_embed(1)],
+        max_sequence_length=1,
+        merge=False,
+    )
+    assert isinstance(out, np.ndarray)
+
+
 # ---------------------------------------------------------------------------
 # Layout selection
 # ---------------------------------------------------------------------------
