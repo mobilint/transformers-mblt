@@ -298,6 +298,23 @@ env var) wins over the config field. Resolution order:
 3. The hardcoded default `(0, 2, 3, 1)` — backward compatibility for repos whose
    `config.json` predates the field.
 
+#### Vision MXQ input layouts
+
+`MobilintQwen3VLVisionModel` detects the vision layout from the compiled variant handle's
+`get_model_input_shape()` at load time. The input count selects the path; for the single-input
+static path, the last axis selects the tensor layout. Widths below are those of the Qwen3-VL 2B
+vision config.
+
+| Signature | Inputs | Notes |
+| --- | --- | --- |
+| Static folded | `[folded (1, N, 1536)]` | qbcompiler 1.4 `vision` part compiled without side inputs. `N` is the compiled patch count (256 for a 256x256 frame); the processor resizes every image to that frame. |
+| Static legacy | `[repreprocessed (1024, 64, 6)]` | Earlier static releases. The runtime repreprocesses the `(256, 1536)` pixel rows into the `(1024, 64, 6)` grid. |
+| Dynamic | `[folded (1, -1, 1536), pos (1, -1, 1024), rope (1, -1, 128)]` | Variable patch count; the slot order is recovered from the widths. |
+
+`fold_in = in_channels * temporal_patch_size * patch_size**2` is derived from the loaded vision
+config, so the detection follows the config rather than fixed numbers. A single-input MXQ whose
+width matches neither static layout raises `ValueError` at load time.
+
 #### Text MXQ DeepStack input layouts
 
 The Qwen3-VL text MXQ is compiled with rank-3 inputs; the DeepStack feed can be **bundled** into

@@ -239,6 +239,15 @@ class MobilintQwen3VLVisionModel(MobilintModelMixin, MobilintQwen3VLPreTrainedMo
         # future refactors so we standardise on it here too.
         input_shapes = mxq.get_model_variant_handle(0).get_model_input_shape()
         self._uses_dynamic_vision = self._resolve_dynamic_vision_flag(len(input_shapes))
+        if not self._uses_dynamic_vision:
+            # Two single-input layouts ship: the folded pixel tensor of a
+            # qbcompiler 1.4 ``vision`` part compiled without side inputs, and
+            # the legacy repreprocessed ``(1024, 64, 6)`` grid of the earlier
+            # static releases. The input count cannot tell them apart; the
+            # last-axis width can.
+            self._static_input_layout = self._resolve_static_input_layout(input_shapes[0], config)
+            static_token_count = int(input_shapes[0][-2]) if self._static_input_layout == "folded" else 0
+            self._static_token_count = static_token_count if static_token_count > 0 else None
         # Only the dynamic path consumes `pos_embed` and `rotary_pos_emb`
         # (via `_prepare_dynamic_npu_inputs`), and static Qwen3-VL Hub
         # checkpoints don't ship `visual.pos_embed.weight`. Skipping the
@@ -287,6 +296,46 @@ class MobilintQwen3VLVisionModel(MobilintModelMixin, MobilintQwen3VLPreTrainedMo
         raise ValueError(
             f"Qwen3-VL vision MXQ must expose 1 (static) or 3 (dynamic rope + "
             f"pos + folded) inputs; got {num_mxq_inputs}."
+        )
+
+    @staticmethod
+    def _resolve_static_input_layout(
+        input_shape: tuple[int, ...],
+        config: "MobilintQwen3VLVisionConfig",
+    ) -> str:
+        """Detect the single-input (static) vision layout from the compiled MXQ input shape.
+
+        Two static layouts exist, both with one tensor input:
+
+        * ``"folded"``: ``(1, N, fold_in)`` with ``fold_in = in_channels *
+          temporal_patch_size * patch_size**2`` -- the folded pixel tensor the
+          dynamic path feeds in its ``folded`` slot, without the side inputs.
+          A qbcompiler 1.4 ``vision`` part compiled without ``side_inputs``
+          produces it; ``N`` is the compiled patch count (256 for a 256x256
+          frame with 16-pixel patches).
+        * ``"legacy"``: ``(1024, 64, in_channels * temporal_patch_size)`` --
+          the repreprocessed grid of the earlier static releases, built by
+          :meth:`_repreprocess_pixel_values`.
+
+        The two widths differ for every Qwen3-VL config (1536 vs 6), so the
+        last axis identifies the layout. Anything else is a compile-side
+        mismatch; raise at load time rather than let a wrong-shape tensor
+        reach the NPU.
+        """
+        width = int(input_shape[-1])
+        in_channels = int(config.in_channels)
+        temporal_patch_size = int(config.temporal_patch_size)
+        fold_in = in_channels * temporal_patch_size * (int(config.patch_size) ** 2)
+        legacy_width = in_channels * temporal_patch_size
+        if width == fold_in:
+            return "folded"
+        if width == legacy_width:
+            return "legacy"
+        raise ValueError(
+            f"Qwen3-VL static vision MXQ input shape {tuple(input_shape)} matches neither the "
+            f"folded layout (1, N, {fold_in}) nor the legacy layout (1024, 64, {legacy_width}) "
+            "derived from the vision config. The compiled MXQ was likely built against a "
+            "different config; recompile it or load the matching config."
         )
 
     @staticmethod
@@ -361,11 +410,15 @@ class MobilintQwen3VLVisionModel(MobilintModelMixin, MobilintQwen3VLPreTrainedMo
     ) -> Union[tuple, BaseModelOutputWithDeepstackFeatures]:
         """Run the NPU vision encoder and adapt to the upstream Qwen3-VL vision contract.
 
-        The compiled encoder expects a fixed-shape tensor with the following flow:
+        A static encoder takes one tensor; its layout is detected at load time
+        (:meth:`_resolve_static_input_layout`):
 
-        1. HF processor output: `(256, 1536)` for a 224x224 image
-        2. Runtime repreprocess: `(1, 6, 1024, 64)`
-        3. Final MXQ input: `(1024, 64, 6)`
+        * folded: HF processor output `(256, 1536)` -> MXQ input `(1, 256, 1536)`
+        * legacy: HF processor output `(256, 1536)` -> repreprocess `(1, 6, 1024, 64)`
+          -> MXQ input `(1024, 64, 6)`
+
+        A dynamic encoder takes the folded pixel tensor together with the position
+        embeddings and the packed RoPE (:meth:`_prepare_dynamic_npu_inputs`).
 
         The Mobilint backend exposes merged image embeds and deepstack features only, so
         `last_hidden_state`, `hidden_states`, and `attentions` remain unavailable.
@@ -523,15 +576,29 @@ class MobilintQwen3VLVisionModel(MobilintModelMixin, MobilintQwen3VLPreTrainedMo
         return hidden_states
 
     def _prepare_npu_inputs(self, hidden_states: torch.Tensor, grid_thw: torch.Tensor) -> np.ndarray:
-        """Convert runtime repreprocess output to the exact MXQ input shape.
+        """Convert the HF pixel values of one image to the static MXQ input layout.
 
         Args:
             hidden_states: HF processor pixel values, typically `(256, 1536)`.
-            grid_thw: Visual grid metadata, typically `[[1, 16, 16]]`.
+            grid_thw: Visual grid metadata of the image, typically `[1, 16, 16]`.
 
         Returns:
-            Float32 numpy tensor with shape `(1024, 64, 6)`.
+            Float32 numpy tensor with shape `(1, 256, 1536)` for the folded layout or
+            `(1024, 64, 6)` for the legacy layout (see :meth:`_resolve_static_input_layout`).
         """
+        if self._static_input_layout == "folded":
+            expected = self._static_token_count
+            if expected is not None and int(hidden_states.shape[0]) != expected:
+                raise ValueError(
+                    f"Qwen3-VL static vision MXQ was compiled for {expected} patches; the processor "
+                    f"produced {int(hidden_states.shape[0])}. Load the processor of the same release "
+                    "so every image is resized to the compiled frame size."
+                )
+            # Same tensor the dynamic path feeds in its `folded` slot, without
+            # the side inputs: `(N, fold_in)` -> `(1, N, fold_in)`.
+            folded = fold_pixel_values(hidden_states)
+            return folded.squeeze(2).permute(0, 2, 1).contiguous().to(torch.float32).cpu().numpy()
+
         processed = self._repreprocess_pixel_values(hidden_states, grid_thw)
         if processed.ndim != 4 or processed.shape[0] != 1:
             raise ValueError(f"Unexpected preprocessed vision tensor shape: {tuple(processed.shape)}")

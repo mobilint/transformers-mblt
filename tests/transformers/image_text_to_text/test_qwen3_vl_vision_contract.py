@@ -152,6 +152,77 @@ def test_qwen3_vl_dynamic_mxq_signature_maps_shape_roles_without_runtime() -> No
     }
 
 
+def _static_vision_config() -> SimpleNamespace:
+    """Vision config fields used by the static input layout helpers (Qwen3-VL 2B)."""
+    return SimpleNamespace(
+        hidden_size=1024,
+        num_heads=16,
+        in_channels=3,
+        temporal_patch_size=2,
+        patch_size=16,
+        spatial_merge_size=2,
+    )
+
+
+def test_qwen3_vl_static_input_layout_is_resolved_from_mxq_width() -> None:
+    """Tell the folded and legacy single-input vision layouts apart by their last axis."""
+    config = _static_vision_config()
+
+    assert MobilintQwen3VLVisionModel._resolve_static_input_layout((1, 256, 1536), config) == "folded"
+    assert MobilintQwen3VLVisionModel._resolve_static_input_layout((1024, 64, 6), config) == "legacy"
+    with pytest.raises(ValueError, match="matches neither"):
+        MobilintQwen3VLVisionModel._resolve_static_input_layout((1, 256, 1024), config)
+
+
+def test_qwen3_vl_prepare_npu_inputs_folded_layout_keeps_pixel_rows() -> None:
+    """Feed a folded static MXQ the processor pixel rows as `(1, N, fold_in)`."""
+    vision = SimpleNamespace(
+        config=_static_vision_config(),
+        _static_input_layout="folded",
+        _static_token_count=256,
+    )
+    pixel_values = torch.arange(256 * 1536, dtype=torch.float32).view(256, 1536)
+    grid = torch.tensor([1, 16, 16], dtype=torch.long)
+
+    npu_input = MobilintQwen3VLVisionModel._prepare_npu_inputs(vision, pixel_values, grid)
+
+    assert npu_input.shape == (1, 256, 1536)
+    assert npu_input.dtype == np.float32
+    assert np.array_equal(npu_input[0], pixel_values.numpy())
+
+
+def test_qwen3_vl_prepare_npu_inputs_folded_layout_rejects_patch_count_mismatch() -> None:
+    """Raise a legible error when the processor frame does not match the compiled patch count."""
+    vision = SimpleNamespace(
+        config=_static_vision_config(),
+        _static_input_layout="folded",
+        _static_token_count=256,
+    )
+    pixel_values = torch.zeros((196, 1536), dtype=torch.float32)
+    grid = torch.tensor([1, 14, 14], dtype=torch.long)
+
+    with pytest.raises(ValueError, match="compiled for 256 patches"):
+        MobilintQwen3VLVisionModel._prepare_npu_inputs(vision, pixel_values, grid)
+
+
+def test_qwen3_vl_prepare_npu_inputs_legacy_layout_repreprocesses() -> None:
+    """Keep the `(1024, 64, 6)` repreprocess path for legacy static releases."""
+    vision = SimpleNamespace(
+        config=_static_vision_config(),
+        _static_input_layout="legacy",
+        _static_token_count=None,
+    )
+    vision._repreprocess_pixel_values = lambda hidden_states, grid_thw: (
+        MobilintQwen3VLVisionModel._repreprocess_pixel_values(vision, hidden_states, grid_thw)
+    )
+    pixel_values = torch.zeros((256, 1536), dtype=torch.float32)
+    grid = torch.tensor([1, 16, 16], dtype=torch.long)
+
+    npu_input = MobilintQwen3VLVisionModel._prepare_npu_inputs(vision, pixel_values, grid)
+
+    assert npu_input.shape == (1024, 64, 6)
+
+
 def test_qwen3_vl_visual_forward_supports_return_dict_false(monkeypatch: pytest.MonkeyPatch) -> None:
     """Convert structured vision outputs to tuple form when requested."""
     monkeypatch.setattr(modeling_qwen3_vl, "_upstream_qwen3_vl_uses_structured_vision_outputs", lambda: True)

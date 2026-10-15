@@ -115,6 +115,9 @@ description: >-
   handling (including `MBLT_VISION_OUTPUT_ORDER` env override) live in
   `transformers_mblt/README.md`; per-artifact resolution and validation logic
   live in `transformers_mblt/models/qwen3_vl/modeling_qwen3_vl.py::_resolve_vision_output_order`.
+  A static (single-input) vision MXQ ships in one of two layouts, detected by width in
+  `_resolve_static_input_layout`: folded `(1, N, 1536)` from qbcompiler 1.4 (`vision` part
+  without side inputs) or legacy repreprocessed `(1024, 64, 6)`. Keep both paths.
 - Mixture-of-Experts contract (Qwen3-MoE): `MobilintMixtureOfExpertsConfigMixin` /
   `MobilintMixtureOfExpertsModelMixin` / `MobilintMixtureOfExpertsGenerationMixin` /
   `MobilintMixtureOfExpertsCache` pair like the EAGLE-3 mixins, and

@@ -27,7 +27,10 @@ from .configuration_qwen3_vl import MobilintQwen3VLConfig
 
 logger = logging.get_logger(__name__)
 
-# NPU vision model fixed input shape: (H_npu, W_npu, C_npu) = (1024, 64, 6)
+# Static vision frame grid. Legacy static releases take the repreprocessed
+# (H_npu, W_npu, C_npu) = (1024, 64, 6) tensor; qbcompiler 1.4 static builds take
+# the folded (1, N, 1536) tensor of the same frame. Both derive the frame size
+# through `_compute_npu_frame_size`, so the resize target is shared.
 _NPU_H, _NPU_W = 1024, 64
 
 # The dynamic vision MXQ accepts a variable pre-merge patch sequence, but its
