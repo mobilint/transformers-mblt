@@ -21,7 +21,7 @@ import logging
 import threading
 import time
 import weakref
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from typing import TYPE_CHECKING, Callable, List, Literal, Optional, Tuple, cast
 
 import numpy as np
@@ -68,11 +68,14 @@ class MultiSlotDispatcher:
         self._executor_lock = threading.Lock()
         self._executor_finalizer: Optional[weakref.finalize] = None
 
-    def _group_executor(self, n_groups: int) -> ThreadPoolExecutor:
-        """Return the dispatcher's pool, grown to at least ``n_groups`` workers.
+    def _submit_groups(self, n_groups: int, run_group: Callable[[int], None]) -> List[Future]:
+        """Submit ``run_group(0..n_groups-1)`` to the dispatcher's pool and return the futures.
 
         Every group is submitted at once and each blocks on its own ``infer``, so the pool must hold
-        one worker per group; a smaller pool would serialize slots that should run in parallel.
+        one worker per group; a smaller pool would serialize slots that should run in parallel, so a
+        dispatch with more groups replaces it with a larger one. The lock covers the whole submission:
+        a concurrent dispatch that grows the pool, or ``close()``, waits until every group of this
+        dispatch is queued, and shutting the old pool down then waits for those groups to finish.
         """
         with self._executor_lock:
             if self._executor is None or self._executor_workers < n_groups:
@@ -80,7 +83,7 @@ class MultiSlotDispatcher:
                 self._executor = ThreadPoolExecutor(max_workers=n_groups, thread_name_prefix="mblt-slot")
                 self._executor_workers = n_groups
                 self._executor_finalizer = weakref.finalize(self, self._executor.shutdown, wait=False)
-            return self._executor
+            return [self._executor.submit(run_group, gi) for gi in range(n_groups)]
 
     def _close_executor_locked(self) -> None:
         if self._executor_finalizer is not None:
@@ -422,8 +425,7 @@ class MultiSlotDispatcher:
             group_raw[gi] = np.asarray(result[0])
 
         t_wall_0 = time.perf_counter()
-        executor = self._group_executor(len(groups))
-        futures = [executor.submit(_run, gi) for gi in range(len(groups))]
+        futures = self._submit_groups(len(groups), _run)
         # Wait for every group before raising, as leaving a ``with`` pool did: no group may
         # still be running on its slot when this call returns or raises.
         wait(futures)

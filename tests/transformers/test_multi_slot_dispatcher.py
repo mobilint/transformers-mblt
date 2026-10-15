@@ -338,6 +338,46 @@ def test_dispatch_waits_for_every_group_before_raising() -> None:
     dispatcher.close()
 
 
+def test_dispatch_survives_concurrent_pool_growth_and_close() -> None:
+    """Dispatches racing pool growth and close() never hit a shut-down pool mid-submission."""
+    import threading
+
+    class _Yielding(_StaticN1Mxq):
+        def infer(self, inputs, _extra, cache_size, batch_params):
+            time.sleep(0.001)
+            return super().infer(inputs, _extra, cache_size, batch_params)
+
+    ms = [_Yielding(vocab_size=3, tag=1000.0 * i) for i in range(4)]
+    dispatcher = MultiSlotDispatcher(_MockBackend(ms, k_per_model=1))
+    errors: list[BaseException] = []
+    stop = threading.Event()
+
+    def worker(n_rows: int) -> None:
+        try:
+            for _ in range(60):
+                merged, _shape = _dispatch_rows(dispatcher, n_rows, 4)
+                assert [merged[i][0] for i in range(n_rows)] == pytest.approx([1000.0 * i for i in range(n_rows)])
+        except BaseException as exc:  # collected and asserted below
+            errors.append(exc)
+
+    def closer() -> None:
+        while not stop.is_set():
+            dispatcher.close()
+            time.sleep(0.0005)
+
+    threads = [threading.Thread(target=worker, args=(n,)) for n in (2, 3, 4)]
+    closing = threading.Thread(target=closer)
+    closing.start()
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    stop.set()
+    closing.join()
+    dispatcher.close()
+    assert errors == []
+
+
 # ---------------------------------------------------------------------------
 # Layout selection
 # ---------------------------------------------------------------------------
