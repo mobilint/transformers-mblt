@@ -2,6 +2,15 @@
 
 ## 0.6.1
 
+### Added
+
+- `discard()` on `MobilintCache` (and its subclasses), `MobilintEagle3Cache`, `MobilintMixtureOfExpertsCache` and
+  `MobilintLayer` drops a cache's KV: it frees the NPU slots the cache holds without dumping them, then resets the
+  cache, so it is no longer `is_resident`. `offload()` saves the KV instead, which dumps the whole slot synchronously
+  (about 380 ms for a 224 MiB Qwen3-0.6B slot). A serving engine evicting a prefix-cache entry that is still on its
+  slot can use it rather than `reset()`, which also avoids the dump but leaves the emptied cache recorded as the
+  slot's owner. `cache_residency.discard(layer)` is the owner-table operation behind it.
+
 ### Changed
 
 - Multi-slot batched inference (a backend with more than one Model slot, e.g. `dev_no` lists) keeps one worker

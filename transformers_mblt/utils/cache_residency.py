@@ -17,6 +17,7 @@ binding a cache before an infer, an explicit ``load_cache_memory()``, a file res
 4. records the incoming layer as the owner.
 
 Acquiring a slot the layer already owns costs nothing, so a cache that keeps decoding on its own slot never dumps.
+A caller that no longer needs a layer's KV frees its slot with :func:`discard` instead, which saves nothing.
 KV only moves between compatible MXQs: see :func:`mxq_kv_signature`.
 
 A slot is live while its Model is alive and not disposed (qbruntime's ``Model.dispose()`` drops ``_acc``). The KV
@@ -181,6 +182,20 @@ def release(layer: "MobilintLayer") -> None:
         evict(layer.mxq_model, layer.cache_id)
 
 
+def discard(layer: "MobilintLayer") -> None:
+    """Free ``layer``'s slot without saving its KV, if it holds one: the next layer bound there overwrites it.
+
+    For a caller that no longer needs the KV (a prefix-cache entry it drops). The layer itself is not changed, so
+    callers reset it too: :meth:`MobilintLayer.discard` and the caches' ``discard()`` do both. A slot the layer does
+    not hold keeps its owner.
+    """
+    if not is_resident(layer):
+        return
+    slots = _slots(layer.mxq_model)
+    if slots is not None:
+        slots.pop(int(layer.cache_id), None)
+
+
 def bind_cache_layers(bindings: Iterable[tuple["MobilintLayer", Any, int]]) -> None:
     """Make each ``(layer, mxq_model, cache_id)`` slot hold its layer's KV before an infer."""
     for layer, mxq_model, cache_id in bindings:
@@ -199,6 +214,7 @@ __all__ = [
     "bind_cache_layers",
     "bind_cacheless",
     "claim",
+    "discard",
     "evict",
     "is_resident",
     "mxq_kv_signature",

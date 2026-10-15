@@ -9,7 +9,11 @@ import pytest
 
 from transformers_mblt.utils import cache_residency
 from transformers_mblt.utils.cache_residency import MobilintCacheStateError
-from transformers_mblt.utils.cache_utils import MobilintCache
+from transformers_mblt.utils.cache_utils import (
+    MobilintCache,
+    MobilintEagle3Cache,
+    MobilintMixtureOfExpertsCache,
+)
 
 
 class _SlotMxq:
@@ -205,6 +209,71 @@ def test_eviction_dumps_again_after_an_infer_writes() -> None:
     assert backend.mxq_models[0].calls == [("dump", 0), ("dump", 0)]
     _run(a, backend, 0, "!")
     assert _slot(backend) == "prefix-more!"
+
+
+def test_discard_frees_the_slot_without_dumping() -> None:
+    backend = _Backend()
+    a = MobilintCache(backend.mxq_models)
+    _run(a, backend, 0, "aaa")
+
+    a.discard()
+
+    assert cache_residency.owner(backend.mxq_models[0], 0) is None
+    assert a.get_seq_length() == 0 and not a.is_resident
+    b = MobilintCache(backend.mxq_models)
+    _run(b, backend, 0, "b")
+    assert _slot(backend) == "b"
+    assert backend.mxq_models[0].calls == []
+
+
+def test_discarded_cache_starts_over_without_loading() -> None:
+    backend = _Backend()
+    a = MobilintCache(backend.mxq_models)
+    _run(a, backend, 0, "aaa")
+    b = MobilintCache(backend.mxq_models)
+    _run(b, backend, 0, "b")  # A is saved to host memory
+
+    a.discard()
+    _run(a, backend, 0, "x")
+
+    assert _slot(backend) == "x"
+    assert backend.mxq_models[0].calls == [("dump", 0), ("dump", 0)]  # A once, then B; A's host copy is gone
+
+
+def test_discarding_a_saved_cache_keeps_the_slot_owner() -> None:
+    backend = _Backend()
+    a = MobilintCache(backend.mxq_models)
+    b = MobilintCache(backend.mxq_models)
+    _run(a, backend, 0, "aaa")
+    _run(b, backend, 0, "bb")
+
+    a.discard()
+
+    assert b.is_resident
+    _run(b, backend, 0, "B")
+    assert _slot(backend) == "bbB"
+    assert backend.mxq_models[0].calls == [("dump", 0)]
+
+
+def test_mixture_of_experts_and_eagle3_caches_discard_every_slot_without_dumping() -> None:
+    moe_backend = _Backend(n=2)
+    moe = MobilintMixtureOfExpertsCache(moe_backend.mxq_models)
+    moe.bind_shared(moe_backend.mxq_models)
+    moe.update_seen_tokens(3)
+    base, draft = _SlotMxq(), _SlotMxq(signature="draft")
+    eagle3 = MobilintEagle3Cache(base, draft)
+    eagle3.bind_base(base)
+    eagle3.bind_draft(draft)
+    eagle3.update_base_seen_tokens(3)
+    eagle3.update_draft_seen_tokens(3)
+
+    moe.discard()
+    eagle3.discard()
+
+    models = [*moe_backend.mxq_models, base, draft]
+    assert [cache_residency.owner(model, 0) for model in models] == [None] * 4
+    assert moe.get_seq_length() == 0 and eagle3.get_seq_length() == 0
+    assert [model.calls for model in models] == [[]] * 4
 
 
 def test_raising_a_resident_cursor_by_hand_dumps_on_eviction() -> None:
