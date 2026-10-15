@@ -4,6 +4,11 @@
 
 ### Fixed
 
+- Qwen3-VL static vision: a single-input vision MXQ compiled by qbcompiler 1.4 (`vision` part without side
+  inputs) takes the folded pixel tensor `(1, N, 1536)`, the same tensor the dynamic path feeds.
+  `MobilintQwen3VLVisionModel` now reads the compiled input width at load time and sends that layout. The
+  legacy `(1024, 64, 6)` repreprocessed layout of earlier static releases is still detected and fed as before.
+  Before this fix the folded static MXQ failed in `qbruntime` with `ValueError: Input shape is invalid.`
 - Batched `tps measure` and `tps sweep` runs (batch size above 1, text and VLM) report `prefill_npu_lat` and
   `decode_npu_lat` as the share of each phase's wall-clock time spent in NPU calls. They used the phase's NPU time as
   its duration, so both read exactly 100%, and TTFT, `decode_duration`, `prefill_tps` and `decode_tps` left out the
@@ -24,14 +29,6 @@
   speech output is not validated on NPU builds. `MobilintLfm2AudioFeatureExtractor` and
   `MobilintLfm2AudioProcessor` provide the log-mel front end and the chat prompt with audio placeholders. NPU
   settings take the `encoder_`, `decoder_` (backbone) and `depthformer_` prefixes.
-
-### Fixed
-
-- Qwen3-VL static vision: a single-input vision MXQ compiled by qbcompiler 1.4 (`vision` part without side
-  inputs) takes the folded pixel tensor `(1, N, 1536)`, the same tensor the dynamic path feeds.
-  `MobilintQwen3VLVisionModel` now reads the compiled input width at load time and sends that layout. The
-  legacy `(1024, 64, 6)` repreprocessed layout of earlier static releases is still detected and fed as before.
-  Before this fix the folded static MXQ failed in `qbruntime` with `ValueError: Input shape is invalid.`
 
 ## 0.5.0
 
