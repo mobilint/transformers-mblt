@@ -217,10 +217,10 @@ def test_multi_model_dispatch_fast_path_when_rows_land_on_one_model() -> None:
     m0 = StaticLastOnlyMxq(vocab_size=3, max_width=4)
     m1 = StaticLastOnlyMxq(vocab_size=3, max_width=4)
     model = _make_multi_slot_model([m0, m1], k_per_model=2)
-    # per_model_batch=2, so flat rows 0..1 -> m0, 2..3 -> m1.
-    cache = MobilintCache([m0, m1], per_model_batch=2)
+    # Place both rows on m0 explicitly; the default layout would alternate them between the Models.
+    cache = MobilintCache([m0, m1], per_model_batch=2, slots=[(0, 0), (0, 1)])
 
-    # Only send batch rows that route to m0 (flat rows 0..1 land on model 0).
+    # Only send batch rows that route to m0.
     inputs_embeds = torch.randn(2, 2, 4, dtype=torch.float32)
     attention_mask = torch.ones(2, 2, dtype=torch.long)
 
@@ -238,6 +238,25 @@ def test_multi_model_dispatch_fast_path_when_rows_land_on_one_model() -> None:
         for cache_id, _seq_len, _cache_size in call["batch"]:
             assert cache_id in (0, 1)  # local slot ids within m0
     assert logits.shape == (2, 1, 3)
+
+
+def test_multi_model_default_cache_spreads_a_small_batch_over_both_models() -> None:
+    """N=2, K=2 with the default cache: a batch of 2 runs one row on each Model, in parallel."""
+    m0 = StaticLastOnlyMxq(vocab_size=3, max_width=4)
+    m1 = StaticLastOnlyMxq(vocab_size=3, max_width=4)
+    model = _make_multi_slot_model([m0, m1], k_per_model=2)
+    cache = MobilintCache([m0, m1], per_model_batch=2)
+
+    logits = model.llm_forward(
+        inputs_embeds=torch.randn(2, 2, 4, dtype=torch.float32),
+        past_key_values=cache,
+        cache_position=torch.arange(2),
+        attention_mask=torch.ones(2, 2, dtype=torch.long),
+    )
+
+    assert logits.shape == (2, 1, 3)
+    assert len(m0.calls) >= 1 and len(m1.calls) >= 1
+    assert all(cache_id == 0 for call in m0.calls + m1.calls for cache_id, _s, _c in call["batch"])
 
 
 # ---------------------------------------------------------------------------

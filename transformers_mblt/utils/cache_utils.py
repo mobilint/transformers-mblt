@@ -302,6 +302,20 @@ class MobilintLayer(CacheLayerMixin):
         return copied
 
 
+def default_row_slot(row: int, n_models: int, k_per_model: int) -> Tuple[int, int]:
+    """Return the default ``(model_idx, cache_id)`` of flat row ``row`` on ``n_models`` x ``k_per_model`` slots.
+
+    Rows go round-robin over the Models: row ``i`` is ``(i % N, i // N)``. A batch smaller than ``N * K`` then
+    runs on every Model in parallel; the former ``divmod(i, K)`` layout put the first ``K`` rows all on Model 0
+    and left the other Models idle. With one Model both layouts are ``(0, i)``.
+    """
+    n = max(1, int(n_models))
+    row = int(row)
+    if not 0 <= row < n * max(1, int(k_per_model)):
+        raise IndexError(f"row {row} out of range for N={n} x K={k_per_model} slots")
+    return row % n, row // n
+
+
 class MobilintCache(Cache):
     def __init__(
         self,
@@ -317,7 +331,9 @@ class MobilintCache(Cache):
         ``N = len(mxq_models)`` Model handles with ``K = per_model_batch``
         cache slots each, laid out as flat rows so external callers can keep
         the historical row-index API. Row ``i`` maps to
-        ``(i // K, i % K)``; helpers :meth:`slot_of`, :meth:`model_of`, and
+        ``(i % N, i // N)`` (see :func:`default_row_slot`), so a batch smaller
+        than ``N * K`` spreads over every Model instead of filling Model 0
+        first; helpers :meth:`slot_of`, :meth:`model_of`, and
         :meth:`group_by_model` expose that routing without leaking the slot
         concept into upstream dispatch.
 
@@ -340,7 +356,7 @@ class MobilintCache(Cache):
                 would silently double the total capacity and pin the first
                 ``K`` rows entirely to slot 0.
             slots: Place row ``i`` on ``slots[i] = (model_idx, cache_id)``
-                instead of the default ``divmod(i, K)`` layout. The cache then
+                instead of the default :func:`default_row_slot` layout. The cache then
                 has ``len(slots)`` rows; a serving engine uses this to keep one
                 cache per request on the slot it assigned. Slots must be
                 distinct and inside ``N * K``.
@@ -379,9 +395,7 @@ class MobilintCache(Cache):
         self._batch_size: int = self.n_models * self.k_per_model
 
         if slots is None:
-            row_slots = [
-                (model_idx, cache_id) for model_idx in range(self.n_models) for cache_id in range(self.k_per_model)
-            ]
+            row_slots = [default_row_slot(row, self.n_models, self.k_per_model) for row in range(self._batch_size)]
         else:
             row_slots = [(int(model_idx), int(cache_id)) for model_idx, cache_id in slots]
             if not row_slots:
