@@ -84,7 +84,8 @@ description: >-
   `"d:c"` cluster prefixes and warn when a partial cluster is rounded up. `global8` requires
   both clusters on every covered device.
 - `MobilintCache([m0, m1, ...], per_model_batch=K)` dualizes KV state along
-  `(model_idx, cache_id)` with capacity `N * K` rows. Row `i` maps to `(i // K, i % K)`; use
+  `(model_idx, cache_id)` with capacity `N * K` rows. Row `i` maps to `(i % N, i // N)` (round-robin over
+  the Models, `default_row_slot`); use
   `slot_of`, `model_of`, and `group_by_model` for dispatch routing. `ensure_batch_size` beyond
   `N * K` is only allowed on the legacy single-Model hardware-batch path (`N == 1`).
   `MobilintCache(model, batch_size=K)` remains as a shim for the historical `N = 1, K = K`
