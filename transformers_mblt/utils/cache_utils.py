@@ -232,6 +232,11 @@ class MobilintLayer(CacheLayerMixin):
         """Save this layer's KV to its host copy and free its NPU slot for other caches."""
         residency.release(self)
 
+    def discard(self) -> None:
+        """Drop this layer's KV: free its NPU slot without saving it, and empty the layer."""
+        residency.discard(self)
+        self.reset()
+
     def dump_cache_memory(self):
         """Snapshot the current KV into ``buffer``; :meth:`load_cache_memory` restores it."""
         if self._tracked and not self.is_resident:
@@ -454,6 +459,16 @@ class MobilintCache(Cache):
         """Save every resident row to host memory and free its NPU slot for other caches."""
         for layer in self.layers:
             layer.offload()
+
+    def discard(self) -> None:
+        """Drop this cache's KV: free every row's NPU slot without saving it, and reset the cache.
+
+        Unlike :meth:`offload`, nothing is dumped: use it for a cache whose KV is no longer needed, such as a
+        prefix-cache entry being evicted. The next cache bound to those slots overwrites them.
+        """
+        for layer in self.layers:
+            residency.discard(layer)
+        self.reset()
 
     def adopt_backend(self, backend: Any) -> None:
         """Point the cache at ``backend``'s live Model handles, moving it from another model instance if needed.
@@ -1065,6 +1080,11 @@ class MobilintBeamCache(MobilintCache):
         """Free the slot for other caches; the next forward replays the full history."""
         residency.release(self._replay_slot)
 
+    def discard(self) -> None:
+        """Free the slot and reset the cache, forgetting every beam history."""
+        residency.discard(self._replay_slot)
+        super().discard()
+
     def reset(self) -> None:
         """Reset active qbruntime cache bookkeeping and clear beam token histories."""
         super().reset()
@@ -1560,6 +1580,12 @@ class MobilintEagle3Cache(Cache):
         self.base_layer.offload()
         self.draft_layer.offload()
 
+    def discard(self) -> None:
+        """Drop the base and draft KV: free both MXQ slots without saving them, and reset the cache."""
+        residency.discard(self.base_layer)
+        residency.discard(self.draft_layer)
+        self.reset()
+
     def defer_accept_tokens(self) -> None:
         """Keep accepted tokens that were not fed for the next call instead of counting them as cached."""
         defer_eagle3_accept_tokens(self)
@@ -1782,6 +1808,12 @@ class MobilintMixtureOfExpertsCache(Cache):
         self._sync_shared_layers()
         for layer in self.shared_layers:
             layer.offload()
+
+    def discard(self) -> None:
+        """Drop every shared layer's KV: free the shared MXQs without saving it, and reset the cache."""
+        for layer in self.shared_layers:
+            residency.discard(layer)
+        self.reset()
 
     def bind_shared(self, shared_models: Sequence[Any]) -> None:
         """Make each shared MXQ hold this cache's KV before a forward, moving the cache to ``shared_models``."""
