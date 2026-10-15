@@ -163,7 +163,8 @@ class MultiSlotDispatcher:
         """Return ``(model_idx, local_cache_id)`` for a flat batch row.
 
         Multi-slot dispatch routes each flat row to its owning Model via
-        ``(row // K, row % K)``. When ``past_key_values`` exposes ``slot_of``
+        :func:`~transformers_mblt.utils.cache_utils.default_row_slot`, the layout a
+        default :class:`MobilintCache` uses. When ``past_key_values`` exposes ``slot_of``
         (a :class:`MobilintCache`) it is the source of truth — it carries the
         cache's own ``N`` and ``K``. Otherwise (e.g. ``use_cache=False`` on a
         decoder-only forward with labels) we derive the mapping from the
@@ -171,7 +172,9 @@ class MultiSlotDispatcher:
         """
         if past_key_values is not None and hasattr(past_key_values, "slot_of"):
             return past_key_values.slot_of(int(row))
-        return divmod(int(row), self.k_per_model)
+        from .cache_utils import default_row_slot
+
+        return default_row_slot(row, self.n_slots, self.k_per_model)
 
     def _validate_cache_topology(self, past_key_values: Optional["MobilintCache"]) -> None:
         """Reject a caller-supplied cache whose ``(N, K, model handles)`` disagree with this backend.
@@ -321,7 +324,7 @@ class MultiSlotDispatcher:
 
         # Cacheless capacity guard: when the caller omits ``past_key_values``
         # (e.g. ``use_cache=False`` on an evaluation forward), ``slot_of``
-        # falls back to ``divmod(row, k_per_model)``. That routing has no
+        # falls back to ``default_row_slot``. That routing has no
         # awareness of ``n_slots``, so a request beyond ``N * K`` would
         # otherwise surface as an ``IndexError`` on ``mxq_models[model_idx]``
         # (multi-slot) or a low-level qbruntime error when ``cache_ids``
