@@ -2,6 +2,14 @@
 
 ## 0.6.1
 
+### Changed
+
+- Multi-slot batched inference (a backend with more than one Model slot, e.g. `dev_no` lists) keeps one worker
+  thread pool for the dispatcher's lifetime instead of creating and tearing one down on every dispatch. On a
+  3-card, 48-row Qwen3-0.6B decode, the dispatch step outside the NPU calls took about 11 ms per step, and this
+  per-call pool was part of it. A dispatch still waits for every slot before it returns or re-raises a slot's error.
+  `MultiSlotDispatcher.close()` shuts the pool down; the next multi-slot dispatch starts a new one. (#26)
+
 ### Fixed
 
 - Qwen3-VL static vision: a single-input vision MXQ compiled by qbcompiler 1.4 (`vision` part without side

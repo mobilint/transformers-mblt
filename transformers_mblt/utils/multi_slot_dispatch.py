@@ -4,8 +4,9 @@ Centralizes the routing that :meth:`MobilintModelMixin._llm_forward_batch`
 previously reimplemented inside a per-call closure. Callers hand the dispatcher
 a flat list of batch rows plus their per-row inputs; the dispatcher groups
 rows by owning ``qbruntime.Model`` slot, submits one blocking ``.infer`` per
-group (in parallel via a :class:`~concurrent.futures.ThreadPoolExecutor` when
-there is more than one group), and merges the outputs back into caller order.
+group (in parallel on a :class:`~concurrent.futures.ThreadPoolExecutor` the
+dispatcher keeps for its lifetime, when there is more than one group), and
+merges the outputs back into caller order.
 
 Layout resolution is done once — the compiled MXQ has one output convention
 across every slot, so the merge reads ``backend.output_layout`` instead of
@@ -17,8 +18,10 @@ inspects an unambiguous runtime group and pins the answer via
 from __future__ import annotations
 
 import logging
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+import weakref
+from concurrent.futures import ThreadPoolExecutor, wait
 from typing import TYPE_CHECKING, Callable, List, Literal, Optional, Tuple, cast
 
 import numpy as np
@@ -58,6 +61,40 @@ class MultiSlotDispatcher:
 
     def __init__(self, backend: "MobilintNPUBackend") -> None:
         self.backend = backend
+        # One pool for the dispatcher's lifetime: creating a pool per dispatch costs thread
+        # start-up and teardown on every multi-slot decode step.
+        self._executor: Optional[ThreadPoolExecutor] = None
+        self._executor_workers = 0
+        self._executor_lock = threading.Lock()
+        self._executor_finalizer: Optional[weakref.finalize] = None
+
+    def _group_executor(self, n_groups: int) -> ThreadPoolExecutor:
+        """Return the dispatcher's pool, grown to at least ``n_groups`` workers.
+
+        Every group is submitted at once and each blocks on its own ``infer``, so the pool must hold
+        one worker per group; a smaller pool would serialize slots that should run in parallel.
+        """
+        with self._executor_lock:
+            if self._executor is None or self._executor_workers < n_groups:
+                self._close_executor_locked()
+                self._executor = ThreadPoolExecutor(max_workers=n_groups, thread_name_prefix="mblt-slot")
+                self._executor_workers = n_groups
+                self._executor_finalizer = weakref.finalize(self, self._executor.shutdown, wait=False)
+            return self._executor
+
+    def _close_executor_locked(self) -> None:
+        if self._executor_finalizer is not None:
+            self._executor_finalizer.detach()
+            self._executor_finalizer = None
+        if self._executor is not None:
+            self._executor.shutdown(wait=True)
+            self._executor = None
+            self._executor_workers = 0
+
+    def close(self) -> None:
+        """Shut down the dispatcher's worker pool. A later multi-group dispatch starts a new one."""
+        with self._executor_lock:
+            self._close_executor_locked()
 
     # ------------------------------------------------------------------
     # Topology accessors
@@ -385,13 +422,16 @@ class MultiSlotDispatcher:
             group_raw[gi] = np.asarray(result[0])
 
         t_wall_0 = time.perf_counter()
-        with ThreadPoolExecutor(max_workers=len(groups)) as executor:
-            futures = [executor.submit(_run, gi) for gi in range(len(groups))]
-            for f in futures:
-                # ``.result()`` re-raises worker exceptions here so the caller
-                # sees the underlying qbruntime error rather than a silently
-                # missing group_raw slot.
-                f.result()
+        executor = self._group_executor(len(groups))
+        futures = [executor.submit(_run, gi) for gi in range(len(groups))]
+        # Wait for every group before raising, as leaving a ``with`` pool did: no group may
+        # still be running on its slot when this call returns or raises.
+        wait(futures)
+        for f in futures:
+            # ``.result()`` re-raises worker exceptions here so the caller
+            # sees the underlying qbruntime error rather than a silently
+            # missing group_raw slot.
+            f.result()
         wall_elapsed = time.perf_counter() - t_wall_0
 
         if count_npu_time:

@@ -7,12 +7,15 @@ asserted independently of the caller's chunk-assembly logic.
 
 from __future__ import annotations
 
+import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Literal, Optional, Tuple
 
 import numpy as np
 import pytest
 import torch
 
+from transformers_mblt.utils import multi_slot_dispatch
 from transformers_mblt.utils.multi_slot_dispatch import MultiSlotDispatcher
 
 
@@ -244,6 +247,95 @@ def test_dispatch_multi_group_with_four_groups() -> None:
         # ``tag + 10 * cache_id`` where local cache_id is 0 for every slot here.
         assert merged[row_idx][0] == pytest.approx(1000.0 * row_idx)
         assert len(mxq.calls) == 1
+
+
+class _CountingExecutor(ThreadPoolExecutor):
+    """ThreadPoolExecutor that records how many instances were created."""
+
+    created: list["_CountingExecutor"] = []
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        _CountingExecutor.created.append(self)
+
+
+class _SlotRoutingCache:
+    def __init__(self, n_models: int) -> None:
+        self.n_models = n_models
+        self.k_per_model = 1
+
+    def slot_of(self, row: int) -> Tuple[int, int]:
+        return divmod(row, 1)
+
+
+def _dispatch_rows(dispatcher: MultiSlotDispatcher, n_rows: int, n_models: int):
+    return dispatcher.dispatch(
+        cache_ids=list(range(n_rows)),
+        sequence_lengths=[1] * n_rows,
+        cache_sizes=[0] * n_rows,
+        inputs_embeds_chunks=[_make_embed(1) for _ in range(n_rows)],
+        max_sequence_length=1,
+        past_key_values=_SlotRoutingCache(n_models),
+    )
+
+
+def test_dispatch_multi_group_reuses_one_executor_across_calls(monkeypatch) -> None:
+    """Repeated multi-group dispatches (one per decode step) share one worker pool."""
+    monkeypatch.setattr(multi_slot_dispatch, "ThreadPoolExecutor", _CountingExecutor)
+    _CountingExecutor.created = []
+    ms = [_StaticN1Mxq(vocab_size=3, tag=1000.0 * i) for i in range(3)]
+    dispatcher = MultiSlotDispatcher(_MockBackend(ms, k_per_model=1))
+
+    for _ in range(5):
+        merged, _shape = _dispatch_rows(dispatcher, 3, 3)
+        assert [merged[i][0] for i in range(3)] == pytest.approx([0.0, 1000.0, 2000.0])
+
+    assert len(_CountingExecutor.created) == 1
+    assert all(len(m.calls) == 5 for m in ms)
+    dispatcher.close()
+
+
+def test_dispatch_grows_executor_when_more_groups_arrive(monkeypatch) -> None:
+    """A dispatch with more groups than the pool has workers replaces the pool with a larger one."""
+    monkeypatch.setattr(multi_slot_dispatch, "ThreadPoolExecutor", _CountingExecutor)
+    _CountingExecutor.created = []
+    ms = [_StaticN1Mxq(vocab_size=3, tag=1000.0 * i) for i in range(4)]
+    dispatcher = MultiSlotDispatcher(_MockBackend(ms, k_per_model=1))
+
+    _dispatch_rows(dispatcher, 2, 4)
+    _dispatch_rows(dispatcher, 4, 4)
+    _dispatch_rows(dispatcher, 2, 4)
+
+    assert [e._max_workers for e in _CountingExecutor.created] == [2, 4]
+    assert _CountingExecutor.created[0]._shutdown
+    dispatcher.close()
+    assert _CountingExecutor.created[1]._shutdown
+
+
+def test_dispatch_waits_for_every_group_before_raising() -> None:
+    """A failing slot re-raises only after the other slots finished, as the per-call pool did."""
+    finished: list[int] = []
+
+    class _Failing(_StaticN1Mxq):
+        def infer(self, inputs, _extra, cache_size, batch_params):
+            raise RuntimeError("slot failed")
+
+    class _Slow(_StaticN1Mxq):
+        def infer(self, inputs, _extra, cache_size, batch_params):
+            time.sleep(0.05)
+            finished.append(1)
+            return super().infer(inputs, _extra, cache_size, batch_params)
+
+    dispatcher = MultiSlotDispatcher(_MockBackend([_Failing(vocab_size=3), _Slow(vocab_size=3)], k_per_model=1))
+    with pytest.raises(RuntimeError, match="slot failed"):
+        _dispatch_rows(dispatcher, 2, 2)
+    assert finished == [1]
+
+    # The pool survives a failed dispatch.
+    dispatcher.backend.mxq_models[0] = _StaticN1Mxq(vocab_size=3)
+    merged, _shape = _dispatch_rows(dispatcher, 2, 2)
+    assert merged.shape == (2, 3)
+    dispatcher.close()
 
 
 # ---------------------------------------------------------------------------
