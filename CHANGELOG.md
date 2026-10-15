@@ -12,6 +12,14 @@
   `MobilintLfm2AudioProcessor` provide the log-mel front end and the chat prompt with audio placeholders. NPU
   settings take the `encoder_`, `decoder_` (backbone) and `depthformer_` prefixes.
 
+### Fixed
+
+- Qwen3-VL static vision: a single-input vision MXQ compiled by qbcompiler 1.4 (`vision` part without side
+  inputs) takes the folded pixel tensor `(1, N, 1536)`, the same tensor the dynamic path feeds.
+  `MobilintQwen3VLVisionModel` now reads the compiled input width at load time and sends that layout. The
+  legacy `(1024, 64, 6)` repreprocessed layout of earlier static releases is still detected and fed as before.
+  Before this fix the folded static MXQ failed in `qbruntime` with `ValueError: Input shape is invalid.`
+
 ## 0.5.0
 
 ### Added
