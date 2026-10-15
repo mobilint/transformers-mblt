@@ -39,36 +39,90 @@ THREAD_ENV_VARS = ("OMP_NUM_THREADS", "MKL_NUM_THREADS")
 """Environment variables that set the thread count explicitly. When any is set, the defaults are not applied."""
 
 _CGROUP_ROOT = Path("/sys/fs/cgroup")
+_PROC_SELF_CGROUP = Path("/proc/self/cgroup")
 
 
-def _cgroup_cpu_limit(cgroup_root: Optional[Path] = None) -> Optional[int]:
-    """Return the CPU count allowed by a cgroup CPU quota, or ``None`` when there is no quota.
+def _own_cgroup_paths(proc_cgroup: Path) -> tuple:
+    """Return this process's cgroup v2 path and cgroup v1 ``cpu`` controller path from ``/proc/self/cgroup``.
 
-    Reads the cgroup v2 ``cpu.max`` file, then the cgroup v1 ``cpu.cfs_quota_us`` / ``cpu.cfs_period_us`` pair, at the
-    cgroup root the process sees (the container's own cgroup under a cgroup namespace). A fractional quota rounds up.
+    Either is ``None`` when the file has no matching line or cannot be read. Paths are relative to the hierarchy
+    root, without the leading ``/``.
+    """
+    try:
+        lines = proc_cgroup.read_text().splitlines()
+    except OSError:
+        return None, None
+    v2_path = None
+    v1_cpu_path = None
+    for line in lines:
+        parts = line.split(":", 2)
+        if len(parts) != 3:
+            continue
+        hierarchy, controllers, path = parts
+        if hierarchy == "0" and controllers == "":
+            v2_path = path.strip("/")
+        elif "cpu" in controllers.split(","):
+            v1_cpu_path = path.strip("/")
+    return v2_path, v1_cpu_path
+
+
+def _ancestors(base: Path, relative: Optional[str]) -> list:
+    """Return ``base / relative`` and each of its parents up to ``base``, deepest first, that exist."""
+    dirs = [base]
+    if relative:
+        current = base
+        for part in relative.split("/"):
+            current = current / part
+            dirs.append(current)
+    return [d for d in reversed(dirs) if d.is_dir()]
+
+
+def _cgroup_cpu_limit(cgroup_root: Optional[Path] = None, proc_cgroup: Optional[Path] = None) -> Optional[int]:
+    """Return the CPU count allowed by the cgroup CPU quotas on this process, or ``None`` when there is none.
+
+    Resolves the process's own cgroup from ``/proc/self/cgroup`` and reads the quota of that cgroup and of every
+    ancestor up to the mount root, since a quota on any of them limits the process (e.g. a systemd service's own
+    cgroup under an unlimited root). The tightest quota wins. Reads cgroup v2 ``cpu.max`` files, else the cgroup v1
+    ``cpu.cfs_quota_us`` / ``cpu.cfs_period_us`` pairs under the ``cpu`` controller. Levels that are not visible (for
+    example host paths inside a container's cgroup namespace) are skipped. A fractional quota rounds up.
 
     Args:
         cgroup_root: Mount point of the cgroup file system. ``None`` means ``/sys/fs/cgroup``.
+        proc_cgroup: The process's cgroup membership file. ``None`` means ``/proc/self/cgroup``.
 
     Returns:
-        The number of CPUs the quota allows, at least 1, or ``None`` when no quota is set or it cannot be read.
+        The number of CPUs the tightest quota allows, at least 1, or ``None`` when no quota is set or readable.
     """
     if cgroup_root is None:
         cgroup_root = _CGROUP_ROOT
-    try:
-        fields = (cgroup_root / "cpu.max").read_text().split()
-    except OSError:
-        fields = []
-    if len(fields) == 2 and fields[0] != "max":
-        return _quota_cpus(fields[0], fields[1])
-    if fields:
-        return None
-    try:
-        quota = (cgroup_root / "cpu" / "cpu.cfs_quota_us").read_text().strip()
-        period = (cgroup_root / "cpu" / "cpu.cfs_period_us").read_text().strip()
-    except OSError:
-        return None
-    return _quota_cpus(quota, period)
+    if proc_cgroup is None:
+        proc_cgroup = _PROC_SELF_CGROUP
+    v2_path, v1_cpu_path = _own_cgroup_paths(proc_cgroup)
+
+    limits = []
+    v2_seen = False
+    for directory in _ancestors(cgroup_root, v2_path):
+        try:
+            fields = (directory / "cpu.max").read_text().split()
+        except OSError:
+            continue
+        v2_seen = True
+        if len(fields) == 2 and fields[0] != "max":
+            limit = _quota_cpus(fields[0], fields[1])
+            if limit is not None:
+                limits.append(limit)
+    if not v2_seen:
+        v1_root = cgroup_root / "cpu"
+        for directory in _ancestors(v1_root, v1_cpu_path):
+            try:
+                quota = (directory / "cpu.cfs_quota_us").read_text().strip()
+                period = (directory / "cpu.cfs_period_us").read_text().strip()
+            except OSError:
+                continue
+            limit = _quota_cpus(quota, period)
+            if limit is not None:
+                limits.append(limit)
+    return min(limits) if limits else None
 
 
 def _quota_cpus(quota: str, period: str) -> Optional[int]:

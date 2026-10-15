@@ -7,6 +7,12 @@ import pytest
 from transformers_mblt.utils import host_threads
 
 
+@pytest.fixture(autouse=True)
+def no_proc_cgroup(tmp_path, monkeypatch):
+    """Keep the host's own /proc/self/cgroup out of every test; tests that need one write it."""
+    monkeypatch.setattr(host_threads, "_PROC_SELF_CGROUP", tmp_path / "proc-self-cgroup-missing")
+
+
 @pytest.fixture
 def no_cgroup(tmp_path, monkeypatch):
     monkeypatch.setattr(host_threads, "_CGROUP_ROOT", tmp_path / "missing")
@@ -61,6 +67,67 @@ def test_cgroup_v1_without_quota_is_ignored(tmp_path):
 
     assert host_threads._cgroup_cpu_limit(tmp_path) is None
     assert host_threads._cgroup_cpu_limit(Path(tmp_path / "missing")) is None
+
+
+def _write_proc_cgroup(tmp_path, monkeypatch, text: str) -> None:
+    proc = tmp_path / "proc-self-cgroup"
+    proc.write_text(text)
+    monkeypatch.setattr(host_threads, "_PROC_SELF_CGROUP", proc)
+
+
+def test_available_cpus_honor_nested_cgroup_v2_quota(tmp_path, monkeypatch):
+    # A systemd service: the quota sits in the service's own cgroup, the root has none.
+    root = tmp_path / "cgroup"
+    service = root / "system.slice" / "engine.service"
+    service.mkdir(parents=True)
+    (root / "cpu.max").write_text("max 100000\n")
+    (root / "system.slice" / "cpu.max").write_text("max 100000\n")
+    (service / "cpu.max").write_text("200000 100000\n")
+    monkeypatch.setattr(host_threads, "_CGROUP_ROOT", root)
+    _write_proc_cgroup(tmp_path, monkeypatch, "0::/system.slice/engine.service\n")
+    _set_affinity(monkeypatch, 16)
+
+    assert host_threads.available_host_cpus() == 2
+
+
+def test_nested_cgroup_v2_takes_the_tightest_ancestor_quota(tmp_path, monkeypatch):
+    root = tmp_path / "cgroup"
+    leaf = root / "parent" / "leaf"
+    leaf.mkdir(parents=True)
+    (root / "parent" / "cpu.max").write_text("300000 100000\n")
+    (leaf / "cpu.max").write_text("600000 100000\n")
+    monkeypatch.setattr(host_threads, "_CGROUP_ROOT", root)
+    _write_proc_cgroup(tmp_path, monkeypatch, "0::/parent/leaf\n")
+    _set_affinity(monkeypatch, 16)
+
+    assert host_threads.available_host_cpus() == 3
+
+
+def test_available_cpus_honor_nested_cgroup_v1_quota(tmp_path, monkeypatch):
+    root = tmp_path / "cgroup"
+    group = root / "cpu" / "engines" / "card0"
+    group.mkdir(parents=True)
+    (root / "cpu" / "cpu.cfs_quota_us").write_text("-1\n")
+    (root / "cpu" / "cpu.cfs_period_us").write_text("100000\n")
+    (group / "cpu.cfs_quota_us").write_text("250000\n")
+    (group / "cpu.cfs_period_us").write_text("100000\n")
+    monkeypatch.setattr(host_threads, "_CGROUP_ROOT", root)
+    _write_proc_cgroup(tmp_path, monkeypatch, "12:memory:/engines/card0\n4:cpu,cpuacct:/engines/card0\n")
+    _set_affinity(monkeypatch, 16)
+
+    assert host_threads.available_host_cpus() == 3
+
+
+def test_invisible_cgroup_levels_are_skipped(tmp_path, monkeypatch):
+    # Inside a cgroup namespace the host path in /proc/self/cgroup may not exist under the mount; the root still counts.
+    root = tmp_path / "cgroup"
+    root.mkdir()
+    (root / "cpu.max").write_text("400000 100000\n")
+    monkeypatch.setattr(host_threads, "_CGROUP_ROOT", root)
+    _write_proc_cgroup(tmp_path, monkeypatch, "0::/host/only/path\n")
+    _set_affinity(monkeypatch, 16)
+
+    assert host_threads.available_host_cpus() == 4
 
 
 @pytest.mark.parametrize(

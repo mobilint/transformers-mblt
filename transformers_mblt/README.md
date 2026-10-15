@@ -522,8 +522,9 @@ recommended_host_threads(n_engines_on_host=3)  # 5 on a 16-CPU reservation
 apply_host_thread_defaults(n_engines_on_host=3)  # torch.set_num_threads(5); None if the env sets it
 ```
 
-`recommended_host_threads` divides the CPUs available to the process (its affinity mask, lowered to a cgroup CPU
-quota when one is set) evenly among the engines and clamps the share to 2–8 threads (`min_threads`, `max_threads`).
+`recommended_host_threads` divides the CPUs available to the process (its affinity mask, lowered to the tightest cgroup
+CPU quota on the process's own cgroup or any of its ancestors) evenly among the engines and clamps the share to
+2–8 threads (`min_threads`, `max_threads`).
 `apply_host_thread_defaults` lowers torch's pool to that value with `torch.set_num_threads` (it never raises it above
 torch's default, which counts physical cores), unless `OMP_NUM_THREADS` or
 `MKL_NUM_THREADS` is set, in which case it leaves torch alone and returns `None`. Call it once per process before the
