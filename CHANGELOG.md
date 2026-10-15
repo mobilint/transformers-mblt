@@ -9,6 +9,11 @@
   3-card, 48-row Qwen3-0.6B decode, the dispatch step outside the NPU calls took about 11 ms per step, and this
   per-call pool was part of it. A dispatch still waits for every slot before it returns or re-raises a slot's error.
   `MultiSlotDispatcher.close()` shuts the pool down; the next multi-slot dispatch starts a new one. (#26)
+- Multi-slot batched decode with the default `logits_to_keep=1` copies each item's logits straight from its slot's
+  output instead of first merging every slot's output into one array and copying the rows out of it. The merge
+  copied the full logits once per step (about 29 MB for 48 rows of a 151,936-token vocabulary).
+  `MultiSlotDispatcher.dispatch(..., merge=False)` returns a `GroupedRows` for this; `np.asarray()` on it still
+  gives the merged array, and the default `merge=True` is unchanged.
 
 ### Fixed
 
