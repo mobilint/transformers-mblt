@@ -263,6 +263,35 @@ def npu_latency_pct(total_latency: Optional[float], npu_latency: Optional[float]
     return (npu_latency / total_latency) * 100.0
 
 
+def _split_batch_phase_wall_time(
+    t_start_ns: int,
+    t_end_ns: int,
+    first_token_ns: Optional[int],
+) -> tuple[float, float]:
+    """Split a batched ``generate`` wall clock into prefill and decode durations.
+
+    Phase durations are host wall-clock time, split at the first-generated-token
+    callback, as on the batch-1 streamer path. Aggregate NPU timing never sets
+    them: it is the numerator of the ``*_npu_latency_pct`` metrics, and using it
+    as the denominator as well pins those percentages at 100% and drops the
+    host time between ``infer`` calls from the phase TPS.
+
+    Args:
+        t_start_ns: ``perf_counter_ns`` just before ``generate`` starts.
+        t_end_ns: ``perf_counter_ns`` just after ``generate`` returns.
+        first_token_ns: ``perf_counter_ns`` at the first generated token, or ``None``.
+
+    Returns:
+        ``(prefill_latency, decode_duration)`` in seconds. Without a usable boundary
+        (generation ended before the first token), both phases get the full wall clock.
+
+    """
+    if first_token_ns is not None and t_start_ns <= first_token_ns <= t_end_ns:
+        return _ns_to_seconds(first_token_ns - t_start_ns), _ns_to_seconds(t_end_ns - first_token_ns)
+    total_time = _ns_to_seconds(t_end_ns - t_start_ns)
+    return total_time, total_time
+
+
 def _call_maybe_getter(obj: object, name: str) -> object | None:
     """Return an attribute value, calling it when it is a zero-argument getter."""
     candidate = getattr(obj, name, None)
@@ -630,6 +659,16 @@ class TokenIteratorStreamer(TextIteratorStreamer):
 
 @dataclass
 class SingleMeasurement:
+    """One measured generate run.
+
+    ``prefill_latency``, ``decode_duration`` and ``total_time`` are host wall-clock time, and the
+    TPS values divide tokens by them. ``npu_*`` times come from ``count_npu_time``: the host
+    wall-clock time spent inside the qbruntime ``infer`` calls of each phase. That includes the
+    runtime's work around the device run, such as input and output transfers, so it bounds the
+    device busy time from above; a qbruntime event trace (``--trace``) shows the busy time itself. ``*_npu_latency_pct``
+    is that NPU time as a share of the phase's wall-clock time.
+    """
+
     num_prefill: int
     num_decode: int
     prefill_latency: float  # seconds
@@ -1168,22 +1207,9 @@ class TPSMeasurer:
         if fake_prefill:
             prefill_latency = 0.0
             decode_duration = total_time
-            npu_prefill_time = 0.0 if has_npu_time else 0.0
-        elif has_npu_time and (npu_prefill_time > 0 or npu_decode_time > 0):
-            prefill_latency = npu_prefill_time if npu_prefill_time > 0 else total_time
-            decode_duration = npu_decode_time if npu_decode_time > 0 else max(total_time - prefill_latency, 0.0)
-        elif first_token_ns is not None and t_start_ns <= first_token_ns <= t_end_ns:
-            # Non-NPU compute backends (e.g., CUDA GPU) do not expose aggregate phase timing.
-            # Derive the phase boundary from the first-generated-token callback that fires
-            # inside the ``StoppingCriteria`` after the first decode step completes.
-            prefill_latency = _ns_to_seconds(first_token_ns - t_start_ns)
-            decode_duration = _ns_to_seconds(t_end_ns - first_token_ns)
+            npu_prefill_time = 0.0
         else:
-            # Callback boundary unavailable (e.g., generation ended before the first token).
-            # Fall back to attributing the full wall clock to both phases so downstream
-            # total-throughput math stays consistent.
-            prefill_latency = total_time
-            decode_duration = total_time
+            prefill_latency, decode_duration = _split_batch_phase_wall_time(t_start_ns, t_end_ns, first_token_ns)
 
         prefill_latency_ns = _seconds_to_ns(prefill_latency) or 0
         decode_duration_ns = _seconds_to_ns(decode_duration) or 0
@@ -2065,17 +2091,7 @@ class VLMTPSMeasurer:
             total_time = _ns_to_seconds(total_time_ns)
             has_npu_time, npu_prefill_time, npu_decode_time = _read_aggregate_npu_timing(npu_timing_target)
             first_token_ns = phase_callbacks.first_token_ns
-            if has_npu_time and (npu_prefill_time > 0 or npu_decode_time > 0):
-                prefill_latency = npu_prefill_time if npu_prefill_time > 0 else total_time
-                decode_duration = npu_decode_time if npu_decode_time > 0 else max(total_time - prefill_latency, 0.0)
-            elif first_token_ns is not None and t_start_ns <= first_token_ns <= t_end_ns:
-                # Non-NPU compute backends (e.g., CUDA GPU) lack aggregate phase timing;
-                # derive the phase boundary from the first-generated-token callback.
-                prefill_latency = _ns_to_seconds(first_token_ns - t_start_ns)
-                decode_duration = _ns_to_seconds(t_end_ns - first_token_ns)
-            else:
-                prefill_latency = total_time
-                decode_duration = total_time
+            prefill_latency, decode_duration = _split_batch_phase_wall_time(t_start_ns, t_end_ns, first_token_ns)
             total_prefill_tokens = seq_len * batch_size
             total_decode_tokens = decode_count * batch_size
             avg_total_prefill_token_latency = (
