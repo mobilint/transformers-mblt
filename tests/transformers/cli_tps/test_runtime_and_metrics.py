@@ -3427,3 +3427,99 @@ def test_vlm_measure_llm_forces_use_cache_over_config(batch_size):
     assert measurer.model.generate_kwargs.get("use_cache") is True
     assert measurer.model.config.use_cache is False
     assert measurer.model.generation_config.use_cache is False
+
+
+_PREFILL_WALL_S = 0.02
+_DECODE_WALL_S = 0.04
+_PREFILL_NPU_S = 0.005
+_DECODE_NPU_S = 0.01
+
+
+class _AggregateNPUTiming:
+    """Aggregate ``count_npu_time`` counters shorter than the generate wall clock."""
+
+    def reset_npu_timing(self) -> None:
+        """Match the Mobilint aggregate timing reset API."""
+
+    def get_npu_timing(self) -> dict[str, float | int]:
+        """Report less NPU time than wall time, as host work between ``infer`` calls does."""
+        return {"prefill_time": _PREFILL_NPU_S, "decode_time": _DECODE_NPU_S, "prefill_calls": 1, "decode_calls": 4}
+
+
+def _assert_wall_clock_phases_with_npu_share(result) -> None:
+    """Phase durations stay wall clock, and NPU time is only their numerator."""
+    assert result.npu_prefill_time == pytest.approx(_PREFILL_NPU_S)
+    assert result.npu_decode_time == pytest.approx(_DECODE_NPU_S)
+    assert result.prefill_latency >= _PREFILL_WALL_S
+    assert result.decode_duration >= _DECODE_WALL_S
+    assert result.prefill_latency + result.decode_duration == pytest.approx(result.total_time, abs=5e-3)
+    assert result.prefill_npu_latency_pct < 100.0
+    assert result.decode_npu_latency_pct < 100.0
+    assert result.prefill_npu_latency_pct == pytest.approx(100.0 * _PREFILL_NPU_S / result.prefill_latency)
+    assert result.decode_npu_latency_pct == pytest.approx(100.0 * _DECODE_NPU_S / result.decode_duration)
+
+
+def test_batched_generate_keeps_wall_clock_phases_with_npu_timing():
+    """Batched generate with ``count_npu_time`` must not use NPU time as the phase duration.
+
+    Using it pinned ``prefill_npu_lat``/``decode_npu_lat`` at 100% and computed TTFT and
+    phase TPS from NPU time alone.
+    """
+    import time
+
+    class _TimedBatchedModel(_AggregateNPUTiming, _DummyBatchedGenerateNPUModel):
+        """Batched NPU model double whose ``infer`` time is shorter than its wall clock."""
+
+        def generate(self, **kwargs):
+            self.generate_kwargs = kwargs
+            input_ids = kwargs["input_ids"]
+            new_tokens = int(kwargs["max_new_tokens"])
+            time.sleep(_PREFILL_WALL_S)
+            outputs = torch.zeros(
+                (int(input_ids.shape[0]), int(input_ids.shape[1]) + new_tokens),
+                dtype=torch.long,
+            )
+            stopping_criteria = kwargs.get("stopping_criteria")
+            if stopping_criteria is not None:
+                stopping_criteria(outputs[:, : int(input_ids.shape[1]) + 1], None)
+            time.sleep(_DECODE_WALL_S)
+            return outputs
+
+    model = _TimedBatchedModel()
+    measurer = TPSMeasurer(_DummyTextPipeline(model))
+
+    result = measurer.measure(num_prefill=8, num_decode=4, batch_size=2)
+
+    assert model.generate_kwargs["count_npu_time"] is True
+    _assert_wall_clock_phases_with_npu_share(result)
+    assert result.prefill_tps == pytest.approx(8 * 2 / result.prefill_latency)
+    assert result.decode_tps == pytest.approx(4 * 2 / result.decode_duration)
+
+
+def test_vlm_batched_llm_keeps_wall_clock_phases_with_npu_timing():
+    """The VLM batched LLM path must also keep wall-clock phases when NPU timing exists."""
+    import time
+
+    class _TimedVLMLanguageModel(_AggregateNPUTiming, _DummyVLMLanguageModel):
+        """VLM language model double exposing aggregate NPU timing."""
+
+    class _TimedBatchedVLMModel(_DummyBatchedVLMModel):
+        """Batched VLM double whose ``infer`` time is shorter than its wall clock."""
+
+        def generate(self, **kwargs) -> torch.Tensor:
+            batch_size = int(kwargs["inputs_embeds"].shape[0])
+            time.sleep(_PREFILL_WALL_S)
+            stopping_criteria = kwargs.get("stopping_criteria")
+            if stopping_criteria is not None:
+                stopping_criteria(torch.zeros((batch_size, 1), dtype=torch.long), None)
+            time.sleep(_DECODE_WALL_S)
+            return torch.zeros((batch_size, int(self.generated_tokens)), dtype=torch.long)
+
+    language_model = _TimedVLMLanguageModel()
+    num_decode = 4
+    measurer = _DummyBatchedVLMTPSMeasurer(language_model, generated_tokens=num_decode + 1)
+    measurer.model = _TimedBatchedVLMModel(language_model, generated_tokens=num_decode + 1)
+
+    result = measurer._measure_llm_once(torch.zeros((2, 8, 4), dtype=torch.float32), num_decode=num_decode)
+
+    _assert_wall_clock_phases_with_npu_share(result)
