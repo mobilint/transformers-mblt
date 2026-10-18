@@ -38,6 +38,10 @@
 
 ### Fixed
 
+- `MobilintLfm2AudioProcessor.save_pretrained()` works on transformers 4.56 and 4.57. Those releases call
+  `to_dict(legacy_serialization=...)` while saving a processor, and the Mobilint processor's `to_dict()` took no
+  arguments, so saving failed with `TypeError: ... got an unexpected keyword argument 'legacy_serialization'`. The
+  processor and its feature extractor now pass their `to_dict()` arguments through.
 - `MobilintLfm2AudioCache` zeroes only the NPU slot it holds. Building, `reset()` or `discard()` of a cache whose
   slot another cache had taken used to zero that slot too, which wiped the other cache's KV while it still counted
   as resident. A cache that does not hold its slot now zeroes it when it next binds, so every sequence still starts
