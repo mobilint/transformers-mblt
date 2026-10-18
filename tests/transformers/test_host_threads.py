@@ -9,8 +9,9 @@ from transformers_mblt.utils import host_threads
 
 @pytest.fixture(autouse=True)
 def no_proc_cgroup(tmp_path, monkeypatch):
-    """Keep the host's own /proc/self/cgroup out of every test; tests that need one write it."""
+    """Keep the host's own /proc/self/cgroup and mountinfo out of every test; tests that need one write it."""
     monkeypatch.setattr(host_threads, "_PROC_SELF_CGROUP", tmp_path / "proc-self-cgroup-missing")
+    monkeypatch.setattr(host_threads, "_PROC_SELF_MOUNTINFO", tmp_path / "proc-self-mountinfo-missing")
 
 
 @pytest.fixture
@@ -116,6 +117,53 @@ def test_available_cpus_honor_nested_cgroup_v1_quota(tmp_path, monkeypatch):
     _set_affinity(monkeypatch, 16)
 
     assert host_threads.available_host_cpus() == 3
+
+
+def test_available_cpus_honor_comounted_cgroup_v1_quota(tmp_path, monkeypatch):
+    # cpu and cpuacct co-mounted at cpu,cpuacct with no cpu symlink beside it.
+    root = tmp_path / "cgroup"
+    group = root / "cpu,cpuacct"
+    group.mkdir(parents=True)
+    (group / "cpu.cfs_quota_us").write_text("200000\n")
+    (group / "cpu.cfs_period_us").write_text("100000\n")
+    monkeypatch.setattr(host_threads, "_CGROUP_ROOT", root)
+    _set_affinity(monkeypatch, 16)
+
+    assert host_threads.available_host_cpus() == 2
+
+
+def test_cgroup_v1_cpu_mount_is_found_from_mountinfo(tmp_path, monkeypatch):
+    # A container: the cpu controller is mounted at a path the defaults do not name, and its mount root is the
+    # container's own cgroup, which /proc/self/cgroup reports with the host prefix.
+    mount = tmp_path / "elsewhere" / "cpu-ctl"
+    mount.mkdir(parents=True)
+    (mount / "cpu.cfs_quota_us").write_text("400000\n")
+    (mount / "cpu.cfs_period_us").write_text("100000\n")
+    mountinfo = tmp_path / "mountinfo"
+    mountinfo.write_text(
+        "30 25 0:26 / /sys/fs/cgroup/memory rw,nosuid - cgroup cgroup rw,memory\n"
+        f"31 25 0:27 /docker/abc {mount.as_posix()} rw,nosuid shared:9 - cgroup cgroup rw,cpu,cpuacct\n"
+    )
+    monkeypatch.setattr(host_threads, "_PROC_SELF_MOUNTINFO", mountinfo)
+    monkeypatch.setattr(host_threads, "_CGROUP_ROOT", tmp_path / "cgroup-missing")
+    _write_proc_cgroup(tmp_path, monkeypatch, "4:cpu,cpuacct:/docker/abc\n")
+    _set_affinity(monkeypatch, 16)
+
+    assert host_threads.available_host_cpus() == 4
+
+
+def test_cgroup_v1_mount_root_is_stripped_from_nested_path(tmp_path, monkeypatch):
+    mount = tmp_path / "cpu-ctl"
+    leaf = mount / "engines" / "card0"
+    leaf.mkdir(parents=True)
+    (leaf / "cpu.cfs_quota_us").write_text("150000\n")
+    (leaf / "cpu.cfs_period_us").write_text("100000\n")
+    mountinfo = tmp_path / "mountinfo"
+    mountinfo.write_text(f"31 25 0:27 /docker/abc {mount.as_posix()} rw - cgroup cgroup rw,cpuacct,cpu\n")
+    proc_cgroup = tmp_path / "explicit-proc-cgroup"
+    proc_cgroup.write_text("4:cpuacct,cpu:/docker/abc/engines/card0\n")
+
+    assert host_threads._cgroup_cpu_limit(tmp_path / "cgroup-missing", proc_cgroup, mountinfo) == 2
 
 
 def test_invisible_cgroup_levels_are_skipped(tmp_path, monkeypatch):

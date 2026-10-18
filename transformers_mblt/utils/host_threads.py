@@ -40,6 +40,9 @@ THREAD_ENV_VARS = ("OMP_NUM_THREADS", "MKL_NUM_THREADS")
 
 _CGROUP_ROOT = Path("/sys/fs/cgroup")
 _PROC_SELF_CGROUP = Path("/proc/self/cgroup")
+_PROC_SELF_MOUNTINFO = Path("/proc/self/mountinfo")
+_V1_CPU_DIR_NAMES = ("cpu", "cpu,cpuacct", "cpuacct,cpu")
+"""Usual cgroup v1 directory names of the ``cpu`` controller, co-mounted with ``cpuacct`` or not."""
 
 
 def _own_cgroup_paths(proc_cgroup: Path) -> tuple:
@@ -77,18 +80,65 @@ def _ancestors(base: Path, relative: Optional[str]) -> list:
     return [d for d in reversed(dirs) if d.is_dir()]
 
 
-def _cgroup_cpu_limit(cgroup_root: Optional[Path] = None, proc_cgroup: Optional[Path] = None) -> Optional[int]:
+def _v1_cpu_mounts(mountinfo: Path) -> list:
+    """Return ``(mount point, cgroup path of the mount root)`` for each cgroup v1 mount that carries ``cpu``.
+
+    Read from ``/proc/self/mountinfo``, so it finds the controller wherever it is mounted (for example
+    ``/sys/fs/cgroup/cpu,cpuacct`` with no ``cpu`` symlink). Returns an empty list when the file cannot be read.
+    """
+    try:
+        lines = mountinfo.read_text().splitlines()
+    except OSError:
+        return []
+    mounts = []
+    for line in lines:
+        pre, sep, post = line.partition(" - ")
+        fields = pre.split()
+        post_fields = post.split()
+        if not sep or len(fields) < 5 or len(post_fields) < 3 or post_fields[0] != "cgroup":
+            continue
+        if "cpu" in post_fields[2].split(","):
+            mounts.append((Path(fields[4]), fields[3].strip("/")))
+    return mounts
+
+
+def _v1_cpu_dirs(cgroup_root: Path, mountinfo: Path, cpu_path: Optional[str]) -> list:
+    """Return the cgroup v1 ``cpu`` controller directories that apply to this process, deepest first per mount.
+
+    Each mount from ``mountinfo`` is searched with its own mount root removed from ``cpu_path`` (a container sees
+    its own cgroup at the mount point), then the usual controller directories under ``cgroup_root`` are searched.
+    """
+    mounts = _v1_cpu_mounts(mountinfo) + [(cgroup_root / name, "") for name in _V1_CPU_DIR_NAMES]
+    dirs = []
+    for mount, mount_root in mounts:
+        relative = cpu_path
+        if relative and mount_root:
+            if relative == mount_root:
+                relative = ""
+            elif relative.startswith(mount_root + "/"):
+                relative = relative[len(mount_root) + 1 :]
+        for directory in _ancestors(mount, relative):
+            if directory not in dirs:
+                dirs.append(directory)
+    return dirs
+
+
+def _cgroup_cpu_limit(
+    cgroup_root: Optional[Path] = None, proc_cgroup: Optional[Path] = None, mountinfo: Optional[Path] = None
+) -> Optional[int]:
     """Return the CPU count allowed by the cgroup CPU quotas on this process, or ``None`` when there is none.
 
     Resolves the process's own cgroup from ``/proc/self/cgroup`` and reads the quota of that cgroup and of every
     ancestor up to the mount root, since a quota on any of them limits the process (e.g. a systemd service's own
     cgroup under an unlimited root). The tightest quota wins. Reads cgroup v2 ``cpu.max`` files, else the cgroup v1
-    ``cpu.cfs_quota_us`` / ``cpu.cfs_period_us`` pairs under the ``cpu`` controller. Levels that are not visible (for
-    example host paths inside a container's cgroup namespace) are skipped. A fractional quota rounds up.
+    ``cpu.cfs_quota_us`` / ``cpu.cfs_period_us`` pairs under the ``cpu`` controller, found from ``mountinfo`` and
+    under the usual ``cpu`` / ``cpu,cpuacct`` directories. Levels that are not visible (for example host paths inside
+    a container's cgroup namespace) are skipped. A fractional quota rounds up.
 
     Args:
         cgroup_root: Mount point of the cgroup file system. ``None`` means ``/sys/fs/cgroup``.
         proc_cgroup: The process's cgroup membership file. ``None`` means ``/proc/self/cgroup``.
+        mountinfo: The process's mount table. ``None`` means ``/proc/self/mountinfo``.
 
     Returns:
         The number of CPUs the tightest quota allows, at least 1, or ``None`` when no quota is set or readable.
@@ -97,6 +147,8 @@ def _cgroup_cpu_limit(cgroup_root: Optional[Path] = None, proc_cgroup: Optional[
         cgroup_root = _CGROUP_ROOT
     if proc_cgroup is None:
         proc_cgroup = _PROC_SELF_CGROUP
+    if mountinfo is None:
+        mountinfo = _PROC_SELF_MOUNTINFO
     v2_path, v1_cpu_path = _own_cgroup_paths(proc_cgroup)
 
     limits = []
@@ -112,8 +164,7 @@ def _cgroup_cpu_limit(cgroup_root: Optional[Path] = None, proc_cgroup: Optional[
             if limit is not None:
                 limits.append(limit)
     if not v2_seen:
-        v1_root = cgroup_root / "cpu"
-        for directory in _ancestors(v1_root, v1_cpu_path):
+        for directory in _v1_cpu_dirs(cgroup_root, mountinfo, v1_cpu_path):
             try:
                 quota = (directory / "cpu.cfs_quota_us").read_text().strip()
                 period = (directory / "cpu.cfs_period_us").read_text().strip()
