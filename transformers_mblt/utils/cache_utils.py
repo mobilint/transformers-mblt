@@ -305,9 +305,9 @@ class MobilintLayer(CacheLayerMixin):
 def default_row_slot(row: int, n_models: int, k_per_model: int) -> Tuple[int, int]:
     """Return the default ``(model_idx, cache_id)`` of flat row ``row`` on ``n_models`` x ``k_per_model`` slots.
 
-    Rows go round-robin over the Models: row ``i`` is ``(i % N, i // N)``. A batch smaller than ``N * K`` then
-    runs on every Model in parallel; the former ``divmod(i, K)`` layout put the first ``K`` rows all on Model 0
-    and left the other Models idle. With one Model both layouts are ``(0, i)``.
+    Rows go round-robin over the Models: row ``i`` is ``(i % N, i // N)``. A batch of ``B`` rows then runs on
+    ``min(B, N)`` Models in parallel (every Model once ``B >= N``); the former ``divmod(i, K)`` layout put the
+    first ``K`` rows all on Model 0 and left the other Models idle. With one Model both layouts are ``(0, i)``.
     """
     n = max(1, int(n_models))
     row = int(row)
@@ -331,8 +331,8 @@ class MobilintCache(Cache):
         ``N = len(mxq_models)`` Model handles with ``K = per_model_batch``
         cache slots each, laid out as flat rows so external callers can keep
         the historical row-index API. Row ``i`` maps to
-        ``(i % N, i // N)`` (see :func:`default_row_slot`), so a batch smaller
-        than ``N * K`` spreads over every Model instead of filling Model 0
+        ``(i % N, i // N)`` (see :func:`default_row_slot`), so a batch of
+        ``B`` rows spreads over ``min(B, N)`` Models instead of filling Model 0
         first; helpers :meth:`slot_of`, :meth:`model_of`, and
         :meth:`group_by_model` expose that routing without leaking the slot
         concept into upstream dispatch.

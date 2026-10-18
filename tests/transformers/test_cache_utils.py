@@ -554,7 +554,7 @@ def test_mobilint_cache_group_by_model_preserves_row_order_per_model() -> None:
 
 
 def test_mobilint_cache_default_rows_spread_over_models() -> None:
-    """A batch smaller than N*K lands on every Model, not on Model 0 first."""
+    """A batch of at least N rows (but below N*K) lands on every Model, not on Model 0 first."""
     models = [_FakeMxqModel() for _ in range(3)]
     cache = MobilintCache(models, per_model_batch=16)
 
@@ -562,6 +562,15 @@ def test_mobilint_cache_default_rows_spread_over_models() -> None:
     assert {cache.slot_of(row)[0] for row in range(16)} == {0, 1, 2}
     # Every slot is used exactly once across the full capacity.
     assert sorted(cache.slot_of(row) for row in range(48)) == [(m, c) for m in range(3) for c in range(16)]
+
+
+def test_mobilint_cache_default_rows_below_n_use_one_model_each() -> None:
+    """A batch of B < N rows reaches only B Models, one row on each."""
+    models = [_FakeMxqModel() for _ in range(3)]
+    cache = MobilintCache(models, per_model_batch=16)
+
+    assert [cache.slot_of(row) for row in range(2)] == [(0, 0), (1, 0)]
+    assert set(cache.group_by_model(range(2))) == {0, 1}
 
 
 def test_mobilint_cache_single_model_default_rows_are_unchanged() -> None:
