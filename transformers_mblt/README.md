@@ -514,6 +514,35 @@ the end-of-audio code. When `generate()` receives only `input_features` (the pip
 than the encoder window (10 s) is transcribed window by window and the tokens are joined; a prompt built by the
 processor for such a clip concatenates the windows' embeddings into one sequence instead.
 
+## Host CPU Threads
+
+PyTorch sizes its CPU thread pool from the cores the process can see. When several processes drive NPUs from one
+host, for example one serving engine per card, each starts a full-size pool and they compete for the same cores. A
+process can size its pool for its share of the host instead:
+
+```python
+from transformers_mblt.utils import apply_host_thread_defaults, recommended_host_threads
+
+recommended_host_threads(n_engines_on_host=3)  # 5 on a 16-CPU reservation
+apply_host_thread_defaults(n_engines_on_host=3)  # torch.set_num_threads(5); None if the env sets it
+```
+
+`recommended_host_threads` divides the CPUs available to the process (its affinity mask, lowered to the tightest cgroup
+CPU quota on the process's own cgroup or any of its ancestors) evenly among the engines and clamps the share to
+2–8 threads (`min_threads`, `max_threads`).
+`apply_host_thread_defaults` lowers torch's pool to that value with `torch.set_num_threads` (it never raises it above
+torch's default, which counts physical cores), unless `OMP_NUM_THREADS` or
+`MKL_NUM_THREADS` is set, in which case it leaves torch alone and returns `None`. Call it once per process before the
+first torch CPU work.
+
+The bounds come from a serving measurement on Qwen3-0.6B (runtime batch 16, three single-ARIES cards, one engine per
+card). On a 16-core reservation shared with the load clients, three engines with default threads reached 194–216
+tok/s in total and saturated the reservation; with two threads per engine they reached 557–580 tok/s. One engine at
+concurrency 16 used 2.8–2.9 cores with default threads and 0.9 core with two, at the same throughput. The cost of
+fewer threads is host-side sampling: 48 rows took 9.5 ms with two threads instead of 1.6 ms, against a decode step of
+about 80–110 ms, so the cap keeps some threads for large batches on one engine. These numbers depend on the host and
+model; set `OMP_NUM_THREADS` to override them.
+
 ## Listing Available Models
 
 **transformers-mblt** offers a function to list all available models. You can use the following code snippet to list the models for a specific task (e.g., `text-generation`, `automatic-speech-recognition`, etc.):

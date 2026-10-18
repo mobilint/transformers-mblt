@@ -10,6 +10,12 @@
   (about 380 ms for a 224 MiB Qwen3-0.6B slot). A serving engine evicting a prefix-cache entry that is still on its
   slot can use it rather than `reset()`, which also avoids the dump but leaves the emptied cache recorded as the
   slot's owner. `cache_residency.discard(layer)` is the owner-table operation behind it.
+- `transformers_mblt.utils.recommended_host_threads(n_engines_on_host)` returns a torch CPU thread count for one of
+  several engine processes on a host: the CPUs the process may use (affinity mask, lowered to a cgroup CPU quota)
+  divided among the engines, clamped to 2–8. `apply_host_thread_defaults(...)` lowers torch's pool to it with
+  `torch.set_num_threads` (never above torch's default) unless `OMP_NUM_THREADS` or `MKL_NUM_THREADS` is set. With
+  default threads, three engines (one per card) on a 16-core reservation reached 194–216 tok/s in total; with two
+  threads each they reached 557–580 tok/s.
 
 ### Changed
 
