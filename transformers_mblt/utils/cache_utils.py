@@ -85,6 +85,9 @@ class MobilintLayer(CacheLayerMixin):
         self.speculative = False
         self._kv_signature: Optional[tuple] = None
         self._owner_cache: Optional[Any] = None  # weakref to the multi-layer cache this layer belongs to, if any
+        # KV to write when this layer takes a slot with nothing cached (LFM2's convolution state must start at zero).
+        # ``None`` leaves whatever the slot held: the infer overwrites every position the layer reads.
+        self.blank_kv: Optional[list[bytes]] = None
 
     def lazy_initialization(self, key_states: torch.Tensor, value_states: Optional[torch.Tensor] = None):
         del value_states
@@ -200,6 +203,9 @@ class MobilintLayer(CacheLayerMixin):
 
     def _load_into_slot(self) -> None:
         """Load the host buffer into the slot, which the owner table is about to assign to this layer."""
+        if self._seen_tokens <= 0 and self.blank_kv is not None:
+            self.mxq_model.load_cache_memory(self.blank_kv, self.cache_id)
+            return
         if self._seen_tokens <= 0 or not self.kv_valid:
             return
         if self._host_valid_len < self._seen_tokens:
@@ -304,6 +310,7 @@ class MobilintLayer(CacheLayerMixin):
         copied._host_valid_len = self._host_valid_len
         copied._tracked = self._tracked
         copied._kv_signature = self._kv_signature
+        copied.blank_kv = self.blank_kv
         return copied
 
 

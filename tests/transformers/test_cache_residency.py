@@ -276,6 +276,70 @@ def test_mixture_of_experts_and_eagle3_caches_discard_every_slot_without_dumping
     assert [model.calls for model in models] == [[]] * 4
 
 
+def _is_zeroed(slot: object) -> bool:
+    return isinstance(slot, str) and slot != "" and set(slot) == {"\x00"}
+
+
+def test_lfm2_audio_cache_zeroes_only_the_slot_it_holds() -> None:
+    from transformers_mblt.models.lfm2_audio.modeling_lfm2_audio import MobilintLfm2AudioCache
+
+    backend = _Backend()
+    a = MobilintLfm2AudioCache(backend.mxq_models)
+    assert _is_zeroed(_slot(backend))  # a new cache zeroes a slot no cache holds
+    _run(a, backend, 0, "aaa")
+
+    b = MobilintLfm2AudioCache(backend.mxq_models)  # A holds the slot: building B leaves it alone
+    assert _slot(backend) == "aaa" and a.is_resident
+
+    a.reset()  # A still holds the slot: zeroed in place for its next sequence
+    assert _is_zeroed(_slot(backend)) and a.is_resident
+    _run(a, backend, 0, "aaa")
+
+    b.bind_rows(backend, [0])  # A is saved; B starts empty on a zeroed slot
+    assert _is_zeroed(_slot(backend)) and b.is_resident
+    del b
+
+
+def test_lfm2_audio_cache_discard_or_reset_of_a_displaced_cache_keeps_the_owner_kv() -> None:
+    from transformers_mblt.models.lfm2_audio.modeling_lfm2_audio import MobilintLfm2AudioCache
+
+    backend = _Backend()
+    a = MobilintLfm2AudioCache(backend.mxq_models)
+    b = MobilintLfm2AudioCache(backend.mxq_models)
+    _run(a, backend, 0, "aaa")
+    _run(b, backend, 0, "bb")  # A is saved to host memory; B holds the slot
+
+    a.discard()
+    a.reset()
+
+    assert _slot(backend) == "bb" and b.is_resident
+    _run(b, backend, 0, "B")
+    assert _slot(backend) == "bbB"
+
+    a.bind_rows(backend, [0])  # B is saved; A rebinds empty and zeroes the slot first
+    assert _is_zeroed(_slot(backend)) and a.is_resident
+    _run(a, backend, 0, "x")
+    assert _slot(backend) == "x"
+    _run(b, backend, 0, "!")
+    assert _slot(backend) == "bbB!"
+
+
+def test_lfm2_audio_cache_discard_of_the_resident_cache_writes_nothing() -> None:
+    from transformers_mblt.models.lfm2_audio.modeling_lfm2_audio import MobilintLfm2AudioCache
+
+    backend = _Backend()
+    a = MobilintLfm2AudioCache(backend.mxq_models)
+    _run(a, backend, 0, "aaa")
+    calls = list(backend.mxq_models[0].calls)
+
+    a.discard()
+
+    assert cache_residency.owner(backend.mxq_models[0], 0) is None and not a.is_resident
+    assert backend.mxq_models[0].calls == calls  # neither dumped nor zeroed
+    a.bind_rows(backend, [0])
+    assert _is_zeroed(_slot(backend))
+
+
 def test_raising_a_resident_cursor_by_hand_dumps_on_eviction() -> None:
     backend = _Backend()
     a = MobilintCache(backend.mxq_models)
