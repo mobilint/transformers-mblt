@@ -25,6 +25,7 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.models.auto.modeling_auto import AutoModel, AutoModelForSpeechSeq2Seq
 from transformers.utils.generic import logging
 
+from ...utils import cache_residency as residency
 from ...utils.base_utils import PretrainedOnlyMixin
 from ...utils.cache_utils import MobilintCache
 from ...utils.generation_utils import MobilintGenerationMixin
@@ -67,11 +68,16 @@ def _as_array(outputs: Any) -> np.ndarray:
 
 
 class MobilintLfm2AudioCache(MobilintCache):
-    """:class:`MobilintCache` that zeroes the device cache memory whenever it is reset.
+    """:class:`MobilintCache` that zeroes the device cache memory before every sequence.
 
     The LFM2 short-convolution layers read a fixed window of previous states from the device cache, so the
     memory that ``launch()`` leaves behind would leak into the first positions of a sequence. Writing zero
     buffers before every sequence makes the output independent of what ran before.
+
+    A row only zeroes a slot that holds its own KV (or, before the owner table ever tracked it, a slot no cache
+    holds): a slot another cache took keeps that cache's KV. Every row carries the zero buffers as its
+    :attr:`~transformers_mblt.utils.cache_utils.MobilintLayer.blank_kv`, so an empty row that binds a slot it does
+    not hold (after :meth:`discard`, or a reset while displaced) zeroes it then.
     """
 
     def __init__(
@@ -82,12 +88,19 @@ class MobilintLfm2AudioCache(MobilintCache):
         batch_size: Optional[int] = None,
     ) -> None:
         super().__init__(mxq_models, per_model_batch, batch_size=batch_size)
-        self._zero_buffers = [[bytes(len(buffer)) for buffer in model.dump_cache_memory()] for model in self.mxq_models]
+        zero_buffers = [[bytes(len(buffer)) for buffer in model.dump_cache_memory()] for model in self.mxq_models]
+        for layer, (model_idx, _) in zip(self.layers, self._row_slots):
+            layer.blank_kv = zero_buffers[model_idx]
         self._zero_device_cache()
 
     def _zero_device_cache(self) -> None:
-        for model, buffers in zip(self.mxq_models, self._zero_buffers):
-            model.load_cache_memory(buffers)
+        """Zero the slots of the empty rows that hold them; the others are zeroed when they next bind."""
+        for layer in self.layers:
+            if layer.blank_kv is None:
+                continue
+            holder = residency.owner(layer.mxq_model, layer.cache_id)
+            if holder is layer or (holder is None and not layer.is_managed):
+                layer.mxq_model.load_cache_memory(layer.blank_kv, layer.cache_id)
 
     def reset(self) -> None:
         super().reset()

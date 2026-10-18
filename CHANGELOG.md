@@ -2,6 +2,15 @@
 
 ## 0.6.1
 
+### Added
+
+- `discard()` on `MobilintCache` (and its subclasses), `MobilintEagle3Cache`, `MobilintMixtureOfExpertsCache` and
+  `MobilintLayer` drops a cache's KV: it frees the NPU slots the cache holds without dumping them, then resets the
+  cache, so it is no longer `is_resident`. `offload()` saves the KV instead, which dumps the whole slot synchronously
+  (about 380 ms for a 224 MiB Qwen3-0.6B slot). A serving engine evicting a prefix-cache entry that is still on its
+  slot can use it rather than `reset()`, which also avoids the dump but leaves the emptied cache recorded as the
+  slot's owner. `cache_residency.discard(layer)` is the owner-table operation behind it.
+
 ### Changed
 
 - Multi-slot batched inference (a backend with more than one Model slot, e.g. `dev_no` lists) keeps one worker
@@ -23,6 +32,11 @@
 
 ### Fixed
 
+- `MobilintLfm2AudioCache` zeroes only the NPU slot it holds. Building, `reset()` or `discard()` of a cache whose
+  slot another cache had taken used to zero that slot too, which wiped the other cache's KV while it still counted
+  as resident. A cache that does not hold its slot now zeroes it when it next binds, so every sequence still starts
+  from zeroed convolution state. `MobilintLayer.blank_kv` holds the KV that an empty layer writes when it takes a
+  slot.
 - Qwen3-VL static vision: a single-input vision MXQ compiled by qbcompiler 1.4 (`vision` part without side
   inputs) takes the folded pixel tensor `(1, N, 1536)`, the same tensor the dynamic path feeds.
   `MobilintQwen3VLVisionModel` now reads the compiled input width at load time and sends that layout. The

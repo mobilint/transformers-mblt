@@ -453,6 +453,9 @@ model.generate(continuation_a, past_key_values=a, max_new_tokens=32)  # b is sav
 - `copy()` returns a snapshot. A resident cache saves its slot first, and the copy is loaded on its first use.
 - `offload()` saves the cache to host memory now and frees its slots. `is_resident` reports whether every row is
   on the NPU, and `host_nbytes` how much host memory the cache holds.
+- `discard()` drops the cache's KV instead: it frees the slots the cache holds without dumping them and resets the
+  cache. Use it for a cache whose KV is no longer needed, such as an evicted prefix-cache entry, so the next cache
+  bound to those slots does not save it first. Slots the cache does not hold keep their owner.
 - Passing a cache to another instance of the same checkpoint moves it: it is dumped there and loaded here. Both
   instances must have the same slot topology (`N` Models x `K` cache slots each). The MXQs must also have the same
   KV layout (same compiled model, quantization, core mode and KV capacity); otherwise the move raises
@@ -476,7 +479,8 @@ Whisper and Qwen3-ASR beam caches (`MobilintBeamCache`, `MobilintWhisperCache`) 
 record which token history the decoder slot holds and replay what is missing. They take part in the same owner table.
 When another cache or a forward without a cache uses the decoder slot, or the cache moves to another instance, the
 beam cache forgets that history and replays it from the start on its next forward. `offload()` frees the slot,
-`is_resident` reports whether the slot still holds the history, and `host_nbytes` is always 0.
+`discard()` frees it and resets the cache, `is_resident` reports whether the slot still holds the history, and
+`host_nbytes` is always 0.
 
 ### LFM2-Audio
 
