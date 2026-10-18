@@ -524,7 +524,7 @@ def test_mobilint_cache_two_models_per_model_batch_one_yields_flat_row_layout() 
 
 
 def test_mobilint_cache_four_models_per_model_batch_sixteen_slot_math() -> None:
-    """Four Models × K=16 should produce 64 flat rows with the divmod slot layout."""
+    """Four Models × K=16 should produce 64 flat rows, assigned round-robin over the Models."""
     models = [_FakeMxqModel() for _ in range(4)]
     cache = MobilintCache(models, per_model_batch=16)
 
@@ -532,7 +532,7 @@ def test_mobilint_cache_four_models_per_model_batch_sixteen_slot_math() -> None:
     assert cache.k_per_model == 16
     assert cache.batch_size == 64
     assert len(cache.layers) == 64
-    assert cache.slot_of(17) == (1, 1)
+    assert cache.slot_of(17) == (1, 4)
     assert cache.model_of(17) is models[1]
     assert cache.slot_of(63) == (3, 15)
     assert cache.model_of(63) is models[3]
@@ -545,11 +545,38 @@ def test_mobilint_cache_group_by_model_preserves_row_order_per_model() -> None:
 
     grouped = cache.group_by_model([9, 0, 5, 2, 4])
 
+    # Round-robin rows: row i is (i % 3, i // 3).
     assert grouped == {
-        2: [(9, 1)],
-        0: [(0, 0), (2, 2)],
-        1: [(5, 1), (4, 0)],
+        0: [(9, 3), (0, 0)],
+        2: [(5, 1), (2, 0)],
+        1: [(4, 1)],
     }
+
+
+def test_mobilint_cache_default_rows_spread_over_models() -> None:
+    """A batch of at least N rows (but below N*K) lands on every Model, not on Model 0 first."""
+    models = [_FakeMxqModel() for _ in range(3)]
+    cache = MobilintCache(models, per_model_batch=16)
+
+    assert [cache.slot_of(row) for row in range(4)] == [(0, 0), (1, 0), (2, 0), (0, 1)]
+    assert {cache.slot_of(row)[0] for row in range(16)} == {0, 1, 2}
+    # Every slot is used exactly once across the full capacity.
+    assert sorted(cache.slot_of(row) for row in range(48)) == [(m, c) for m in range(3) for c in range(16)]
+
+
+def test_mobilint_cache_default_rows_below_n_use_one_model_each() -> None:
+    """A batch of B < N rows reaches only B Models, one row on each."""
+    models = [_FakeMxqModel() for _ in range(3)]
+    cache = MobilintCache(models, per_model_batch=16)
+
+    assert [cache.slot_of(row) for row in range(2)] == [(0, 0), (1, 0)]
+    assert set(cache.group_by_model(range(2))) == {0, 1}
+
+
+def test_mobilint_cache_single_model_default_rows_are_unchanged() -> None:
+    """With one Model the default layout is still row i -> (0, i)."""
+    cache = MobilintCache([_FakeMxqModel()], per_model_batch=8)
+    assert [cache.slot_of(row) for row in range(8)] == [(0, i) for i in range(8)]
 
 
 def test_mobilint_cache_update_seen_tokens_per_row_routes_via_slot_of() -> None:

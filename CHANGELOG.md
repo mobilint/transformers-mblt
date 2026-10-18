@@ -14,6 +14,12 @@
   copied the full logits once per step (about 29 MB for 48 rows of a 151,936-token vocabulary).
   `MultiSlotDispatcher.dispatch(..., merge=False)` returns a `GroupedRows` for this; `np.asarray()` on it still
   gives the merged array, and the default `merge=True` is unchanged.
+- A default `MobilintCache` on a multi-slot backend places row `i` round-robin over the Models, at
+  `(i % N, i // N)`, instead of `divmod(i, K)`. A batch of `B` rows below the backend's `N * K` capacity now runs on
+  `min(B, N)` Models instead of filling Model 0 first: `generate()` on a 3-card backend with a batch-16 MXQ
+  (`max_batch_size=48`) was 22% faster at batch 8 and 45% faster at batch 16, and unchanged at batch 48. The
+  dispatcher's cacheless fallback uses the same layout, and `default_row_slot(row, n_models, k_per_model)` in
+  `cache_utils` returns it. A single-Model backend and caches built with explicit `slots=` are unchanged.
 
 ### Fixed
 

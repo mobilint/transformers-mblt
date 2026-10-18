@@ -142,16 +142,16 @@ def test_slot_of_uses_past_key_values_when_available() -> None:
     assert dispatcher.slot_of(1, past_key_values=_StubCache()) == (0, 0)
 
 
-def test_slot_of_falls_back_to_divmod_when_cache_missing() -> None:
-    """Without a cache the dispatcher must derive the mapping from ``k_per_model``."""
+def test_slot_of_falls_back_to_default_row_layout_when_cache_missing() -> None:
+    """Without a cache the dispatcher uses the default MobilintCache layout (round-robin over Models)."""
     m0, m1 = _StaticN1Mxq(), _StaticN1Mxq()
     backend = _MockBackend([m0, m1], k_per_model=2)
     dispatcher = MultiSlotDispatcher(backend)
 
-    # k=2 flattens rows 0..1 -> slot 0, rows 2..3 -> slot 1.
+    # N=2, K=2: rows alternate between the two Models.
     assert dispatcher.slot_of(0) == (0, 0)
-    assert dispatcher.slot_of(1) == (0, 1)
-    assert dispatcher.slot_of(2) == (1, 0)
+    assert dispatcher.slot_of(1) == (1, 0)
+    assert dispatcher.slot_of(2) == (0, 1)
     assert dispatcher.slot_of(3) == (1, 1)
 
 

@@ -458,7 +458,8 @@ model.generate(continuation_a, past_key_values=a, max_new_tokens=32)  # b is sav
   KV layout (same compiled model, quantization, core mode and KV capacity); otherwise the move raises
   `MobilintCacheStateError`, and so does a move whose MXQ layout cannot be read.
 - `MobilintCache(mxq_models, per_model_batch=K, slots=[(model_idx, cache_id), ...])` places row `i` on
-  `slots[i]` instead of the default `divmod(i, K)` layout. A serving engine can then keep one cache per request
+  `slots[i]` instead of the default layout, which puts row `i` on `(i % N, i // N)` so a batch of `B` rows
+  runs on `min(B, N)` Models (every Model once `B >= N`). A serving engine can then keep one cache per request
   on the slot it assigned. Slots must be distinct and inside `N x K`. The cache has `len(slots)` rows, cannot
   grow with `ensure_batch_size()`, and a single-row forward requires row 0 on slot `(0, 0)`.
 - KV that was on the NPU when the backend was disposed is lost unless `dump_cache_memory()` saved it first. Using
