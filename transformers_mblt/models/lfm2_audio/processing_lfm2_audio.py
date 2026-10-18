@@ -99,8 +99,8 @@ class MobilintLfm2AudioFeatureExtractor(SequenceFeatureExtractor):
             mel_scale="slaney",
         )
 
-    def to_dict(self) -> dict[str, Any]:
-        output = super().to_dict()
+    def to_dict(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        output = super().to_dict(*args, **kwargs)
         output.pop("mel_filters", None)
         output.pop("feature_extractor_type", None)
         output.pop("processor_class", None)
@@ -234,8 +234,8 @@ class MobilintLfm2AudioProcessor(ProcessorMixin):
         super().__init__(feature_extractor, tokenizer, **kwargs)
         self.audio_token_id = tokenizer.convert_tokens_to_ids(audio_token)
 
-    def to_dict(self) -> dict[str, Any]:
-        output = super().to_dict()
+    def to_dict(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        output = super().to_dict(*args, **kwargs)
         output.pop("processor_class", None)
         return output
 
