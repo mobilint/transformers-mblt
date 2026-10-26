@@ -19,10 +19,8 @@ from ...utils.base_utils import PretrainedOnlyMixin
 from ...utils.cache_utils import MobilintBeamCache, MobilintCache, cache_rope_deltas
 from ...utils.generation_utils import MobilintGenerationMixin
 from ...utils.modeling_utils import MobilintModelMixin
-from ._errors import guard_qwen_asr_import
 
-with guard_qwen_asr_import():
-    from qwen_asr.core.transformers_backend.modeling_qwen3_asr import (
+from ._upstream.modeling_qwen3_asr import (
         Qwen3ASRForConditionalGeneration,
         Qwen3ASRPreTrainedModel,
         Qwen3ASRThinkerCausalLMOutputWithPast,

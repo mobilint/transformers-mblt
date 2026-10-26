@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.7.0
+
+### Changed
+
+- Qwen3-ASR no longer needs the `qwen-asr` package. Its Transformers backend (configuration, processor and model
+  classes from `qwen-asr` 0.0.6, Apache-2.0) is vendored under `transformers_mblt.models.qwen3_asr._upstream`, so
+  Qwen3-ASR works on Transformers 5.x. `qwen-asr` pins `transformers==4.57.6`, which kept it out of environments
+  such as vLLM 0.32 (Transformers ≥5.16). Two changes make the vendored code import and run on 5.x:
+  `check_model_inputs` is applied as a bare decorator, and the composite configs set their sub-configs before
+  `PretrainedConfig.__init__`, which validates through `get_text_config()` on 5.x. The `qwen-asr` extra stays as an
+  empty alias so existing install commands keep working. The original-model GPU baseline of the ASR benchmark and
+  the native `Qwen3ASRModel.transcribe` test still use the `qwen-asr` distribution when it is installed.
+
 ## 0.6.1
 
 ### Added

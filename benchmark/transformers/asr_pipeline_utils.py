@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from benchmark.transformers.asr_metrics import SampleTiming, add_device_efficiency_metrics
-from transformers_mblt.models.qwen3_asr._errors import QWEN_ASR_INSTALL_HINT
+from benchmark.transformers.asr_qwen_utils import QWEN_ASR_INSTALL_HINT
 
 
 def asr_pipeline_inputs(sample: Mapping[str, Any]) -> list[tuple[Any, dict[str, Any]]]:

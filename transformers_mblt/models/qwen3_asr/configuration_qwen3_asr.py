@@ -10,10 +10,8 @@ from ...utils.configuration_utils import (
     _apply_npu_backend_kwargs,
     _split_npu_backend_kwargs,
 )
-from ._errors import guard_qwen_asr_import
 
-with guard_qwen_asr_import():
-    from qwen_asr.core.transformers_backend.configuration_qwen3_asr import (
+from ._upstream.configuration_qwen3_asr import (
         Qwen3ASRAudioEncoderConfig,
         Qwen3ASRConfig,
         Qwen3ASRTextConfig,
@@ -62,8 +60,6 @@ class MobilintQwen3ASRThinkerConfig(Qwen3ASRThinkerConfig):
         initializer_range: float = 0.02,
         **kwargs,
     ):
-        PretrainedConfig.__init__(self, **kwargs)
-
         self.user_token_id = user_token_id
         self.assistant_token_id = assistant_token_id
         self.asr_text_token_id = asr_text_token_id
@@ -86,6 +82,9 @@ class MobilintQwen3ASRThinkerConfig(Qwen3ASRThinkerConfig):
         elif text_config is None:
             text_config = MobilintQwen3ASRTextConfig()
         self.text_config = text_config
+        # Transformers 5 validates the config inside PretrainedConfig.__init__ and reads get_text_config() there, so
+        # the sub-configs are set first.
+        PretrainedConfig.__init__(self, **kwargs)
 
 
 class MobilintQwen3ASRConfig(Qwen3ASRConfig):
@@ -117,8 +116,6 @@ class MobilintQwen3ASRConfig(Qwen3ASRConfig):
             if k.startswith("decoder_")
         }
 
-        PretrainedConfig.__init__(self, **kwargs)
-
         if isinstance(thinker_config, dict):
             thinker_config = MobilintQwen3ASRThinkerConfig(**thinker_config)
         elif thinker_config is None:
@@ -149,6 +146,9 @@ class MobilintQwen3ASRConfig(Qwen3ASRConfig):
 
         self.thinker_config = thinker_config
         self.support_languages = support_languages
+        # Transformers 5 validates the config inside PretrainedConfig.__init__ and reads get_text_config() there, so
+        # the sub-configs are set first.
+        PretrainedConfig.__init__(self, **kwargs)
 
         # MXQ uses integer-quantized weights; float attention kernels (sdpa,
         # flash-attn) bring no benefit, so pin attention to eager.

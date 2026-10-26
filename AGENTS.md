@@ -52,8 +52,11 @@ Ownership boundary:
 - `transformers[serving]>=4.54.0,<5.18.0` is a required dependency. Transformers 5.17 is the latest
   line covered by `scripts/test_transformers_matrix.py`. Widen the range only after that matrix
   passes.
-- The only optional extra is `qwen-asr`. It pins its own `transformers` version, so keep it out of
-  the base dependencies. Missing-extra errors go through `models/qwen3_asr/_errors.py`.
+- There are no optional dependencies. Qwen3-ASR's Transformers backend is vendored from `qwen-asr` 0.0.6
+  (Apache-2.0) under `models/qwen3_asr/_upstream`, modified to import on Transformers 4.57 and 5.x; keep the
+  license headers. The `qwen-asr` extra is an empty alias for old install commands. Only the native
+  `Qwen3ASRModel.transcribe` test and the ASR benchmark's GPU baseline still use the `qwen-asr` distribution
+  (which pins `transformers==4.57.6`); they skip or stay outside the package when it is missing.
 - The top-level package is lazy. `import transformers_mblt` must not import `transformers` or
   `torch`. Add new public names to `__all__` and to `__getattr__` in `transformers_mblt/__init__.py`.
 
