@@ -353,7 +353,6 @@ def test_qwen3_asr_ctor_routes_revision_and_commit_hash_to_backend(prefix: str) 
     routing intact for the fields that do have a config property.
     """
 
-    pytest.importorskip("qwen_asr")
     from transformers_mblt.models.qwen3_asr.configuration_qwen3_asr import (
         MobilintQwen3ASRConfig,
     )
@@ -389,7 +388,6 @@ def test_qwen3_asr_from_dict_routes_revision_and_commit_hash_to_backend(prefix: 
     revision.
     """
 
-    pytest.importorskip("qwen_asr")
     from transformers_mblt.models.qwen3_asr.configuration_qwen3_asr import (
         MobilintQwen3ASRConfig,
     )
@@ -423,7 +421,6 @@ def test_qwen3_asr_from_dict_buffers_prefixed_target_device_atomically(prefix: s
     the ``encoder_target_device`` setter can rebuild to Aries.
     """
 
-    pytest.importorskip("qwen_asr")
     from transformers_mblt.models.qwen3_asr.configuration_qwen3_asr import (
         MobilintQwen3ASRConfig,
     )

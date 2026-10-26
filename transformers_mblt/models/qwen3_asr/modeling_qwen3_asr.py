@@ -19,10 +19,8 @@ from ...utils.base_utils import PretrainedOnlyMixin
 from ...utils.cache_utils import MobilintBeamCache, MobilintCache, cache_rope_deltas
 from ...utils.generation_utils import MobilintGenerationMixin
 from ...utils.modeling_utils import MobilintModelMixin
-from ._errors import guard_qwen_asr_import
 
-with guard_qwen_asr_import():
-    from qwen_asr.core.transformers_backend.modeling_qwen3_asr import (
+from ._upstream.modeling_qwen3_asr import (
         Qwen3ASRForConditionalGeneration,
         Qwen3ASRPreTrainedModel,
         Qwen3ASRThinkerCausalLMOutputWithPast,
@@ -159,7 +157,7 @@ class MobilintQwen3ASRTextModel(
     def __init__(self, config: MobilintQwen3ASRTextConfig, *args, **kwargs):
         super().__init__(config, *args, **kwargs)
         self.embed_tokens = nn.Embedding(
-            config.vocab_size, config.hidden_size, config.pad_token_id
+            config.vocab_size, config.hidden_size, getattr(config, "pad_token_id", None)
         )
 
     def get_input_embeddings(self) -> nn.Module:
@@ -562,9 +560,10 @@ class MobilintQwen3ASRThinkerForConditionalGeneration(
         self.lm_head = nn.Identity()
 
         self.vocab_size = config.text_config.vocab_size
-        self.pad_token_id = (
-            self.config.pad_token_id if self.config.pad_token_id is not None else -1
-        )
+        # transformers 5 configs no longer define pad_token_id unless the model's config declares it.
+        # transformers 5 의 config 는 모델 config 가 선언하지 않으면 pad_token_id 를 갖지 않는다.
+        pad_token_id = getattr(self.config, "pad_token_id", None)
+        self.pad_token_id = pad_token_id if pad_token_id is not None else -1
         self.rope_deltas = None
 
     def get_cache_mxq_model(self):
@@ -612,6 +611,14 @@ class MobilintQwen3ASRThinkerForConditionalGeneration(
             audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
         else:
             audio_feature_lengths = None
+
+        if cache_position is None:
+            # transformers 5 generation no longer passes cache_position; derive it from the cache as Qwen3-VL does.
+            # transformers 5 의 generate 는 cache_position 을 넘기지 않으므로 Qwen3-VL 처럼 cache 길이로 만든다.
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            cache_position = torch.arange(
+                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+            )
 
         with cache_rope_deltas(self, past_key_values) as keep:
             if attention_mask is not None and position_ids is None:

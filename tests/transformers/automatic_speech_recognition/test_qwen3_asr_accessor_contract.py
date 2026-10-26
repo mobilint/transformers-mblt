@@ -14,23 +14,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-try:
-    import qwen_asr  # noqa: F401
-except ImportError:
-    pytest.skip(
-        "Qwen3-ASR accessor contract tests require the optional qwen-asr package.",
-        allow_module_level=True,
-    )
-except (TypeError, AttributeError) as exc:
-    # Same guard as test_qwen3_asr_cache_contract.py: qwen-asr pins one
-    # transformers release and fails at class-body evaluation on others.
-    pytest.skip(
-        f"Qwen3-ASR accessor contract tests skipped: installed qwen-asr is "
-        f"incompatible with the installed transformers ({exc}).",
-        allow_module_level=True,
-    )
-
-from transformers_mblt.models.qwen3_asr.modeling_qwen3_asr import (  # noqa: E402
+from transformers_mblt.models.qwen3_asr.modeling_qwen3_asr import (
     MobilintQwen3ASRForConditionalGeneration,
 )
 
@@ -106,7 +90,7 @@ def test_composite_get_audio_features_matches_the_upstream_thinker_signature() -
     """
     import inspect
 
-    from qwen_asr.core.transformers_backend.modeling_qwen3_asr import (
+    from transformers_mblt.models.qwen3_asr._upstream.modeling_qwen3_asr import (
         Qwen3ASRThinkerForConditionalGeneration,
     )
 

@@ -12,8 +12,6 @@ It provides a seamless experience for using `transformers` models with the same 
 
 ```bash
 pip install transformers-mblt
-# Qwen3-ASR additionally needs the upstream qwen-asr package
-pip install "transformers-mblt[qwen-asr]"
 ```
 
 - If you want to install the latest version from source, clone the repository and install it:

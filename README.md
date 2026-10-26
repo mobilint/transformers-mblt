@@ -38,12 +38,9 @@ The following are installed as required dependencies:
 - `mblt-npu-python`, the shared Mobilint NPU backend
 - `mobilint-qb-runtime`
 
-NPU execution requires a supported Mobilint NPU driver and device. Qwen3-ASR additionally needs the
-upstream `qwen-asr` package:
-
-```bash
-pip install "transformers-mblt[qwen-asr]"
-```
+NPU execution requires a supported Mobilint NPU driver and device. Qwen3-ASR needs nothing extra: its
+Transformers backend is vendored from `qwen-asr` 0.0.6 (Apache-2.0), so it works on Transformers 4.57 and 5.x. The
+`qwen-asr` extra is kept as an empty alias for existing install commands.
 
 ## Quick start
 

@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from benchmark.transformers.asr_metrics import SampleTiming, add_device_efficiency_metrics
-from transformers_mblt.models.qwen3_asr._errors import QWEN_ASR_INSTALL_HINT
+from benchmark.transformers.asr_qwen_utils import QWEN_ASR_INSTALL_HINT
 
 
 def asr_pipeline_inputs(sample: Mapping[str, Any]) -> list[tuple[Any, dict[str, Any]]]:
@@ -208,9 +208,8 @@ def build_asr_pipeline(
         move_native_qwen3_asr_to_device(pipe, device=device, device_map=device_map)
         return configure_native_qwen3_asr_generate(pipe, resolved_native_generate_kwargs)
 
-    if is_qwen3_asr_model(target.model_id):
-        ensure_qwen3_asr_backend_registered()
-
+    # A Mobilint Qwen3-ASR target loads through transformers-mblt's vendored backend, which registers itself; only
+    # the original-model baseline above needs the upstream qwen-asr package.
     kwargs: dict[str, Any] = {
         "task": "automatic-speech-recognition",
         "model": target.model_id,

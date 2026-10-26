@@ -2,16 +2,11 @@
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import shutil
 from pathlib import Path
 
 import pytest
-
-pytestmark = pytest.mark.skipif(
-    importlib.util.find_spec("qwen_asr") is None, reason="Qwen3-ASR requires the qwen-asr extra"
-)
 
 MODEL_ID = "mobilint/Qwen3-ASR-1.7B"
 

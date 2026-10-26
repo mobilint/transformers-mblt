@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Qwen3-ASR no longer needs the `qwen-asr` package. Its Transformers backend (configuration, processor and model
+  classes from `qwen-asr` 0.0.6, Apache-2.0) is vendored under `transformers_mblt.models.qwen3_asr._upstream`, so
+  Qwen3-ASR works on Transformers 5.x. `qwen-asr` pins `transformers==4.57.6`, which kept it out of environments
+  such as vLLM 0.32 (Transformers ≥5.16). These changes make the vendored code import and run on 5.x:
+  `check_model_inputs` is applied as a bare decorator; the composite configs set their sub-configs before
+  `PretrainedConfig.__init__`, which validates through `get_text_config()` on 5.x; `pad_token_id` is optional, as
+  5.x configs no longer define it by default; and generation, which no longer passes `cache_position` on 5.x, keeps
+  the audio features for the prompt step only (`is_first_iteration`) and derives the decode positions from the
+  cache. On the NPU, Transformers 4.57.6 reproduces the `qwen-asr` 0.0.6 transcriptions exactly. On 5.17 the HF
+  pipeline loads the host-side embedding and feeds the audio features in float32 rather than bfloat16, which
+  changed one of five LibriSpeech transcriptions (toward the reference text); forcing bfloat16 for both reproduces
+  the 4.57.6 output exactly. The `qwen-asr` extra stays as an
+  empty alias so existing install commands keep working. The original-model GPU baseline of the ASR benchmark and
+  the native `Qwen3ASRModel.transcribe` test still use the `qwen-asr` distribution when it is installed.
+
 ## 0.6.1
 
 ### Added

@@ -13,7 +13,13 @@ from typing import Any, Mapping
 
 import torch
 
-from transformers_mblt.models.qwen3_asr._errors import QWEN_ASR_INSTALL_HINT
+# The NPU model needs no extra package (its Transformers backend is vendored in transformers-mblt); only the
+# original-model GPU baseline runs through the upstream qwen-asr distribution, which pins transformers==4.57.6.
+QWEN_ASR_INSTALL_HINT = (
+    "The original Qwen3-ASR baseline runs through the upstream 'qwen-asr' package, which is not installed. "
+    "Install it with: pip install qwen-asr (it pins transformers==4.57.6; "
+    "see https://huggingface.co/Qwen/Qwen3-ASR-1.7B for details)."
+)
 
 _QWEN3_ASR_LANGUAGE_ALIASES = {
     "ar": "Arabic",

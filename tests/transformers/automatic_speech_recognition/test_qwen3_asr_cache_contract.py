@@ -8,33 +8,11 @@ import pytest
 import torch
 from transformers.modeling_outputs import BaseModelOutputWithPast
 
-try:
-    import qwen_asr  # noqa: F401
-except ImportError:
-    pytest.skip(
-        "Qwen3-ASR cache contract tests require the optional qwen-asr package.",
-        allow_module_level=True,
-    )
-except (TypeError, AttributeError) as exc:
-    # ``qwen_asr``'s ``__init__`` eagerly imports its transformers backend,
-    # which pins a specific ``transformers`` decorator API (e.g.
-    # ``check_model_inputs()`` as a factory). Newer / older transformers in
-    # our supported range (``>=4.54.0``) expose incompatible
-    # signatures and raise ``TypeError``/``AttributeError`` at class-body
-    # evaluation time rather than at import time — those escape
-    # ``pytest.importorskip`` and turn into a collection error. Treat any
-    # such incompatibility the same as a missing package.
-    pytest.skip(
-        f"Qwen3-ASR cache contract tests skipped: installed qwen-asr is "
-        f"incompatible with the installed transformers ({exc}).",
-        allow_module_level=True,
-    )
-
-from transformers_mblt.models.qwen3_asr.modeling_qwen3_asr import (  # noqa: E402
+from transformers_mblt.models.qwen3_asr.modeling_qwen3_asr import (
     MobilintQwen3ASRTextModel,
     MobilintQwen3ASRThinkerForConditionalGeneration,
 )
-from transformers_mblt.utils.cache_utils import MobilintBeamCache  # noqa: E402
+from transformers_mblt.utils.cache_utils import MobilintBeamCache
 
 
 class _InputsEmbedAwareMxqModel:

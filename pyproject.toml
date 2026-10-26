@@ -51,9 +51,9 @@ Repository = "https://github.com/mobilint/transformers-mblt"
 transformers-mblt = "transformers_mblt.cli:main"
 
 [project.optional-dependencies]
-qwen-asr = [
-    "qwen-asr",
-]
+# Qwen3-ASR's Transformers backend is vendored in transformers_mblt.models.qwen3_asr._upstream, so this extra
+# installs nothing. It is kept so existing `transformers-mblt[qwen-asr]` install commands keep working.
+qwen-asr = []
 
 [tool.setuptools]
 packages = { find = { where = ["."], include = ["transformers_mblt", "transformers_mblt.*"] } }

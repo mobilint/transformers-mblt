@@ -19,8 +19,6 @@ def test_register_is_idempotent_and_covers_every_importable_architecture() -> No
     expected = set(_registry.registered_architectures())
     if importlib.util.find_spec("transformers.models.qwen3_vl") is None:
         expected.discard("qwen3_vl")
-    if importlib.util.find_spec("qwen_asr") is None:
-        expected.discard("qwen3_asr")
     assert expected <= set(first)
 
 
@@ -125,8 +123,6 @@ def test_model_package_exports_resolve(arch: str) -> None:
     """Every name a model package advertises in ``__all__`` resolves through its lazy ``__getattr__``."""
     if arch == "qwen3_vl" and importlib.util.find_spec("transformers.models.qwen3_vl") is None:
         pytest.skip("qwen3_vl requires a newer Transformers release")
-    if arch == "qwen3_asr" and importlib.util.find_spec("qwen_asr") is None:
-        pytest.skip("qwen3_asr requires the qwen-asr extra")
 
     package = importlib.import_module(f"transformers_mblt.models.{arch}")
     exported = getattr(package, "__all__", ())
