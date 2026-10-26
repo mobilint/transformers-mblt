@@ -969,7 +969,7 @@ class Qwen3ASRThinkerTextModel(Qwen3ASRPreTrainedModel):
 
     def __init__(self, config: Qwen3ASRConfig):
         super().__init__(config)
-        self.padding_idx = config.pad_token_id
+        self.padding_idx = getattr(config, "pad_token_id", None)  # Mobilint: absent on transformers 5 configs
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
@@ -1086,7 +1086,9 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
             self.lm_head = nn.Linear(config.text_config.hidden_size, config.classify_num, bias=False)
         else:
             self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
-        self.pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else -1
+        # Mobilint: transformers 5 configs no longer define pad_token_id unless the model's config declares it.
+        pad_token_id = getattr(self.config, "pad_token_id", None)
+        self.pad_token_id = pad_token_id if pad_token_id is not None else -1
         self.rope_deltas = None
         self.post_init()
 
@@ -1283,7 +1285,12 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
 
         model_inputs["position_ids"] = None
 
-        if cache_position[0] != 0:
+        # Mobilint: transformers 5 no longer passes cache_position here; it marks the prompt step instead.
+        if cache_position is not None:
+            is_first_iteration = cache_position[0] == 0
+        else:
+            is_first_iteration = kwargs.get("is_first_iteration", False)
+        if not is_first_iteration:
             model_inputs["input_features"] = None
 
         return model_inputs
