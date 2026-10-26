@@ -208,9 +208,8 @@ def build_asr_pipeline(
         move_native_qwen3_asr_to_device(pipe, device=device, device_map=device_map)
         return configure_native_qwen3_asr_generate(pipe, resolved_native_generate_kwargs)
 
-    if is_qwen3_asr_model(target.model_id):
-        ensure_qwen3_asr_backend_registered()
-
+    # A Mobilint Qwen3-ASR target loads through transformers-mblt's vendored backend, which registers itself; only
+    # the original-model baseline above needs the upstream qwen-asr package.
     kwargs: dict[str, Any] = {
         "task": "automatic-speech-recognition",
         "model": target.model_id,

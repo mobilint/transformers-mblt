@@ -574,6 +574,45 @@ def test_qwen3_asr_uses_encoder_decoder_core_mode_kwargs(monkeypatch: pytest.Mon
     assert "core_mode" not in model_kwargs
 
 
+def test_qwen3_asr_npu_target_builds_without_the_upstream_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify a Mobilint Qwen3-ASR target never needs the optional qwen-asr package."""
+
+    captured: dict[str, object] = {}
+
+    def fake_pipeline(**kwargs):  # type: ignore[no-untyped-def]
+        captured.update(kwargs)
+        return object()
+
+    def refuse_upstream_backend() -> None:
+        raise AssertionError("the NPU target must not register the upstream qwen-asr backend")
+
+    monkeypatch.setitem(
+        sys.modules, "transformers", type("TransformersStub", (), {"pipeline": staticmethod(fake_pipeline)})()
+    )
+    monkeypatch.setattr(asr_bench, "_ensure_qwen3_asr_backend_registered", refuse_upstream_backend)
+
+    target = asr_bench.ASRBenchmarkTarget(
+        model_id="mobilint/Qwen3-ASR-1.7B",
+        revision_candidates=[None],
+        label="mobilint/Qwen3-ASR-1.7B",
+        base="mobilint__Qwen3-ASR-1.7B",
+        mxq_path=None,
+        is_original=False,
+    )
+
+    asr_bench._build_asr_pipeline(
+        target,
+        revision=None,
+        device="cpu",
+        device_map=None,
+        dtype=None,
+        trust_remote_code=True,
+        core_mode=None,
+    )
+
+    assert captured["model"] == "mobilint/Qwen3-ASR-1.7B"
+
+
 def test_whisper_asr_uses_encoder_decoder_core_mode_kwargs() -> None:
     """Verify Whisper ASR receives encoder/decoder-prefixed core-mode kwargs."""
 
