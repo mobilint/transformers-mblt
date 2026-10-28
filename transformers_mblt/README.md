@@ -512,6 +512,23 @@ the end-of-audio code. When `generate()` receives only `input_features` (the pip
 than the encoder window (10 s) is transcribed window by window and the tokens are joined; a prompt built by the
 processor for such a clip concatenates the windows' embeddings into one sequence instead.
 
+## Host-Side Sampling
+
+With `do_sample=True` and both `top_k` and `top_p` set (Qwen3 ships `temperature=0.6, top_k=20, top_p=0.95`),
+Hugging Face sorts the whole vocabulary for top-p and draws with `torch.multinomial` over all of it on every decode
+step. The Mobilint generation classes do both on the top-k slice instead:
+
+- the `TopKLogitsWarper` → `TopPLogitsWarper` pair becomes one `MobilintTopKTopPLogitsWarper` that returns the same
+  processed scores, and
+- when that warper is the last processor and `output_scores` is not requested, the token is drawn on the slice
+  (`MobilintTopKTopPSampler`) and the step selects it greedily.
+
+The token distribution is unchanged. The random stream is not, so a seeded run draws different tokens than upstream
+Transformers. Entries tied with the k-th logit stay in the slice, as `TopKLogitsWarper` keeps them; NPU logits have
+such ties on most steps. Qwen3-0.6B on ARIES (global8, 200 tokens) decodes at 34.9 tok/s this way, against 24.2
+tok/s with the upstream processors and 38.3 tok/s greedy. Set `MBLT_FUSED_TOPK_TOPP=0` to use the upstream
+processors and draw. EAGLE-3 generation has its own sampling path and is unaffected.
+
 ## Host CPU Threads
 
 PyTorch sizes its CPU thread pool from the cores the process can see. When several processes drive NPUs from one

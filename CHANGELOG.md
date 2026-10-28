@@ -4,6 +4,14 @@
 
 ### Changed
 
+- Sampling with both `top_k` and `top_p` (the Qwen3 default) now runs on the top-k slice instead of the whole
+  vocabulary. `MobilintGenerationMixin` fuses Hugging Face's `TopKLogitsWarper` → `TopPLogitsWarper` pair into
+  `MobilintTopKTopPLogitsWarper`, which returns the same processed scores without sorting the vocabulary, and, when
+  that warper is the last processor and `output_scores` is not requested, draws the token on the slice
+  (`MobilintTopKTopPSampler`) instead of running `torch.multinomial` over the whole vocabulary. Qwen3-0.6B on ARIES
+  decodes at 34.9 tok/s instead of 24.2 (greedy: 38.3). The token distribution is unchanged, but seeded runs draw
+  different tokens than before. `MBLT_FUSED_TOPK_TOPP=0` restores the upstream processors and draw.
+
 - Qwen3-ASR no longer needs the `qwen-asr` package. Its Transformers backend (configuration, processor and model
   classes from `qwen-asr` 0.0.6, Apache-2.0) is vendored under `transformers_mblt.models.qwen3_asr._upstream`, so
   Qwen3-ASR works on Transformers 5.x. `qwen-asr` pins `transformers==4.57.6`, which kept it out of environments
