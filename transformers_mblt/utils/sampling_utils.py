@@ -24,7 +24,9 @@ higher token ids survive. The number of survivors and their scores are the upstr
 equal-logit token ids receive the probability can differ. NPU logits are coarse, so this happens often (about a
 third of decode steps in a quantized-logit test at ``top_p=0.8``). Separately, the softmax sums over the slice
 rather than the vocabulary, so a cumulative probability within float rounding of ``1 - top_p`` can land on the
-other side.
+other side, which can change the number of survivors by one. Tie sets wider than four times k (for example when an
+earlier processor left fewer than k finite entries) are processed over the whole vocabulary with the same token-id
+rule.
 
 Set ``MBLT_FUSED_TOPK_TOPP=0`` to keep the upstream processors and sampling (for A/B comparison).
 """
@@ -37,7 +39,7 @@ import torch
 from transformers import GenerationConfig, LogitsProcessor, LogitsProcessorList, TopKLogitsWarper, TopPLogitsWarper
 
 _FUSED_TOPK_TOPP_ENV_VAR = "MBLT_FUSED_TOPK_TOPP"
-# A tie set wider than this many times k runs the two upstream warpers instead of the slice.
+# A tie set wider than this many times k is processed over the whole vocabulary instead of the slice.
 _MAX_SLICE_FACTOR = 4
 
 
@@ -74,29 +76,36 @@ class MobilintTopKTopPLogitsWarper(LogitsProcessor):
         values = values.masked_fill(values < threshold, self.top_k_warper.filter_value)
         return self._top_p(values, indices), indices
 
-    def _top_p(self, values: torch.FloatTensor, indices: torch.LongTensor) -> torch.FloatTensor:
+    def _top_p(self, values: torch.FloatTensor, indices: Optional[torch.LongTensor]) -> torch.FloatTensor:
         """``TopPLogitsWarper.__call__`` on the slice, breaking ties among equal logits by token id.
 
         Index-ordering the slice and sorting it stably puts lower token ids first among equal values, so those are
-        the ones removed when the cutoff splits them (see the module docstring).
+        the ones removed when the cutoff splits them (see the module docstring). ``indices=None`` means ``values``
+        is the whole vocabulary, already in token-id order.
         """
-        order = indices.argsort(dim=-1)
-        by_index = values.gather(-1, order)
+        if indices is None:
+            order, by_index = None, values
+        else:
+            order = indices.argsort(dim=-1)
+            by_index = values.gather(-1, order)
         sorted_logits, sorted_positions = torch.sort(by_index, descending=False, stable=True)
         cumulative_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
         sorted_to_remove = cumulative_probs <= (1 - self.top_p_warper.top_p)
         sorted_to_remove[..., -self.top_p_warper.min_tokens_to_keep :] = False
         to_remove = sorted_to_remove.scatter(-1, sorted_positions, sorted_to_remove)
         kept_by_index = by_index.masked_fill(to_remove, self.top_p_warper.filter_value)
+        if order is None:
+            return kept_by_index
         return torch.empty_like(values).scatter_(-1, order, kept_by_index)
 
-    def _upstream(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
-        return self.top_p_warper(input_ids, self.top_k_warper(input_ids, scores))
+    def _full_vocabulary(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        """Both rules over the whole vocabulary, for tie sets too wide to slice; same token-id tie break."""
+        return self._top_p(self.top_k_warper(input_ids, scores), None)
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
         processed_slice = self._processed_slice(input_ids, scores)
         if processed_slice is None:
-            return self._upstream(input_ids, scores)
+            return self._full_vocabulary(input_ids, scores)
         kept, indices = processed_slice
         # Upstream, the entries removed by top-k also fail the top-p test, so they end at top-p's filter value.
         processed = torch.full_like(scores, self.top_p_warper.filter_value)
@@ -112,7 +121,7 @@ class MobilintTopKTopPSampler(MobilintTopKTopPLogitsWarper):
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
         processed_slice = self._processed_slice(input_ids, scores)
         if processed_slice is None:
-            kept, indices = self._upstream(input_ids, scores), None
+            kept, indices = self._full_vocabulary(input_ids, scores), None
         else:
             kept, indices = processed_slice
         choice = torch.multinomial(kept.softmax(dim=-1), num_samples=1)

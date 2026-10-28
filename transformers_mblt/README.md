@@ -530,6 +530,8 @@ most steps. Two things differ from upstream Transformers:
   `torch.sort`'s unstable order over the vocabulary; here higher token ids survive. The number of survivors and their
   probabilities are the same; which of the equal-logit tokens get them can differ, which coarse NPU logits make
   common.
+- The top-p softmax sums over the slice rather than the whole vocabulary, so a cumulative probability within float
+  rounding of `1 - top_p` can land on the other side of the cutoff and change the number of survivors by one.
 - The random stream differs, so a seeded run draws different tokens. Qwen3-0.6B on ARIES (global8, 200 tokens) decodes at 34.9 tok/s this way, against 24.2
 tok/s with the upstream processors and 38.3 tok/s greedy. Set `MBLT_FUSED_TOPK_TOPP=0` to use the upstream
 processors and draw. EAGLE-3 generation has its own sampling path and is unaffected.

@@ -11,7 +11,8 @@
   (`MobilintTopKTopPSampler`) instead of running `torch.multinomial` over the whole vocabulary. Qwen3-0.6B on ARIES
   decodes at 34.9 tok/s instead of 24.2 (greedy: 38.3). Seeded runs draw different tokens than before. When equal
   logits straddle the top-p cutoff, higher token ids survive instead of the ones `torch.sort`'s unstable order left;
-  the number of survivors and their probabilities are unchanged. Hand-built warper pairs with a finite top-k filter
+  the number of survivors and their probabilities are unchanged, except that a cumulative probability within float
+  rounding of `1 - top_p` can land on the other side of the cutoff (the softmax sums over the slice). Hand-built warper pairs with a finite top-k filter
   value, or a top-p `min_tokens_to_keep` above k, keep the upstream path. `MBLT_FUSED_TOPK_TOPP=0` restores the
   upstream processors and draw.
 

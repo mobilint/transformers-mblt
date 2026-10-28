@@ -141,6 +141,19 @@ def test_ties_at_the_top_p_cutoff_keep_the_higher_token_ids(p: float) -> None:
     assert split_groups > 0  # the case under test occurred
 
 
+def test_wide_tie_sets_use_the_same_tie_rule() -> None:
+    """A tie set wider than 4k at the top is processed over the whole vocabulary, still keeping higher ids."""
+    scores = torch.randn(2, 5000, generator=torch.Generator().manual_seed(11))
+    scores[:, 1000:1200] = scores.max() + 1.0  # 200 equal maxima: k=20 widens past 4k, top-p 0.5 splits them
+    top_k, top_p = TopKLogitsWarper(20), TopPLogitsWarper(0.5)
+    out = _fused(top_k, top_p, scores)
+    assert torch.equal(out, _upstream_with_index_ties(top_k, top_p, scores))
+    kept = torch.isfinite(out[0]).nonzero().flatten()
+    assert 0 < len(kept) < 200 and kept.min() > 1000 and kept.max() == 1199  # the higher ids of the tie group
+    drawn = MobilintTopKTopPSampler(top_k, top_p)(None, scores).argmax(dim=-1)
+    assert all(torch.isfinite(out[row, token]) for row, token in enumerate(drawn.tolist()))
+
+
 def test_sampler_support_follows_the_tie_rule() -> None:
     generator = torch.Generator().manual_seed(9)
     top_k, top_p = TopKLogitsWarper(20), TopPLogitsWarper(0.8)
