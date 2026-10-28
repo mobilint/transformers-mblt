@@ -8,7 +8,7 @@ from typing import Any, Callable, Dict, Mapping, MutableMapping, Optional, cast
 import qbruntime
 import torch
 import torch.nn as nn
-from transformers import GenerationConfig, GenerationMixin, PreTrainedModel
+from transformers import GenerationConfig, GenerationMixin, LogitsProcessorList, PreTrainedModel
 from transformers.generation.stopping_criteria import StoppingCriteriaList
 from transformers.generation.utils import GenerateDecoderOnlyOutput
 from transformers.modeling_outputs import CausalLMOutputWithPast
@@ -29,6 +29,7 @@ from ..utils.cache_utils import (
     take_eagle3_unfed_tokens,
 )
 from ..utils.modeling_utils import MobilintModelMixin
+from ..utils.sampling_utils import fuse_top_k_top_p, fused_top_k_top_p_enabled, sample_in_top_k_slice
 
 logger = logging.get_logger(__name__)
 
@@ -526,6 +527,30 @@ class MobilintGenerationMixin(ABC, GenerationMixin):
         model_inputs["count_npu_time"] = count_npu_time
         model_inputs["npu_prefill_chunk_size"] = npu_prefill_chunk_size
         return model_inputs
+
+    # Positional arguments differ across the supported Transformers range, so they are forwarded as is.
+    def _get_logits_processor(self, *args: Any, **kwargs: Any) -> LogitsProcessorList:
+        """Build the upstream processor list, then fuse its top-k / top-p pair (see ``sampling_utils``)."""
+        processors = super()._get_logits_processor(*args, **kwargs)
+        if fused_top_k_top_p_enabled():
+            fuse_top_k_top_p(processors)
+        return processors
+
+    # ``generate`` reaches this through ``self._sample`` on 4.x and ``getattr(type(self), "_sample")`` on 5.x.
+    def _sample(
+        self,
+        input_ids: torch.LongTensor,
+        logits_processor: LogitsProcessorList,
+        stopping_criteria: StoppingCriteriaList,
+        generation_config: GenerationConfig,
+        *args: Any,
+        **kwargs: Any,
+    ):
+        """Run the upstream loop, drawing on the top-k slice when ``sample_in_top_k_slice`` allows it."""
+        swapped = sample_in_top_k_slice(logits_processor, generation_config) if fused_top_k_top_p_enabled() else None
+        if swapped is not None:
+            logits_processor, generation_config = swapped
+        return super()._sample(input_ids, logits_processor, stopping_criteria, generation_config, *args, **kwargs)
 
     def get_cache_mxq_model(self) -> qbruntime.Model:
         if isinstance(self, MobilintModelMixin):

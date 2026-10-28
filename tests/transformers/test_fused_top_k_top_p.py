@@ -1,0 +1,298 @@
+"""Tests for the fused top-k / top-p logits warper."""
+
+from __future__ import annotations
+
+import pytest
+import torch
+from transformers import (
+    GenerationConfig,
+    GenerationMixin,
+    LogitsProcessorList,
+    MinPLogitsWarper,
+    TemperatureLogitsWarper,
+    TopKLogitsWarper,
+    TopPLogitsWarper,
+)
+
+from transformers_mblt.utils.generation_utils import MobilintGenerationMixin
+from transformers_mblt.utils.sampling_utils import (
+    MobilintTopKTopPLogitsWarper,
+    MobilintTopKTopPSampler,
+    fuse_top_k_top_p,
+    sample_in_top_k_slice,
+)
+
+VOCAB = 151_936  # Qwen3
+
+
+def _upstream(top_k: TopKLogitsWarper, top_p: TopPLogitsWarper, scores: torch.Tensor) -> torch.Tensor:
+    return top_p(None, top_k(None, scores.clone()))
+
+
+def _fused(top_k: TopKLogitsWarper, top_p: TopPLogitsWarper, scores: torch.Tensor) -> torch.Tensor:
+    return MobilintTopKTopPLogitsWarper(top_k, top_p)(None, scores.clone())
+
+
+@pytest.mark.parametrize(
+    ("k", "p", "min_keep", "batch"),
+    [(20, 0.95, 1, 1), (20, 0.8, 1, 3), (50, 0.95, 1, 2), (5, 0.3, 1, 1), (20, 0.5, 3, 2), (1, 0.9, 1, 1)],
+)
+def test_fused_scores_equal_upstream(k: int, p: float, min_keep: int, batch: int) -> None:
+    generator = torch.Generator().manual_seed(k * 1000 + batch)
+    for _ in range(5):
+        scores = TemperatureLogitsWarper(0.6)(None, torch.randn(batch, VOCAB, generator=generator) * 4)
+        top_k = TopKLogitsWarper(k, min_tokens_to_keep=min_keep)
+        top_p = TopPLogitsWarper(p, min_tokens_to_keep=min_keep)
+        assert torch.equal(_fused(top_k, top_p, scores), _upstream(top_k, top_p, scores))
+
+
+def test_finite_top_p_filter_value_matches_upstream() -> None:
+    scores = torch.randn(2, 1000, generator=torch.Generator().manual_seed(0)) * 3
+    top_k, top_p = TopKLogitsWarper(10), TopPLogitsWarper(0.7, filter_value=-2e4)
+    assert torch.equal(_fused(top_k, top_p, scores), _upstream(top_k, top_p, scores))
+
+
+def test_finite_top_k_filter_value_is_not_fused() -> None:
+    """A filter value that does not underflow in softmax leaves mass outside the top-k slice upstream."""
+    scores = torch.randn(1, VOCAB, generator=torch.Generator().manual_seed(6))
+    top_k, top_p = TopKLogitsWarper(20, filter_value=-1.0), TopPLogitsWarper(0.95)
+    upstream = _upstream(top_k, top_p, scores).softmax(dim=-1)
+    assert upstream.sort(descending=True).values[0, 20:].sum() > 0.5  # the slice could not represent this
+    assert list(fuse_top_k_top_p(LogitsProcessorList([top_k, top_p]))) == [top_k, top_p]
+
+
+def test_top_p_keeping_more_than_k_entries_is_not_fused() -> None:
+    """Upstream top-p keeps entries top-k removed (left at -inf) when its min_tokens_to_keep exceeds k."""
+    scores = torch.randn(1, 1000, generator=torch.Generator().manual_seed(7))
+    top_k = TopKLogitsWarper(5)
+    top_p = TopPLogitsWarper(0.9, min_tokens_to_keep=10, filter_value=-1.0)
+    assert int(torch.isinf(_upstream(top_k, top_p, scores)).sum()) == 5  # the slice could not represent this
+    assert list(fuse_top_k_top_p(LogitsProcessorList([top_k, top_p]))) == [top_k, top_p]
+    # the shape generate builds: both warpers get the same min_tokens_to_keep, so top-k keeps at least as many
+    same = TopPLogitsWarper(0.9, min_tokens_to_keep=10, filter_value=-1.0)
+    fused = fuse_top_k_top_p(LogitsProcessorList([TopKLogitsWarper(5, min_tokens_to_keep=10), same]))
+    assert type(fused[0]) is MobilintTopKTopPLogitsWarper
+
+
+def test_tie_at_kth_value_keeps_every_tied_entry() -> None:
+    scores = torch.randn(1, 1000, generator=torch.Generator().manual_seed(1))
+    threshold = torch.topk(scores, 20).values[0, -1]
+    scores[0, :5] = threshold  # five extra entries equal to the k-th value: upstream keeps all of them
+    top_k, top_p = TopKLogitsWarper(20), TopPLogitsWarper(0.999)
+    out = _fused(top_k, top_p, scores)
+    assert torch.equal(out, _upstream(top_k, top_p, scores))
+    assert int(torch.isfinite(out).sum()) == 25
+
+
+def test_batch_rows_with_different_tie_counts_match_upstream() -> None:
+    scores = torch.randn(3, 1000, generator=torch.Generator().manual_seed(3))
+    for row, extra in ((0, 0), (1, 4), (2, 9)):
+        threshold = torch.topk(scores[row], 20).values[-1]
+        scores[row, torch.topk(scores[row], extra, largest=False).indices] = threshold
+    top_k, top_p = TopKLogitsWarper(20), TopPLogitsWarper(0.999)
+    out = _fused(top_k, top_p, scores)
+    assert torch.equal(out, _upstream(top_k, top_p, scores))
+    assert torch.isfinite(out).sum(dim=-1).tolist() == [20, 24, 29]
+
+
+def _kept_values(scores: torch.Tensor) -> list[list[float]]:
+    return [sorted(row[torch.isfinite(row)].tolist()) for row in scores]
+
+
+def _upstream_with_index_ties(top_k: TopKLogitsWarper, top_p: TopPLogitsWarper, scores: torch.Tensor) -> torch.Tensor:
+    """The upstream warpers over the whole vocabulary, with a stable sort so equal logits break ties by token id."""
+    scores = top_k(None, scores.clone())
+    sorted_logits, sorted_indices = torch.sort(scores, descending=False, stable=True)
+    cumulative_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+    sorted_to_remove = cumulative_probs <= (1 - top_p.top_p)
+    sorted_to_remove[..., -top_p.min_tokens_to_keep :] = False
+    to_remove = sorted_to_remove.scatter(1, sorted_indices, sorted_to_remove)
+    return scores.masked_fill(to_remove, top_p.filter_value)
+
+
+def _quantized(generator: torch.Generator, batch: int = 2) -> torch.Tensor:
+    return TemperatureLogitsWarper(0.6)(None, (torch.randn(batch, VOCAB, generator=generator) * 16).round() / 4)
+
+
+@pytest.mark.parametrize("p", [0.95, 0.8])
+def test_npu_like_quantized_logits_keep_the_upstream_values(p: float) -> None:
+    """Coarse logits tie inside the top 20 on most NPU decode steps. The survivors' scores match upstream; which of
+    several equal logits survive at the cutoff follows token ids here and torch.sort's unstable order upstream."""
+    generator = torch.Generator().manual_seed(4)
+    top_k, top_p = TopKLogitsWarper(20), TopPLogitsWarper(p)
+    for _ in range(20):
+        scores = _quantized(generator)
+        assert _kept_values(_fused(top_k, top_p, scores)) == _kept_values(_upstream(top_k, top_p, scores))
+
+
+@pytest.mark.parametrize("p", [0.95, 0.8, 0.5])
+def test_ties_at_the_top_p_cutoff_keep_the_higher_token_ids(p: float) -> None:
+    """Surviving token ids match the upstream rule with ties broken by token id, including split tie groups."""
+    generator = torch.Generator().manual_seed(8)
+    top_k, top_p = TopKLogitsWarper(20), TopPLogitsWarper(p)
+    split_groups = 0
+    for _ in range(30):
+        scores = _quantized(generator)
+        expected = _upstream_with_index_ties(top_k, top_p, scores)
+        assert torch.equal(_fused(top_k, top_p, scores), expected)
+        for row, kept in zip(scores, expected):
+            cutoff = row[torch.isfinite(kept)].min()
+            split_groups += int(int((row == cutoff).sum()) > int((kept == cutoff).sum()))
+    assert split_groups > 0  # the case under test occurred
+
+
+def test_wide_tie_sets_use_the_same_tie_rule() -> None:
+    """A tie set wider than 4k at the top is processed over the whole vocabulary, still keeping higher ids."""
+    scores = torch.randn(2, 5000, generator=torch.Generator().manual_seed(11))
+    scores[:, 1000:1200] = scores.max() + 1.0  # 200 equal maxima: k=20 widens past 4k, top-p 0.5 splits them
+    top_k, top_p = TopKLogitsWarper(20), TopPLogitsWarper(0.5)
+    out = _fused(top_k, top_p, scores)
+    assert torch.equal(out, _upstream_with_index_ties(top_k, top_p, scores))
+    kept = torch.isfinite(out[0]).nonzero().flatten()
+    assert 0 < len(kept) < 200 and kept.min() > 1000 and kept.max() == 1199  # the higher ids of the tie group
+    drawn = MobilintTopKTopPSampler(top_k, top_p)(None, scores).argmax(dim=-1)
+    assert all(torch.isfinite(out[row, token]) for row, token in enumerate(drawn.tolist()))
+
+
+def test_sampler_support_follows_the_tie_rule() -> None:
+    generator = torch.Generator().manual_seed(9)
+    top_k, top_p = TopKLogitsWarper(20), TopPLogitsWarper(0.8)
+    sampler = MobilintTopKTopPSampler(top_k, top_p)
+    torch.manual_seed(10)
+    for _ in range(20):
+        scores = _quantized(generator, batch=1)
+        support = torch.isfinite(_upstream_with_index_ties(top_k, top_p, scores))[0]
+        drawn = {int(sampler(None, scores).argmax()) for _ in range(200)}
+        assert all(support[token] for token in drawn)
+
+
+def test_fewer_finite_entries_than_k_match_upstream() -> None:
+    scores = torch.full((1, 1000), -float("inf"))
+    scores[0, [3, 70, 500]] = torch.tensor([1.0, 2.0, 0.5])
+    top_k, top_p = TopKLogitsWarper(20), TopPLogitsWarper(0.95)
+    assert torch.equal(_fused(top_k, top_p, scores), _upstream(top_k, top_p, scores))
+
+
+def test_seeded_sampling_draws_the_same_tokens() -> None:
+    scores = torch.randn(1, VOCAB, generator=torch.Generator().manual_seed(2)) * 3
+    top_k, top_p = TopKLogitsWarper(20), TopPLogitsWarper(0.95)
+    draws = []
+    for warp in (_fused, _upstream):
+        torch.manual_seed(7)
+        probs = warp(top_k, top_p, scores).softmax(dim=-1)
+        draws.append(torch.multinomial(probs, 50, replacement=True))
+    assert torch.equal(draws[0], draws[1])
+
+
+def test_fuse_replaces_only_an_adjacent_exact_pair() -> None:
+    temperature, top_k, top_p, min_p = (
+        TemperatureLogitsWarper(0.7),
+        TopKLogitsWarper(20),
+        TopPLogitsWarper(0.9),
+        MinPLogitsWarper(0.05),
+    )
+    processors = fuse_top_k_top_p(LogitsProcessorList([temperature, top_k, top_p, min_p]))
+    assert [type(x) for x in processors] == [TemperatureLogitsWarper, MobilintTopKTopPLogitsWarper, MinPLogitsWarper]
+    assert processors[1].top_k_warper is top_k and processors[1].top_p_warper is top_p
+
+    assert list(fuse_top_k_top_p(LogitsProcessorList([top_p, top_k]))) == [top_p, top_k]
+    assert list(fuse_top_k_top_p(LogitsProcessorList([top_k, min_p, top_p]))) == [top_k, min_p, top_p]
+
+    class CustomTopP(TopPLogitsWarper):
+        pass
+
+    custom = CustomTopP(0.9)
+    assert list(fuse_top_k_top_p(LogitsProcessorList([top_k, custom]))) == [top_k, custom]
+
+
+class _Generator(MobilintGenerationMixin):
+    """Bare mixin instance; only ``_get_logits_processor`` is exercised."""
+
+
+def test_mixin_fuses_the_upstream_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    def upstream(self, *args, **kwargs):
+        return LogitsProcessorList([TemperatureLogitsWarper(0.6), TopKLogitsWarper(20), TopPLogitsWarper(0.95)])
+
+    monkeypatch.setattr(GenerationMixin, "_get_logits_processor", upstream)
+    monkeypatch.delenv("MBLT_FUSED_TOPK_TOPP", raising=False)
+    fused = _Generator()._get_logits_processor(None)
+    assert [type(x) for x in fused] == [TemperatureLogitsWarper, MobilintTopKTopPLogitsWarper]
+
+    monkeypatch.setenv("MBLT_FUSED_TOPK_TOPP", "0")
+    kept = _Generator()._get_logits_processor(None)
+    assert [type(x) for x in kept] == [TemperatureLogitsWarper, TopKLogitsWarper, TopPLogitsWarper]
+
+
+@pytest.mark.parametrize("quantized", [False, True])
+def test_sampler_draws_from_the_upstream_distribution(quantized: bool) -> None:
+    torch.manual_seed(5)
+    scores = torch.randn(1, VOCAB) * 3
+    if quantized:
+        scores = (scores * 4).round() / 4
+    scores = TemperatureLogitsWarper(0.6)(None, scores)
+    top_k, top_p = TopKLogitsWarper(20), TopPLogitsWarper(0.95)
+    # quantized logits split tie groups at the cutoff, where the token-id rule decides (see the tie tests)
+    expected = _upstream_with_index_ties(top_k, top_p, scores).softmax(dim=-1)[0]
+    sampler = MobilintTopKTopPSampler(top_k, top_p)
+    counts = torch.zeros(VOCAB)
+    draws = 6000
+    for _ in range(draws):
+        out = sampler(None, scores)
+        assert int(torch.isfinite(out).sum()) == 1
+        counts[out.argmax()] += 1
+    assert (counts[expected == 0] == 0).all()
+    assert 0.5 * (counts / draws - expected).abs().sum().item() < 0.03
+
+
+def test_sampler_falls_back_when_the_slice_would_be_too_wide() -> None:
+    scores = torch.full((2, 1000), -float("inf"))
+    scores[:, [3, 70, 500]] = torch.tensor([1.0, 2.0, 0.5])
+    out = MobilintTopKTopPSampler(TopKLogitsWarper(20), TopPLogitsWarper(0.95))(None, scores)
+    assert torch.isfinite(out).sum(dim=-1).tolist() == [1, 1]
+    assert set(out.argmax(dim=-1).tolist()) <= {3, 70, 500}
+
+
+def _fused_list() -> LogitsProcessorList:
+    return LogitsProcessorList(
+        [TemperatureLogitsWarper(0.6), MobilintTopKTopPLogitsWarper(TopKLogitsWarper(20), TopPLogitsWarper(0.95))]
+    )
+
+
+def test_sample_in_top_k_slice_swaps_only_when_safe() -> None:
+    config = GenerationConfig(do_sample=True, temperature=0.6, top_k=20, top_p=0.95)
+    processors = _fused_list()
+    swapped, greedy = sample_in_top_k_slice(processors, config)
+    assert type(swapped[-1]) is MobilintTopKTopPSampler and swapped[0] is processors[0]
+    assert swapped[-1].top_k_warper is processors[-1].top_k_warper
+    assert greedy.do_sample is False and config.do_sample is True  # the caller's config is untouched
+    assert type(processors[-1]) is MobilintTopKTopPLogitsWarper
+
+    assert sample_in_top_k_slice(processors, GenerationConfig(do_sample=False)) is None
+    assert sample_in_top_k_slice(LogitsProcessorList([*processors, MinPLogitsWarper(0.05)]), config) is None
+    assert sample_in_top_k_slice(LogitsProcessorList(), config) is None
+    finite_top_p = MobilintTopKTopPLogitsWarper(TopKLogitsWarper(20), TopPLogitsWarper(0.95, filter_value=-1.0))
+    assert sample_in_top_k_slice(LogitsProcessorList([finite_top_p]), config) is None
+    returns_scores = GenerationConfig(do_sample=True, top_k=20, return_dict_in_generate=True, output_scores=True)
+    assert sample_in_top_k_slice(processors, returns_scores) is None
+
+
+def test_mixin_sample_passes_the_swapped_processors(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen = {}
+
+    def upstream(self, input_ids, logits_processor, stopping_criteria, generation_config, *args, **kwargs):
+        seen.update(processors=logits_processor, config=generation_config, args=args, kwargs=kwargs)
+        return "result"
+
+    monkeypatch.setattr(GenerationMixin, "_sample", upstream)
+    monkeypatch.delenv("MBLT_FUSED_TOPK_TOPP", raising=False)
+    config = GenerationConfig(do_sample=True, temperature=0.6, top_k=20, top_p=0.95)
+    result = _Generator()._sample(
+        None, logits_processor=_fused_list(), stopping_criteria=None, generation_config=config, synced_gpus=False
+    )
+    assert result == "result" and seen["kwargs"] == {"synced_gpus": False}
+    assert type(seen["processors"][-1]) is MobilintTopKTopPSampler and seen["config"].do_sample is False
+
+    monkeypatch.setenv("MBLT_FUSED_TOPK_TOPP", "0")
+    processors = _fused_list()
+    _Generator()._sample(None, processors, None, config, False, None)
+    assert seen["processors"] is processors and seen["config"] is config and seen["args"] == (False, None)
