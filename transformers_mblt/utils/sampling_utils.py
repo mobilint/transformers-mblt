@@ -102,9 +102,10 @@ class MobilintTopKTopPSampler(MobilintTopKTopPLogitsWarper):
 def fuse_top_k_top_p(processors: LogitsProcessorList) -> LogitsProcessorList:
     """Replace each adjacent ``TopKLogitsWarper`` → ``TopPLogitsWarper`` pair with the fused warper.
 
-    Only the exact upstream classes are fused, and only when top-k filters to ``-inf`` (what ``generate`` builds).
-    A finite top-k filter value leaves probability on the entries outside the top-k slice, which the slice cannot
-    represent; subclasses, other orderings and such pairs are left alone.
+    Only the exact upstream classes are fused, and only in the shape ``generate`` builds: top-k filters to ``-inf``
+    and top-p keeps at most k entries by its ``min_tokens_to_keep``. A finite top-k filter value leaves probability
+    on the entries outside the top-k slice, and a larger top-p ``min_tokens_to_keep`` makes top-p keep entries that
+    top-k removed; the slice cannot represent either. Subclasses, other orderings and such pairs are left alone.
 
     Args:
         processors: The list built by ``GenerationMixin._get_logits_processor``; modified in place.
@@ -119,6 +120,7 @@ def fuse_top_k_top_p(processors: LogitsProcessorList) -> LogitsProcessorList:
             type(first) is TopKLogitsWarper
             and type(second) is TopPLogitsWarper
             and first.filter_value == -float("inf")
+            and second.min_tokens_to_keep <= first.top_k
         ):
             processors[i : i + 2] = [MobilintTopKTopPLogitsWarper(first, second)]
         i += 1

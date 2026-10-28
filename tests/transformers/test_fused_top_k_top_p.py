@@ -61,6 +61,19 @@ def test_finite_top_k_filter_value_is_not_fused() -> None:
     assert list(fuse_top_k_top_p(LogitsProcessorList([top_k, top_p]))) == [top_k, top_p]
 
 
+def test_top_p_keeping_more_than_k_entries_is_not_fused() -> None:
+    """Upstream top-p keeps entries top-k removed (left at -inf) when its min_tokens_to_keep exceeds k."""
+    scores = torch.randn(1, 1000, generator=torch.Generator().manual_seed(7))
+    top_k = TopKLogitsWarper(5)
+    top_p = TopPLogitsWarper(0.9, min_tokens_to_keep=10, filter_value=-1.0)
+    assert int(torch.isinf(_upstream(top_k, top_p, scores)).sum()) == 5  # the slice could not represent this
+    assert list(fuse_top_k_top_p(LogitsProcessorList([top_k, top_p]))) == [top_k, top_p]
+    # the shape generate builds: both warpers get the same min_tokens_to_keep, so top-k keeps at least as many
+    same = TopPLogitsWarper(0.9, min_tokens_to_keep=10, filter_value=-1.0)
+    fused = fuse_top_k_top_p(LogitsProcessorList([TopKLogitsWarper(5, min_tokens_to_keep=10), same]))
+    assert type(fused[0]) is MobilintTopKTopPLogitsWarper
+
+
 def test_tie_at_kth_value_keeps_every_tied_entry() -> None:
     scores = torch.randn(1, 1000, generator=torch.Generator().manual_seed(1))
     threshold = torch.topk(scores, 20).values[0, -1]

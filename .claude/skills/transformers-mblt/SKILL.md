@@ -100,7 +100,7 @@ description: >-
   `dev_no` (or explicit fully-qualified target strings) rather than retrying on the same
   target set.
 - `MobilintGenerationMixin` overrides `_get_logits_processor` to fuse an adjacent exact
-  `TopKLogitsWarper` → `TopPLogitsWarper` pair (top-k filter `-inf`) into `MobilintTopKTopPLogitsWarper`
+  `TopKLogitsWarper` → `TopPLogitsWarper` pair (top-k filter `-inf`, top-p `min_tokens_to_keep <= k`) into `MobilintTopKTopPLogitsWarper`
   (`utils/sampling_utils.py`), and `_sample` to swap a trailing fused warper for
   `MobilintTopKTopPSampler` with `do_sample=False` on a config copy, unless `output_scores` is
   returned or top-p filters to a finite value. Keep the processed scores HF-equivalent (ties at the k-th logit stay in the slice) and
