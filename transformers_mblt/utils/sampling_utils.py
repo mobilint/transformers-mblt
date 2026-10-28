@@ -102,7 +102,9 @@ class MobilintTopKTopPSampler(MobilintTopKTopPLogitsWarper):
 def fuse_top_k_top_p(processors: LogitsProcessorList) -> LogitsProcessorList:
     """Replace each adjacent ``TopKLogitsWarper`` → ``TopPLogitsWarper`` pair with the fused warper.
 
-    Only the exact upstream classes are fused; subclasses and any other ordering are left alone.
+    Only the exact upstream classes are fused, and only when top-k filters to ``-inf`` (what ``generate`` builds).
+    A finite top-k filter value leaves probability on the entries outside the top-k slice, which the slice cannot
+    represent; subclasses, other orderings and such pairs are left alone.
 
     Args:
         processors: The list built by ``GenerationMixin._get_logits_processor``; modified in place.
@@ -113,7 +115,11 @@ def fuse_top_k_top_p(processors: LogitsProcessorList) -> LogitsProcessorList:
     i = 0
     while i + 1 < len(processors):
         first, second = processors[i], processors[i + 1]
-        if type(first) is TopKLogitsWarper and type(second) is TopPLogitsWarper:
+        if (
+            type(first) is TopKLogitsWarper
+            and type(second) is TopPLogitsWarper
+            and first.filter_value == -float("inf")
+        ):
             processors[i : i + 2] = [MobilintTopKTopPLogitsWarper(first, second)]
         i += 1
     return processors
@@ -124,8 +130,9 @@ def sample_in_top_k_slice(
 ) -> Optional[tuple[LogitsProcessorList, GenerationConfig]]:
     """Move the draw into the fused warper when nothing after it needs the processed scores.
 
-    Applies when sampling, when ``MobilintTopKTopPLogitsWarper`` is the last processor, and when the processed
-    scores are not returned (``return_dict_in_generate`` with ``output_scores``).
+    Applies when sampling, when ``MobilintTopKTopPLogitsWarper`` is the last processor, when its top-p filters to
+    ``-inf`` (a finite filter value leaves probability on the filtered entries, which the slice draw would drop),
+    and when the processed scores are not returned (``return_dict_in_generate`` with ``output_scores``).
 
     Args:
         processors: The processor list ``_sample`` received.
@@ -137,9 +144,11 @@ def sample_in_top_k_slice(
     """
     if not generation_config.do_sample or not processors or type(processors[-1]) is not MobilintTopKTopPLogitsWarper:
         return None
+    fused = processors[-1]
+    if fused.top_p_warper.filter_value != -float("inf"):
+        return None
     if generation_config.return_dict_in_generate and generation_config.output_scores:
         return None
-    fused = processors[-1]
     swapped = LogitsProcessorList([*processors[:-1], MobilintTopKTopPSampler(fused.top_k_warper, fused.top_p_warper)])
     greedy = copy.copy(generation_config)
     greedy.do_sample = False

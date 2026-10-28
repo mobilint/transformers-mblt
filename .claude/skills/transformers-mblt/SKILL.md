@@ -100,10 +100,10 @@ description: >-
   `dev_no` (or explicit fully-qualified target strings) rather than retrying on the same
   target set.
 - `MobilintGenerationMixin` overrides `_get_logits_processor` to fuse an adjacent exact
-  `TopKLogitsWarper` → `TopPLogitsWarper` pair into `MobilintTopKTopPLogitsWarper`
+  `TopKLogitsWarper` → `TopPLogitsWarper` pair (top-k filter `-inf`) into `MobilintTopKTopPLogitsWarper`
   (`utils/sampling_utils.py`), and `_sample` to swap a trailing fused warper for
   `MobilintTopKTopPSampler` with `do_sample=False` on a config copy, unless `output_scores` is
-  returned. Keep the processed scores HF-equivalent (ties at the k-th logit stay in the slice) and
+  returned or top-p filters to a finite value. Keep the processed scores HF-equivalent (ties at the k-th logit stay in the slice) and
   the token distribution unchanged; `MBLT_FUSED_TOPK_TOPP=0` is the A/B switch.
 - Reuse shared NPU options and ``tests/npu_backend_options.py` builders` rather
   than introducing divergent hardware flags or engine keyword bundles.

@@ -46,11 +46,19 @@ def test_fused_scores_equal_upstream(k: int, p: float, min_keep: int, batch: int
         assert torch.equal(_fused(top_k, top_p, scores), _upstream(top_k, top_p, scores))
 
 
-def test_custom_filter_values_match_upstream() -> None:
+def test_finite_top_p_filter_value_matches_upstream() -> None:
     scores = torch.randn(2, 1000, generator=torch.Generator().manual_seed(0)) * 3
-    top_k = TopKLogitsWarper(10, filter_value=-1e4)
-    top_p = TopPLogitsWarper(0.7, filter_value=-2e4)
+    top_k, top_p = TopKLogitsWarper(10), TopPLogitsWarper(0.7, filter_value=-2e4)
     assert torch.equal(_fused(top_k, top_p, scores), _upstream(top_k, top_p, scores))
+
+
+def test_finite_top_k_filter_value_is_not_fused() -> None:
+    """A filter value that does not underflow in softmax leaves mass outside the top-k slice upstream."""
+    scores = torch.randn(1, VOCAB, generator=torch.Generator().manual_seed(6))
+    top_k, top_p = TopKLogitsWarper(20, filter_value=-1.0), TopPLogitsWarper(0.95)
+    upstream = _upstream(top_k, top_p, scores).softmax(dim=-1)
+    assert upstream.sort(descending=True).values[0, 20:].sum() > 0.5  # the slice could not represent this
+    assert list(fuse_top_k_top_p(LogitsProcessorList([top_k, top_p]))) == [top_k, top_p]
 
 
 def test_tie_at_kth_value_keeps_every_tied_entry() -> None:
@@ -192,6 +200,8 @@ def test_sample_in_top_k_slice_swaps_only_when_safe() -> None:
     assert sample_in_top_k_slice(processors, GenerationConfig(do_sample=False)) is None
     assert sample_in_top_k_slice(LogitsProcessorList([*processors, MinPLogitsWarper(0.05)]), config) is None
     assert sample_in_top_k_slice(LogitsProcessorList(), config) is None
+    finite_top_p = MobilintTopKTopPLogitsWarper(TopKLogitsWarper(20), TopPLogitsWarper(0.95, filter_value=-1.0))
+    assert sample_in_top_k_slice(LogitsProcessorList([finite_top_p]), config) is None
     returns_scores = GenerationConfig(do_sample=True, top_k=20, return_dict_in_generate=True, output_scores=True)
     assert sample_in_top_k_slice(processors, returns_scores) is None
 
