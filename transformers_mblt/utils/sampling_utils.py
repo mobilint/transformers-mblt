@@ -24,7 +24,8 @@ higher token ids survive. The number of survivors and their scores are the upstr
 equal-logit token ids receive the probability can differ. NPU logits are coarse, so this happens often (about a
 third of decode steps in a quantized-logit test at ``top_p=0.8``). Separately, the softmax sums over the slice
 rather than the vocabulary, so a cumulative probability within float rounding of ``1 - top_p`` can land on the
-other side, which can change the number of survivors by one. Tie sets wider than four times k (for example when an
+other side; that changes which entries survive at the cutoff, possibly several when equal small probabilities sit
+there. Tie sets wider than four times k (for example when an
 earlier processor left fewer than k finite entries) are processed over the whole vocabulary with the same token-id
 rule.
 
