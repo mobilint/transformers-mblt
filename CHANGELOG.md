@@ -9,8 +9,11 @@
   `MobilintTopKTopPLogitsWarper`, which returns the same processed scores without sorting the vocabulary, and, when
   that warper is the last processor and `output_scores` is not requested, draws the token on the slice
   (`MobilintTopKTopPSampler`) instead of running `torch.multinomial` over the whole vocabulary. Qwen3-0.6B on ARIES
-  decodes at 34.9 tok/s instead of 24.2 (greedy: 38.3). The token distribution is unchanged, but seeded runs draw
-  different tokens than before. `MBLT_FUSED_TOPK_TOPP=0` restores the upstream processors and draw.
+  decodes at 34.9 tok/s instead of 24.2 (greedy: 38.3). Seeded runs draw different tokens than before. When equal
+  logits straddle the top-p cutoff, higher token ids survive instead of the ones `torch.sort`'s unstable order left;
+  the number of survivors and their probabilities are unchanged. Hand-built warper pairs with a finite top-k filter
+  value, or a top-p `min_tokens_to_keep` above k, keep the upstream path. `MBLT_FUSED_TOPK_TOPP=0` restores the
+  upstream processors and draw.
 
 - Qwen3-ASR no longer needs the `qwen-asr` package. Its Transformers backend (configuration, processor and model
   classes from `qwen-asr` 0.0.6, Apache-2.0) is vendored under `transformers_mblt.models.qwen3_asr._upstream`, so

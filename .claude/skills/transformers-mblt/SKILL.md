@@ -103,8 +103,8 @@ description: >-
   `TopKLogitsWarper` → `TopPLogitsWarper` pair (top-k filter `-inf`, top-p `min_tokens_to_keep <= k`) into `MobilintTopKTopPLogitsWarper`
   (`utils/sampling_utils.py`), and `_sample` to swap a trailing fused warper for
   `MobilintTopKTopPSampler` with `do_sample=False` on a config copy, unless `output_scores` is
-  returned or top-p filters to a finite value. Keep the processed scores HF-equivalent (ties at the k-th logit stay in the slice) and
-  the token distribution unchanged; `MBLT_FUSED_TOPK_TOPP=0` is the A/B switch.
+  returned or top-p filters to a finite value. Keep the processed scores HF-equivalent (ties at the k-th logit stay in the slice; ties at the
+  top-p cutoff keep the higher token ids, since upstream's choice follows `torch.sort`'s unstable order); `MBLT_FUSED_TOPK_TOPP=0` is the A/B switch.
 - Reuse shared NPU options and ``tests/npu_backend_options.py` builders` rather
   than introducing divergent hardware flags or engine keyword bundles.
 - Treat `transformers_mblt/cli/tps_table.py` as the source of truth for TPS printed rows, JSON keys,

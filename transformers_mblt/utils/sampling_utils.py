@@ -6,20 +6,25 @@ vocabulary. Both full-vocabulary steps cost milliseconds per token on the host C
 (``TopPLogitsWarper`` sorts the vocabulary; ``multinomial`` draws one exponential per entry), while a 0.6B decode
 step on the NPU takes about 28 ms. Only the top-k entries can be sampled, so both steps are done on that slice:
 
-- ``MobilintTopKTopPLogitsWarper`` replaces the warper pair. It takes the top-k slice, runs the original
-  ``TopPLogitsWarper`` on it and scatters the result back, so the processed scores are the upstream ones.
+- ``MobilintTopKTopPLogitsWarper`` replaces the warper pair. It takes the top-k slice, applies the
+  ``TopPLogitsWarper`` rule to it (same formula, see below for ties) and scatters the result back.
 - ``MobilintTopKTopPSampler`` also draws the token on the slice and returns scores that are finite only at the
   drawn token. ``MobilintGenerationMixin._sample`` uses it, with ``do_sample=False`` on a copy of the generation
   config, when the fused warper is the last processor and the processed scores are not returned
-  (``output_scores``). The token comes from the same distribution; the random stream differs from upstream, so a
-  seeded run draws different tokens.
+  (``output_scores``). The random stream differs from upstream, so a seeded run draws different tokens.
 
 On the slice the softmax, the cumulative sum and the ``min_tokens_to_keep`` guard see the same finite values the
 full-vocabulary call would see. ``TopKLogitsWarper`` keeps every logit equal to the k-th value, and NPU logits tie
-there on most decode steps, so the slice is widened to hold those ties. Two things are not bit-for-bit: when equal
-logits straddle the top-p boundary, which of them survive depends on sort order (upstream too), and the softmax
-sums over the slice rather than the vocabulary, so a cumulative probability within float rounding of
-``1 - top_p`` can land on the other side.
+there on most decode steps, so the slice is widened to hold those ties.
+
+Ties at the top-p cutoff. When equal logits straddle the cutoff, top-p keeps only some of them. Upstream, which
+ones depends on ``torch.sort``'s unstable order over the whole vocabulary (on CPU it does not keep index order
+among equal values), so it cannot be reproduced without that sort. Here the rule is explicit: among equal logits,
+higher token ids survive. The number of survivors and their scores are the upstream ones; only which of the
+equal-logit token ids receive the probability can differ. NPU logits are coarse, so this happens often (about a
+third of decode steps in a quantized-logit test at ``top_p=0.8``). Separately, the softmax sums over the slice
+rather than the vocabulary, so a cumulative probability within float rounding of ``1 - top_p`` can land on the
+other side.
 
 Set ``MBLT_FUSED_TOPK_TOPP=0`` to keep the upstream processors and sampling (for A/B comparison).
 """
@@ -67,7 +72,23 @@ class MobilintTopKTopPLogitsWarper(LogitsProcessor):
         values, indices = torch.topk(scores, slice_size, dim=-1)
         # In a batch, rows with fewer ties got entries below their own threshold; top-k removes those upstream.
         values = values.masked_fill(values < threshold, self.top_k_warper.filter_value)
-        return self.top_p_warper(input_ids, values), indices
+        return self._top_p(values, indices), indices
+
+    def _top_p(self, values: torch.FloatTensor, indices: torch.LongTensor) -> torch.FloatTensor:
+        """``TopPLogitsWarper.__call__`` on the slice, breaking ties among equal logits by token id.
+
+        Index-ordering the slice and sorting it stably puts lower token ids first among equal values, so those are
+        the ones removed when the cutoff splits them (see the module docstring).
+        """
+        order = indices.argsort(dim=-1)
+        by_index = values.gather(-1, order)
+        sorted_logits, sorted_positions = torch.sort(by_index, descending=False, stable=True)
+        cumulative_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+        sorted_to_remove = cumulative_probs <= (1 - self.top_p_warper.top_p)
+        sorted_to_remove[..., -self.top_p_warper.min_tokens_to_keep :] = False
+        to_remove = sorted_to_remove.scatter(-1, sorted_positions, sorted_to_remove)
+        kept_by_index = by_index.masked_fill(to_remove, self.top_p_warper.filter_value)
+        return torch.empty_like(values).scatter_(-1, order, kept_by_index)
 
     def _upstream(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
         return self.top_p_warper(input_ids, self.top_k_warper(input_ids, scores))

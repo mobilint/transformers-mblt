@@ -523,9 +523,14 @@ step. The Mobilint generation classes do both on the top-k slice instead:
 - when that warper is the last processor and `output_scores` is not requested, the token is drawn on the slice
   (`MobilintTopKTopPSampler`) and the step selects it greedily.
 
-The token distribution is unchanged. The random stream is not, so a seeded run draws different tokens than upstream
-Transformers. Entries tied with the k-th logit stay in the slice, as `TopKLogitsWarper` keeps them; NPU logits have
-such ties on most steps. Qwen3-0.6B on ARIES (global8, 200 tokens) decodes at 34.9 tok/s this way, against 24.2
+Entries tied with the k-th logit stay in the slice, as `TopKLogitsWarper` keeps them; NPU logits have such ties on
+most steps. Two things differ from upstream Transformers:
+
+- When equal logits straddle the top-p cutoff, top-p keeps only some of them. Upstream, which ones depends on
+  `torch.sort`'s unstable order over the vocabulary; here higher token ids survive. The number of survivors and their
+  probabilities are the same; which of the equal-logit tokens get them can differ, which coarse NPU logits make
+  common.
+- The random stream differs, so a seeded run draws different tokens. Qwen3-0.6B on ARIES (global8, 200 tokens) decodes at 34.9 tok/s this way, against 24.2
 tok/s with the upstream processors and 38.3 tok/s greedy. Set `MBLT_FUSED_TOPK_TOPP=0` to use the upstream
 processors and draw. EAGLE-3 generation has its own sampling path and is unaffected.
 

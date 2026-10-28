@@ -99,15 +99,58 @@ def _kept_values(scores: torch.Tensor) -> list[list[float]]:
     return [sorted(row[torch.isfinite(row)].tolist()) for row in scores]
 
 
+def _upstream_with_index_ties(top_k: TopKLogitsWarper, top_p: TopPLogitsWarper, scores: torch.Tensor) -> torch.Tensor:
+    """The upstream warpers over the whole vocabulary, with a stable sort so equal logits break ties by token id."""
+    scores = top_k(None, scores.clone())
+    sorted_logits, sorted_indices = torch.sort(scores, descending=False, stable=True)
+    cumulative_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+    sorted_to_remove = cumulative_probs <= (1 - top_p.top_p)
+    sorted_to_remove[..., -top_p.min_tokens_to_keep :] = False
+    to_remove = sorted_to_remove.scatter(1, sorted_indices, sorted_to_remove)
+    return scores.masked_fill(to_remove, top_p.filter_value)
+
+
+def _quantized(generator: torch.Generator, batch: int = 2) -> torch.Tensor:
+    return TemperatureLogitsWarper(0.6)(None, (torch.randn(batch, VOCAB, generator=generator) * 16).round() / 4)
+
+
 @pytest.mark.parametrize("p", [0.95, 0.8])
-def test_npu_like_quantized_logits_keep_the_same_values(p: float) -> None:
-    """Coarse logits tie inside the top 20 on most NPU decode steps; which of several equal entries survives at the
-    top-p boundary is sort-order dependent upstream too, so the kept values are compared as a multiset."""
+def test_npu_like_quantized_logits_keep_the_upstream_values(p: float) -> None:
+    """Coarse logits tie inside the top 20 on most NPU decode steps. The survivors' scores match upstream; which of
+    several equal logits survive at the cutoff follows token ids here and torch.sort's unstable order upstream."""
     generator = torch.Generator().manual_seed(4)
     top_k, top_p = TopKLogitsWarper(20), TopPLogitsWarper(p)
     for _ in range(20):
-        scores = TemperatureLogitsWarper(0.6)(None, (torch.randn(2, VOCAB, generator=generator) * 4 * 4).round() / 4)
+        scores = _quantized(generator)
         assert _kept_values(_fused(top_k, top_p, scores)) == _kept_values(_upstream(top_k, top_p, scores))
+
+
+@pytest.mark.parametrize("p", [0.95, 0.8, 0.5])
+def test_ties_at_the_top_p_cutoff_keep_the_higher_token_ids(p: float) -> None:
+    """Surviving token ids match the upstream rule with ties broken by token id, including split tie groups."""
+    generator = torch.Generator().manual_seed(8)
+    top_k, top_p = TopKLogitsWarper(20), TopPLogitsWarper(p)
+    split_groups = 0
+    for _ in range(30):
+        scores = _quantized(generator)
+        expected = _upstream_with_index_ties(top_k, top_p, scores)
+        assert torch.equal(_fused(top_k, top_p, scores), expected)
+        for row, kept in zip(scores, expected):
+            cutoff = row[torch.isfinite(kept)].min()
+            split_groups += int(int((row == cutoff).sum()) > int((kept == cutoff).sum()))
+    assert split_groups > 0  # the case under test occurred
+
+
+def test_sampler_support_follows_the_tie_rule() -> None:
+    generator = torch.Generator().manual_seed(9)
+    top_k, top_p = TopKLogitsWarper(20), TopPLogitsWarper(0.8)
+    sampler = MobilintTopKTopPSampler(top_k, top_p)
+    torch.manual_seed(10)
+    for _ in range(20):
+        scores = _quantized(generator, batch=1)
+        support = torch.isfinite(_upstream_with_index_ties(top_k, top_p, scores))[0]
+        drawn = {int(sampler(None, scores).argmax()) for _ in range(200)}
+        assert all(support[token] for token in drawn)
 
 
 def test_fewer_finite_entries_than_k_match_upstream() -> None:
@@ -175,7 +218,8 @@ def test_sampler_draws_from_the_upstream_distribution(quantized: bool) -> None:
         scores = (scores * 4).round() / 4
     scores = TemperatureLogitsWarper(0.6)(None, scores)
     top_k, top_p = TopKLogitsWarper(20), TopPLogitsWarper(0.95)
-    expected = _upstream(top_k, top_p, scores).softmax(dim=-1)[0]
+    # quantized logits split tie groups at the cutoff, where the token-id rule decides (see the tie tests)
+    expected = _upstream_with_index_ties(top_k, top_p, scores).softmax(dim=-1)[0]
     sampler = MobilintTopKTopPSampler(top_k, top_p)
     counts = torch.zeros(VOCAB)
     draws = 6000
