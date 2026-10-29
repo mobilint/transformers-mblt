@@ -94,7 +94,7 @@ print(list_models("text-generation"))
 | Task | Architectures |
 | --- | --- |
 | `text-generation` | Llama, Qwen2, Qwen3, Qwen3-MoE, EXAONE 3.5, EXAONE 4.0, Cohere2, EAGLE-3 (Llama, Qwen2, Qwen3) |
-| `image-text-to-text` | Qwen2-VL, Qwen3-VL, Sarashina2.2-Vision (static 448), Aya Vision (SigLIP + Cohere2) |
+| `image-text-to-text` | Qwen2-VL, Qwen3-VL, Sarashina2.2-Vision, Aya Vision (SigLIP + Cohere2) |
 | `automatic-speech-recognition` | Whisper, Qwen3-ASR, LFM2-Audio |
 | `image-to-text` | BLIP |
 | `fill-mask` | BERT |

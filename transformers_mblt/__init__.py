@@ -13,19 +13,12 @@ if TYPE_CHECKING:
     from ._registry import register
     from .utils.api import list_models, list_tasks
 
-_SARASHINA_EXPORTS = (
-    "MobilintSarashina2VisionConfig",
-    "MobilintSarashina2VisionForCausalLM",
-    "MobilintSarashina2VisionProcessor",
-)
-__all__ = ["__version__", "list_models", "list_tasks", "models", "register", "utils", *_SARASHINA_EXPORTS]
+__all__ = ["__version__", "list_models", "list_tasks", "models", "register", "utils"]
 
 
 def __getattr__(name: str):
     import importlib
 
-    if name in _SARASHINA_EXPORTS:
-        return getattr(importlib.import_module(".models.sarashina2_vision", __name__), name)
     if name in {"list_models", "list_tasks"}:
         return getattr(importlib.import_module(".utils.api", __name__), name)
     if name == "register":

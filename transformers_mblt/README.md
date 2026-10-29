@@ -42,22 +42,6 @@ pip install -e .
   runtime, so keep the older-transformers path constrained to non-NPU comparisons (for example,
   loading `mobilint/EXAONE-3.5-*` original modeling code that broke on transformers 4.54+).
 
-## Sarashina2.2-Vision static release
-
-`MobilintSarashina2VisionConfig`, `MobilintSarashina2VisionForCausalLM`, and
-`MobilintSarashina2VisionProcessor` register `mobilint-sarashina2_vision` with the Auto classes.
-The processor resizes one image to 448×448 with PIL BICUBIC, creates the `[1,32,32]` grid,
-and expands `<|file|>` to 256 tokens. Video, multi-image prompts, padded/batched inputs,
-and beam search are not supported by this release.
-
-The package contains **pre-rotated** `model.embed_tokens.weight` in `model.safetensors`
-and the static vision/text MXQs. The compiled vision output head uses the same decoder
-rotation basis. No upstream GPU weights or separate rotation files are loaded, and the
-runtime does not rotate embeddings. `use_cache=True` is required; the compiled KV cache holds 4096 tokens.
-Set `npu_prefill_chunk_size` per generation call or persist `text_config.npu_prefill_chunk_size`
-(1–128). NPU placement uses the usual `vision_*`/`text_*` kwargs or nested configs:
-`mxq_path`, `core_mode`, `target_cores`, `target_clusters`, and `target_device`.
-
 ## Quick Start Guide
 
 **transformers-mblt** provides quantized models based on Transformers with the same interfaces. If the `transformers-mblt` package is installed, you can use auto classes from `transformers` such as `pipeline`, `AutoModel`, and `AutoTokenizer` with our models' ids. The following code snippet shows how to use the pre-trained model for inference with `pipeline`. Our models include proxy python codes to import needed config and model classes. When loading through these proxies, `trust_remote_code=True` must be passed to every `transformers` auto loader that touches the Hub (for example, `AutoTokenizer.from_pretrained(...)`, `AutoProcessor.from_pretrained(...)`, `AutoModel.from_pretrained(...)`, and `pipeline(...)`).
