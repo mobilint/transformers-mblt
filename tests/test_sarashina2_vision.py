@@ -1,4 +1,7 @@
 """Hardware-free contracts for the embedding-only static Sarashina runtime."""
+import builtins
+import runpy
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -322,6 +325,68 @@ def test_explicit_single_beam_overrides_default_config(monkeypatch):
     generate = Mock(return_value="generated")
     monkeypatch.setattr(MobilintGenerationMixin, "generate", generate)
     assert model.generate(generation_config=None, num_beams=1) == "generated"
+
+
+def _proxy_path():
+    return Path(__file__).resolve().parents[1] / (
+        "transformers_mblt/models/sarashina2_vision/proxy_sarashina2_vision.py"
+    )
+
+
+@pytest.mark.parametrize("missing", [
+    "transformers_mblt", "transformers_mblt.models", "transformers_mblt.models.sarashina2_vision",
+])
+def test_proxy_falls_back_when_standalone_lacks_architecture(monkeypatch, missing):
+    real_import = builtins.__import__
+    legacy = SimpleNamespace(MobilintSarashina2VisionConfig=object(),
+                             MobilintSarashina2VisionForCausalLM=object(),
+                             MobilintSarashina2VisionProcessor=object())
+
+    def fake_import(name, *args, **kwargs):
+        if name == "transformers_mblt.models.sarashina2_vision":
+            raise ModuleNotFoundError("old standalone package", name=missing)
+        if name == "mblt_model_zoo.hf_transformers.models.sarashina2_vision":
+            return legacy
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    exports = runpy.run_path(str(_proxy_path()))
+    for name in exports["__all__"]:
+        assert exports[name] is getattr(legacy, name)
+
+
+@pytest.mark.parametrize("legacy_error", [False, True])
+@pytest.mark.parametrize("missing", ["mblt_npu", "transformers_mblt.utils.missing_helper"])
+def test_proxy_preserves_unrelated_import_errors(monkeypatch, legacy_error, missing):
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "transformers_mblt.models.sarashina2_vision":
+            if legacy_error:
+                raise ModuleNotFoundError("missing architecture", name=name)
+            raise ModuleNotFoundError("missing dependency", name=missing)
+        if name == "mblt_model_zoo.hf_transformers.models.sarashina2_vision":
+            raise ModuleNotFoundError("missing legacy dependency", name=missing)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    with pytest.raises(ModuleNotFoundError) as caught:
+        runpy.run_path(str(_proxy_path()))
+    assert caught.value.name == missing
+
+
+def test_proxy_gives_install_hint_when_both_architectures_missing(monkeypatch):
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name in {"transformers_mblt.models.sarashina2_vision",
+                    "mblt_model_zoo.hf_transformers.models.sarashina2_vision"}:
+            raise ModuleNotFoundError("missing architecture", name=name)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    with pytest.raises(ImportError, match="requires a transformers-mblt"):
+        runpy.run_path(str(_proxy_path()))
 
 
 def test_no_cache_is_rejected():

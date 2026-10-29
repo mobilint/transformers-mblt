@@ -6,7 +6,8 @@ try:
         MobilintSarashina2VisionProcessor,
     )
 except ModuleNotFoundError as exc:
-    if exc.name != "transformers_mblt":
+    if exc.name not in {"transformers_mblt", "transformers_mblt.models",
+                        "transformers_mblt.models.sarashina2_vision"}:
         raise
     try:
         from mblt_model_zoo.hf_transformers.models.sarashina2_vision import (
@@ -16,6 +17,7 @@ except ModuleNotFoundError as exc:
         )
     except ModuleNotFoundError as legacy_exc:
         if legacy_exc.name not in {"mblt_model_zoo", "mblt_model_zoo.hf_transformers",
+                                   "mblt_model_zoo.hf_transformers.models",
                                    "mblt_model_zoo.hf_transformers.models.sarashina2_vision"}:
             raise
         raise ImportError("Sarashina2-Vision requires a transformers-mblt release with Sarashina support. "
