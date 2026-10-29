@@ -8,6 +8,10 @@ from pathlib import Path
 
 import pytest
 
+from tests.transformers.transformers_compat import skip_if_transformers_older_than
+
+skip_if_transformers_older_than("4.57.0", "Qwen3-ASR requires transformers>=4.57.0.")
+
 MODEL_ID = "mobilint/Qwen3-ASR-1.7B"
 
 

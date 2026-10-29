@@ -49,3 +49,9 @@ def skip_if_transformers_version(version: str, reason: str) -> None:
     """Skip the current module when the installed Transformers version matches exactly."""
     if is_transformers_version(version):
         pytest.skip(reason, allow_module_level=True)
+
+
+def skip_if_transformers_older_than(version: str, reason: str) -> None:
+    """Skip the current module when the installed Transformers version is older than ``version``."""
+    if installed_transformers_version() < _parse_version(version):
+        pytest.skip(reason, allow_module_level=True)

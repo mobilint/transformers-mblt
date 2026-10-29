@@ -3,6 +3,9 @@ from transformers import pipeline
 
 from tests.asr_samples import load_librispeech_dummy
 from tests.pipe_teardown import pipe_fixture
+from tests.transformers.transformers_compat import skip_if_transformers_older_than
+
+skip_if_transformers_older_than("4.57.0", "Qwen3-ASR requires transformers>=4.57.0.")
 
 MODEL_PATHS = ("mobilint/Qwen3-ASR-1.7B",)
 
