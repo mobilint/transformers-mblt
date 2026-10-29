@@ -53,17 +53,27 @@ class MobilintSarashina2VisionForCausalLM(PretrainedOnlyMixin, MobilintGeneratio
     base_model_prefix = "model"
     input_modalities = ("image", "text")
 
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
+        kwargs["_requested_revision"] = kwargs.get("revision")
+        return super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
+
     def __init__(self, config, *args, **kwargs):
+        requested_revision = kwargs.pop("_requested_revision", None)
         no_launch = kwargs.pop("no_launch", False)
         super().__init__(config, *args, **kwargs)
         if config.text_config.max_batch_size != 1 or config.vision_config.max_batch_size != 1:
             raise ValueError("The static Sarashina release supports batch size 1 only.")
-        config.text_config.revision = getattr(config, "revision", None)
-        config.text_config._commit_hash = getattr(config, "_commit_hash", None)
+        revision = requested_revision or getattr(config, "_commit_hash", None) or getattr(config, "revision", None)
+        for component in (config.text_config, config.vision_config):
+            component.revision = revision
+            component._commit_hash = getattr(config, "_commit_hash", None)
+            component.npu_backend.revision = revision
+            component.npu_backend._commit_hash = component._commit_hash
         self.model = _SarashinaDecoder(config.text_config, _internal_call=True, no_launch=True)
         self.vision_backend = config.vision_config.npu_backend
         self.vision_backend.name_or_path = config.name_or_path
-        self.vision_backend.revision = getattr(config, "revision", None)
+        self.vision_backend.revision = revision
         self.vision_backend._commit_hash = getattr(config, "_commit_hash", None)
         try:
             self.vision_backend.create()

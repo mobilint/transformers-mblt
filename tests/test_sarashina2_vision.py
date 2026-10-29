@@ -77,9 +77,30 @@ def test_selected_revision_reaches_both_backends_before_creation(monkeypatch):
     monkeypatch.setattr(MobilintNPUBackend, "create", lambda self: created.append(
         (self.name_or_path, self.revision, self._commit_hash)))
     model = MobilintSarashina2VisionForCausalLM(config, no_launch=True, _internal_call=True)
-    assert created == [(config.name_or_path, "W8", "selected-commit")] * 2
+    assert created == [(config.name_or_path, "selected-commit", "selected-commit")] * 2
     assert model.language_model is model.model
     assert set(model.state_dict()) == {"model.embed_tokens.weight"}
+
+
+@pytest.mark.parametrize("revision", ["W8", "W4V8"])
+def test_from_pretrained_applies_requested_revision_before_backend_creation(tmp_path, monkeypatch, revision):
+    from safetensors.torch import save_file
+
+    from transformers_mblt._npu import MobilintNPUBackend
+
+    config = small_config()
+    config.revision = "stale-config-ref"
+    config.text_config.npu_backend.revision = "stale-text-ref"
+    config.vision_config.npu_backend.revision = "stale-vision-ref"
+    config.save_pretrained(tmp_path)
+    save_file({"model.embed_tokens.weight": torch.zeros(16, 4)}, tmp_path / "model.safetensors")
+    created = []
+    monkeypatch.setattr(MobilintNPUBackend, "create", lambda self: created.append(self.revision))
+    model = MobilintSarashina2VisionForCausalLM.from_pretrained(
+        tmp_path, revision=revision, local_files_only=True, no_launch=True)
+    assert created == [revision, revision]
+    assert model.model.npu_backend.revision == revision
+    assert model.vision_backend.revision == revision
 
 
 def test_tps_discovers_decoder_and_collects_npu_timing():
