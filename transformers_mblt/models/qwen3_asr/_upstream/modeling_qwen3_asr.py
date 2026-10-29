@@ -38,7 +38,19 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import auto_docstring, can_return_tuple
 from transformers.utils.deprecation import deprecate_kwarg
-from transformers.utils.generic import TransformersKwargs, check_model_inputs
+from transformers.utils.generic import TransformersKwargs
+
+try:
+    from transformers.utils.generic import merge_with_config_defaults
+    from transformers.utils.output_capturing import capture_outputs
+except ImportError:  # Mobilint: transformers < 5.2 still has the combined decorator
+    from transformers.utils.generic import check_model_inputs
+else:
+
+    def check_model_inputs(func):
+        """Mobilint: transformers 5.2 split check_model_inputs into these two decorators and removed it; later
+        releases bring it back only as a deprecated alias of merge_with_config_defaults, without capture_outputs."""
+        return merge_with_config_defaults(capture_outputs(func))
 
 from .configuration_qwen3_asr import (
     Qwen3ASRAudioEncoderConfig,
