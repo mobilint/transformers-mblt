@@ -58,6 +58,8 @@ class MobilintSarashina2VisionForCausalLM(PretrainedOnlyMixin, MobilintGeneratio
         super().__init__(config, *args, **kwargs)
         if config.text_config.max_batch_size != 1 or config.vision_config.max_batch_size != 1:
             raise ValueError("The static Sarashina release supports batch size 1 only.")
+        config.text_config.revision = getattr(config, "revision", None)
+        config.text_config._commit_hash = getattr(config, "_commit_hash", None)
         self.model = _SarashinaDecoder(config.text_config, _internal_call=True, no_launch=True)
         self.vision_backend = config.vision_config.npu_backend
         self.vision_backend.name_or_path = config.name_or_path
@@ -70,6 +72,10 @@ class MobilintSarashina2VisionForCausalLM(PretrainedOnlyMixin, MobilintGeneratio
         except Exception:
             self.dispose()
             raise
+
+    @property
+    def language_model(self):
+        return self.model
 
     def get_input_embeddings(self):
         return self.model.get_input_embeddings()
