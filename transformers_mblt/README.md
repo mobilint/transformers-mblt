@@ -201,9 +201,10 @@ for older artifacts and callers:
 
 - `is_dynamic=True` (dynamic-vision release): variable-resolution vision + per-image 2D RoPE
   in the text decoder. Supports single-image, per-prompt multi-image, and video inputs.
-- `is_dynamic=False` (static-vision release): fixed vision-token count baked into the text
-  decoder. Supports one image per prompt only. Batched single-image prompts (`[[img_1], [img_2], ...]`)
-  are always allowed; video and per-prompt multi-image inputs are rejected.
+- `is_dynamic=False` (static-vision release): the text decoder has a baked M-RoPE layout.
+  Each prompt must put its image at the position used when compiling that MXQ, including in batched
+  prompts (`[[img_1], [img_2], ...]`). The processor does not verify this position against the MXQ;
+  a different layout can produce incorrect results. Video and per-prompt multi-image inputs are rejected.
 
 `AutoProcessor.from_pretrained` reads `config.is_dynamic` from the shipped `config.json` and
 mirrors it onto `MobilintQwen3VLProcessor` and its video processor. Older configs that only carry

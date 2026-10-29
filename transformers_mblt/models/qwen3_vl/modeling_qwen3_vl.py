@@ -1740,8 +1740,9 @@ class MobilintQwen3VLTextModel(MobilintModelMixin, MobilintGenerationMixin, Mobi
         static counterparts without the rope input: bundled ``[inputs,
         deepstack]`` and split ``[inputs, deepstack_0, deepstack_1,
         deepstack_2]``. A static MXQ bakes the M-RoPE table of its compiled
-        prompt layout into the graph and indexes it by each row's cache
-        position, as the non-batch static path does. For a dynamic MXQ the
+        prompt layout into the graph. Each prompt must match that layout;
+        this forward cannot verify the baked image position from the MXQ.
+        For a dynamic MXQ the
         caller supplies a shared ``position_embeddings`` array of shape
         ``(batch, seq_len, peSize)`` pre-computed once in :meth:`forward`;
         per-item rope rows are sliced the same way as deepstack and packed in
