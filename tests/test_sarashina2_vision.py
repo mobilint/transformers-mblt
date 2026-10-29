@@ -144,6 +144,33 @@ def test_pre_rotated_text_and_vision_embeddings_reach_decoder_unchanged():
     assert "_spin_r1" not in model.state_dict()
 
 
+@pytest.mark.parametrize("ids", [[[14]], [[2, 14, 3]]])
+def test_forward_rejects_image_placeholders_without_pixels(ids):
+    model = MobilintSarashina2VisionForCausalLM.__new__(MobilintSarashina2VisionForCausalLM)
+    torch.nn.Module.__init__(model)
+    model.config = small_config()
+    decoder = Mock()
+    model.model = decoder
+    with pytest.raises(ValueError, match="placeholder tokens require pixel_values"):
+        model(input_ids=torch.tensor(ids))
+    decoder.get_input_embeddings.assert_not_called()
+    decoder.assert_not_called()
+
+
+def test_forward_accepts_text_only_without_pixels():
+    model = MobilintSarashina2VisionForCausalLM.__new__(MobilintSarashina2VisionForCausalLM)
+    torch.nn.Module.__init__(model)
+    model.config = small_config()
+    embedding = torch.nn.Embedding(16, 4)
+    decoder = Mock()
+    decoder.get_input_embeddings.return_value = embedding
+    decoder.return_value = "decoded"
+    model.model = decoder
+    ids = torch.tensor([[2, 3]])
+    assert model(input_ids=ids) == "decoded"
+    torch.testing.assert_close(decoder.call_args.kwargs["inputs_embeds"], embedding(ids))
+
+
 @pytest.mark.parametrize("num_beams", [None, 1])
 def test_generate_accepts_unset_or_single_beam(monkeypatch, num_beams):
     model = MobilintSarashina2VisionForCausalLM.__new__(MobilintSarashina2VisionForCausalLM)

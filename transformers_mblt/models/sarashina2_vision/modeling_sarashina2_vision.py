@@ -112,6 +112,9 @@ class MobilintSarashina2VisionForCausalLM(PretrainedOnlyMixin, MobilintGeneratio
             raise ValueError("Static Sarashina supports batch size 1 only.")
         if attention_mask is not None and not bool(torch.all(attention_mask == 1)):
             raise ValueError("Static Sarashina does not support padded attention masks.")
+        if (pixel_values is None and input_ids is not None
+                and bool(torch.any(input_ids == self.config.image_token_index))):
+            raise ValueError("Image placeholder tokens require pixel_values.")
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
         if inputs_embeds.shape[0] != 1:
