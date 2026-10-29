@@ -1135,10 +1135,12 @@ class MobilintQwen3VLTextModel(MobilintModelMixin, MobilintGenerationMixin, Mobi
         #     - 5-input ``[inputs_embeds, deepstack_0, deepstack_1,
         #       deepstack_2, rope]`` — split/dynamic.
         #   * Batch (``max_batch_size > 1``, e.g. the Batch16 W8 build):
-        #     bundled 3-input ``[inputs_embeds, rope, deepstack]`` or split
-        #     5-input ``[inputs_embeds, deepstack_0, deepstack_1,
-        #     deepstack_2, rope]``. Both dynamic layouts are supported by
-        #     ``_llm_forward_batch_deepstack``.
+        #     dynamic bundled 3-input ``[inputs_embeds, rope, deepstack]`` or
+        #     split 5-input ``[inputs_embeds, deepstack_0, deepstack_1,
+        #     deepstack_2, rope]``; static (MRoPE baked in) bundled 2-input
+        #     ``[inputs_embeds, deepstack]`` or split 4-input
+        #     ``[inputs_embeds, deepstack_0, deepstack_1, deepstack_2]``. All
+        #     four are supported by ``_llm_forward_batch_deepstack``.
         # The 3-input orders differ between non-batch and batch builds; the
         # compiled signatures are independent and each dispatch honors its own
         # layout. We trust the compiled MXQ over any config attr for the input
@@ -1199,14 +1201,9 @@ class MobilintQwen3VLTextModel(MobilintModelMixin, MobilintGenerationMixin, Mobi
                 "``_SPLIT_MXQ_INPUT_COUNTS``, and ``_ROPE_MXQ_INPUT_COUNTS`` when "
                 "a variant with a different DeepStack layer count ships."
             )
+        del max_batch_size  # Every layout runs both non-batch and batched.
         uses_split = num_mxq_inputs in cls._SPLIT_MXQ_INPUT_COUNTS
         uses_rope = num_mxq_inputs in cls._ROPE_MXQ_INPUT_COUNTS
-        if uses_split and max_batch_size > 1 and not uses_rope:
-            raise ValueError(
-                "Qwen3-VL split-static text MXQ (per-layer inputs without rope) is "
-                "only supported for max_batch_size == 1; batched Qwen3-VL text "
-                "inference requires a dynamic split or bundled MXQ with a rope input."
-            )
         return uses_split, uses_rope
 
     def _get_num_mxq_inputs(self) -> int:
@@ -1738,20 +1735,24 @@ class MobilintQwen3VLTextModel(MobilintModelMixin, MobilintGenerationMixin, Mobi
         (they are only needed by the single-batch decode replay path).
 
         The batched path supports bundled dynamic MXQs with
-        ``[inputs, rope, deepstack]`` and split dynamic MXQs with
-        ``[inputs, deepstack_0, deepstack_1, deepstack_2, rope]``. The caller
-        supplies a shared ``position_embeddings`` array of shape
+        ``[inputs, rope, deepstack]``, split dynamic MXQs with
+        ``[inputs, deepstack_0, deepstack_1, deepstack_2, rope]``, and their
+        static counterparts without the rope input: bundled ``[inputs,
+        deepstack]`` and split ``[inputs, deepstack_0, deepstack_1,
+        deepstack_2]``. A static MXQ bakes the M-RoPE table of its compiled
+        prompt layout into the graph and indexes it by each row's cache
+        position, as the non-batch static path does. For a dynamic MXQ the
+        caller supplies a shared ``position_embeddings`` array of shape
         ``(batch, seq_len, peSize)`` pre-computed once in :meth:`forward`;
         per-item rope rows are sliced the same way as deepstack and packed in
         the order required by the compiled signature.
         """
         del cache_position  # Batched path uses `update_seen_tokens` bookkeeping.
 
-        if not self._uses_rope_input:
-            raise ValueError("Batched Qwen3-VL text inference requires a dynamic text MXQ with a rope input.")
-        assert position_embeddings is not None, (
-            "position_embeddings must be provided for the 3-input Qwen3-VL text MXQ."
-        )
+        if self._uses_rope_input:
+            assert position_embeddings is not None, (
+                "position_embeddings must be provided for a Qwen3-VL text MXQ with a rope input."
+            )
 
         resolved_npu_prefill_chunk_size = self.resolve_npu_prefill_chunk_size(npu_prefill_chunk_size)
 
@@ -1761,10 +1762,14 @@ class MobilintQwen3VLTextModel(MobilintModelMixin, MobilintGenerationMixin, Mobi
             visual_pos_masks=visual_pos_masks,
             deepstack_visual_embeds=deepstack_visual_embeds,
         )
-        rope_by_item = self._build_batched_rope_arrays(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            position_embeddings=position_embeddings,
+        rope_by_item = (
+            self._build_batched_rope_arrays(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                position_embeddings=position_embeddings,
+            )
+            if self._uses_rope_input
+            else None
         )
 
         def _pack_deepstack_extras(
@@ -1778,7 +1783,8 @@ class MobilintQwen3VLTextModel(MobilintModelMixin, MobilintGenerationMixin, Mobi
             # helper uses for ``inputs_embeds_masked`` and concatenate along
             # the token axis. Keep the compiled input order: bundled builds
             # take ``[rope, deepstack]`` while split builds take one tensor per
-            # DeepStack layer followed by ``rope``.
+            # DeepStack layer followed by ``rope``; static builds take the
+            # same DeepStack inputs without ``rope``.
             rope_chunks: list[np.ndarray] = []
             deepstack_chunks_by_layer: list[list[torch.Tensor]] = [
                 [] for _ in range(self.num_deepstack_layers)
@@ -1786,22 +1792,25 @@ class MobilintQwen3VLTextModel(MobilintModelMixin, MobilintGenerationMixin, Mobi
             for k, cache_id in enumerate(cache_ids):
                 length = sequence_lengths_chunks[k]
                 end = chunk_start + length
-                rope_chunks.append(rope_by_item[cache_id][chunk_start:end, :])
+                if rope_by_item is not None:
+                    rope_chunks.append(rope_by_item[cache_id][chunk_start:end, :])
                 deepstack_item = deepstack_by_item[cache_id][:, chunk_start:end, :]
                 for layer_idx in range(self.num_deepstack_layers):
                     deepstack_chunks_by_layer[layer_idx].append(deepstack_item[layer_idx : layer_idx + 1])
-            rope_concat = np.concatenate(rope_chunks, axis=0)[np.newaxis, :, :]
-            rope_array = rope_concat.astype(np.float32, copy=False)
+            rope_arrays: list[np.ndarray] = []
+            if rope_chunks:
+                rope_concat = np.concatenate(rope_chunks, axis=0)[np.newaxis, :, :]
+                rope_arrays.append(rope_concat.astype(np.float32, copy=False))
             if self._uses_split_deepstack_input:
                 deepstack_arrays = [
                     torch.cat(layer_chunks, dim=1).to(dtype=torch.float32).cpu().numpy()
                     for layer_chunks in deepstack_chunks_by_layer
                 ]
-                return [*deepstack_arrays, rope_array]
+                return [*deepstack_arrays, *rope_arrays]
             deepstack_concat = torch.cat(
                 [torch.cat(layer_chunks, dim=1) for layer_chunks in deepstack_chunks_by_layer], dim=0
             )
-            return [rope_array, deepstack_concat.to(dtype=torch.float32).cpu().numpy()]
+            return [*rope_arrays, deepstack_concat.to(dtype=torch.float32).cpu().numpy()]
 
         return self._llm_forward_batch(
             inputs_embeds,
