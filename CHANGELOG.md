@@ -37,6 +37,12 @@
   empty alias so existing install commands keep working. The original-model GPU baseline of the ASR benchmark and
   the native `Qwen3ASRModel.transcribe` test still use the `qwen-asr` distribution when it is installed.
 
+### Fixed
+
+- `protobuf` is now a dependency. On Transformers 4.x the Sarashina2.2-Vision tokenizer (`LlamaTokenizer` with
+  `add_prefix_space` set) is rebuilt from `tokenizer.model`, which needs both `sentencepiece` and `protobuf`; without
+  `protobuf`, `AutoTokenizer.from_pretrained("mobilint/sarashina2.2-vision-3b")` raised an `ImportError`.
+
 ## 0.6.1
 
 ### Added

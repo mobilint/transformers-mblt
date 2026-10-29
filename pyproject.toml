@@ -21,6 +21,7 @@ dependencies = [
     "numpy>=1.26.0",
     "huggingface-hub",
     "sentencepiece",
+    "protobuf",
     "pillow>=11.1.0",
     "opencv-python>=4.11.0.86",
     "packaging",
