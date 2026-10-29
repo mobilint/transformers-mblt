@@ -5,11 +5,19 @@ from PIL import Image
 from transformers import AutoProcessor, AutoTokenizer
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_transforms import to_pil_image
-from transformers.image_utils import make_flat_list_of_images
+from transformers.image_utils import load_image, make_flat_list_of_images
 from transformers.models.qwen2_vl.image_processing_qwen2_vl import Qwen2VLImageProcessor
 from transformers.processing_utils import ProcessingKwargs, ProcessorMixin
 
 from .configuration_sarashina2_vision import MobilintSarashina2VisionConfig
+
+
+def _load_image_references(images):
+    if isinstance(images, (list, tuple)):
+        return [_load_image_references(image) for image in images]
+    if isinstance(images, (str, Path)):
+        return load_image(str(images))
+    return images
 
 
 class _SarashinaProcessorKwargs(ProcessingKwargs, total=False):
@@ -63,7 +71,7 @@ class MobilintSarashina2VisionProcessor(ProcessorMixin):
         image_inputs = {}
         placeholders = texts[0].count(self.image_token)
         if images is not None:
-            images = make_flat_list_of_images(images)
+            images = make_flat_list_of_images(_load_image_references(images))
             if len(images) != 1 or placeholders != 1:
                 raise ValueError("Static Sarashina requires one image and one <|file|> placeholder per prompt.")
             image = images[0]

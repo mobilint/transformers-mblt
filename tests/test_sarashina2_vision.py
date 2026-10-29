@@ -99,6 +99,31 @@ def test_processor_rejects_unsupported_inputs(processor, kwargs, error):
         processor(**kwargs)
 
 
+@pytest.mark.parametrize("form", ["str", "path", "list", "tuple", "nested"])
+def test_processor_loads_local_image_references(tmp_path, processor, form):
+    image = Image.new("RGB", (700, 200), (23, 71, 119))
+    path = tmp_path / "image.png"
+    image.save(path)
+    images = {"str": str(path), "path": path, "list": [str(path)],
+              "tuple": (path,), "nested": [[str(path)]]}[form]
+    actual = processor(images=images, text="<|file|>hello", return_tensors="pt")
+    expected = processor(images=image, text="<|file|>hello", return_tensors="pt")
+    torch.testing.assert_close(actual.pixel_values, expected.pixel_values)
+    torch.testing.assert_close(actual.input_ids, expected.input_ids)
+    assert actual.image_grid_thw.tolist() == [[1, 32, 32]]
+
+
+def test_processor_loads_image_urls_without_test_network(processor, monkeypatch):
+    import transformers_mblt.models.sarashina2_vision.processing_sarashina2_vision as processing
+
+    load = Mock(return_value=Image.new("RGB", (700, 200)))
+    monkeypatch.setattr(processing, "load_image", load)
+    url = "https://example.com/image.png"
+    result = processor(images=[url], text="<|file|>hello", return_tensors="pt")
+    load.assert_called_once_with(url)
+    assert result.pixel_values.shape == (1024, 1176)
+
+
 def test_processor_output_connects_to_model_image_features(processor):
     batch = processor(images=[Image.new("RGB", (700, 200))], text="<|file|>hello", return_tensors="pt")
     model = MobilintSarashina2VisionForCausalLM.__new__(MobilintSarashina2VisionForCausalLM)
