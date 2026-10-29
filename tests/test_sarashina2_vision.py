@@ -66,6 +66,45 @@ def test_from_pretrained_loads_only_packaged_embedding_weights(tmp_path, monkeyp
     assert not info["unexpected_keys"]
 
 
+def test_selected_revision_reaches_both_backends_before_creation(monkeypatch):
+    from transformers_mblt._npu import MobilintNPUBackend
+
+    config = small_config()
+    config.name_or_path = "mobilint/sarashina2.2-vision-3b"
+    config.revision = "W8"
+    config._commit_hash = "selected-commit"
+    created = []
+    monkeypatch.setattr(MobilintNPUBackend, "create", lambda self: created.append(
+        (self.name_or_path, self.revision, self._commit_hash)))
+    model = MobilintSarashina2VisionForCausalLM(config, no_launch=True, _internal_call=True)
+    assert created == [(config.name_or_path, "W8", "selected-commit")] * 2
+    assert model.language_model is model.model
+    assert set(model.state_dict()) == {"model.embed_tokens.weight"}
+
+
+def test_tps_discovers_decoder_and_collects_npu_timing():
+    from transformers_mblt.utils.benchmark_utils import (
+        _get_npu_timing_target,
+        _is_mobilint_npu_model,
+        _read_aggregate_npu_timing,
+        _reset_npu_timing,
+    )
+
+    model = MobilintSarashina2VisionForCausalLM.__new__(MobilintSarashina2VisionForCausalLM)
+    torch.nn.Module.__init__(model)
+    decoder = _SarashinaDecoder.__new__(_SarashinaDecoder)
+    torch.nn.Module.__init__(decoder)
+    decoder.npu_backend = SimpleNamespace()
+    model.model = decoder
+    assert _is_mobilint_npu_model(model)
+    target = _get_npu_timing_target(model)
+    assert target is decoder
+    _reset_npu_timing(target)
+    decoder._record_npu_timing("prefill", 0.25)
+    decoder._record_npu_timing("decode", 0.125)
+    assert _read_aggregate_npu_timing(target) == (True, 0.25, 0.125)
+
+
 @pytest.fixture
 def processor():
     vocab = {"[UNK]": 0, "hello": 2, "<|file|>": 14}
