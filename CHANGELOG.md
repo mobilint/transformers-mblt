@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Added
+
+- Static Sarashina2.2-Vision NPU config/model/processor and Hub proxy, with embedding-only
+  loading of pre-rotated embeddings, BICUBIC 448 preprocessing, a matching compiled vision head, keyword `cache_size`
+  inference, 128-token maximum chunks and a 4096-token KV cache.
+
 ### Changed
 
 - Sampling with both `top_k` and `top_p` (the Qwen3 default) now runs on the top-k slice instead of the whole

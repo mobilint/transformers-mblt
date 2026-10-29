@@ -26,7 +26,10 @@ def test_register_exposes_mobilint_model_types_to_auto_config() -> None:
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
     transformers_mblt.register()
-    for model_type in ("mobilint-llama", "mobilint-qwen2", "mobilint-qwen2_vl", "mobilint-whisper", "mobilint-bert"):
+    for model_type in (
+        "mobilint-llama", "mobilint-qwen2", "mobilint-qwen2_vl", "mobilint-whisper", "mobilint-bert",
+        "mobilint-sarashina2_vision",
+    ):
         assert model_type in CONFIG_MAPPING
 
 

@@ -25,6 +25,7 @@ _ARCHITECTURES: tuple[str, ...] = (
     "aya_vision",
     "qwen2_vl",
     "qwen3_vl",
+    "sarashina2_vision",
     "whisper",
     "qwen3_asr",
     "lfm2_audio",
