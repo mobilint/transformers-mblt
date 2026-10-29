@@ -65,8 +65,10 @@ def test_from_pretrained_loads_only_packaged_embedding_weights(tmp_path, monkeyp
 
 @pytest.fixture
 def processor():
+    vocab = {"[UNK]": 0, "hello": 2, "<|file|>": 14}
+    vocab.update({f"unused_{i}": i for i in range(16) if i not in (0, 2, 14)})
     tokenizer = PreTrainedTokenizerFast(
-        tokenizer_object=Tokenizer(WordLevel({"[UNK]": 0, "<|file|>": 1, "hello": 2}, unk_token="[UNK]")),
+        tokenizer_object=Tokenizer(WordLevel(vocab, unk_token="[UNK]")),
         unk_token="[UNK]", additional_special_tokens=["<|file|>"],
     )
     image_processor = Qwen2VLImageProcessor(image_mean=[0.5] * 3, image_std=[0.5] * 3)
@@ -80,7 +82,7 @@ def test_static_processor_resizes_non_square_and_expands_tokens(processor):
     assert text == ["<|file|>hello"]
     assert batch.image_grid_thw.tolist() == [[1, 32, 32]]
     assert batch.pixel_values.shape == (1024, 1176)
-    assert int((batch.input_ids == 1).sum()) == 256
+    assert int((batch.input_ids == small_config().image_token_index).sum()) == 256
     expected = processor.image_processor(
         images=[image.resize((448, 448), Image.Resampling.BICUBIC)], do_resize=False, return_tensors="pt")
     torch.testing.assert_close(batch.pixel_values, expected.pixel_values)
@@ -95,6 +97,42 @@ def test_static_processor_resizes_non_square_and_expands_tokens(processor):
 def test_processor_rejects_unsupported_inputs(processor, kwargs, error):
     with pytest.raises(error):
         processor(**kwargs)
+
+
+def test_processor_output_connects_to_model_image_features(processor):
+    batch = processor(images=[Image.new("RGB", (700, 200))], text="<|file|>hello", return_tensors="pt")
+    model = MobilintSarashina2VisionForCausalLM.__new__(MobilintSarashina2VisionForCausalLM)
+    torch.nn.Module.__init__(model)
+    model.config = small_config()
+    decoder = Mock(return_value=CausalLMOutputWithPast(logits=torch.zeros(1, 1, 16)))
+    decoder.get_input_embeddings.return_value = torch.nn.Embedding(16, 4)
+    model.model = decoder
+    vision = Mock(return_value=[np.full((1, 256, 4), 3, dtype=np.float32)])
+    model.vision_backend = SimpleNamespace(mxq_models=[SimpleNamespace(infer=vision)])
+    output = model(**batch)
+    assert output.logits.shape == (1, 1, 16)
+    vision.assert_called_once()
+    mask = batch.input_ids == model.config.image_token_index
+    fed = decoder.call_args.kwargs["inputs_embeds"]
+    torch.testing.assert_close(fed[mask], torch.full((256, 4), 3.0))
+
+
+def test_processor_rejects_image_token_id_mismatch(processor):
+    with pytest.raises(ValueError, match="image_token_index=1"):
+        MobilintSarashina2VisionProcessor(processor.image_processor, processor.tokenizer, image_token_index=1)
+
+
+def test_processor_load_checks_model_config_token_id(tmp_path, processor):
+    processor.image_processor.save_pretrained(tmp_path)
+    processor.tokenizer.save_pretrained(tmp_path)
+    config = small_config()
+    config.save_pretrained(tmp_path)
+    loaded = MobilintSarashina2VisionProcessor.from_pretrained(tmp_path)
+    assert loaded.image_token_index == config.image_token_index
+    config.image_token_index = 1
+    config.save_pretrained(tmp_path)
+    with pytest.raises(ValueError, match="image_token_index=1"):
+        MobilintSarashina2VisionProcessor.from_pretrained(tmp_path)
 
 
 def test_decoder_chunks_keyword_cache_size_and_cache_limit():

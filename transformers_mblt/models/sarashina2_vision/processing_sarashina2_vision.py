@@ -1,4 +1,6 @@
 """Static BICUBIC 448x448 preprocessing for Sarashina2.2-Vision."""
+from pathlib import Path
+
 from PIL import Image
 from transformers import AutoProcessor, AutoTokenizer
 from transformers.feature_extraction_utils import BatchFeature
@@ -18,10 +20,17 @@ class MobilintSarashina2VisionProcessor(ProcessorMixin):
     attributes = ["image_processor", "tokenizer"]
     image_processor_class = "AutoImageProcessor"
     tokenizer_class = "AutoTokenizer"
-    valid_kwargs = ["chat_template"]
+    valid_kwargs = ["chat_template", "image_token_index"]
 
-    def __init__(self, image_processor, tokenizer, chat_template=None, **kwargs):
+    def __init__(self, image_processor, tokenizer, chat_template=None, image_token_index=14, **kwargs):
         self.image_token = "<|file|>"
+        self.image_token_index = image_token_index
+        token_id = tokenizer.convert_tokens_to_ids(self.image_token)
+        if self.image_token not in tokenizer.get_vocab() or token_id != image_token_index:
+            raise ValueError(
+                f"Tokenizer image token {self.image_token!r} maps to {token_id}, "
+                f"but model config requires image_token_index={image_token_index}."
+            )
         super().__init__(image_processor, tokenizer, chat_template=chat_template)
 
     @classmethod
@@ -32,7 +41,14 @@ class MobilintSarashina2VisionProcessor(ProcessorMixin):
         image_processor = Qwen2VLImageProcessor.from_pretrained(pretrained_model_name_or_path, **kwargs)
         tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path, trust_remote_code=False, **kwargs)
         processor_dict, _ = cls.get_processor_dict(pretrained_model_name_or_path, **kwargs)
-        return cls(image_processor, tokenizer, chat_template=processor_dict.get("chat_template", tokenizer.chat_template))
+        image_token_index = processor_dict.get("image_token_index", 14)
+        folder = Path(pretrained_model_name_or_path) / kwargs.get("subfolder", "")
+        if not folder.is_dir() or (folder / "config.json").is_file():
+            config_dict, _ = MobilintSarashina2VisionConfig.get_config_dict(pretrained_model_name_or_path, **kwargs)
+            image_token_index = config_dict.get("image_token_index", image_token_index)
+        return cls(image_processor, tokenizer,
+                   chat_template=processor_dict.get("chat_template", tokenizer.chat_template),
+                   image_token_index=image_token_index)
 
     def __call__(self, images=None, text=None, videos=None, **kwargs):
         if videos is not None:
@@ -67,9 +83,8 @@ class MobilintSarashina2VisionProcessor(ProcessorMixin):
         text_inputs = self.tokenizer(texts, **text_kwargs)
         # Truncation must not silently drop a portion of an image's token block.
         if images is not None:
-            image_token_id = self.tokenizer.convert_tokens_to_ids(self.image_token)
             ids = text_inputs["input_ids"][0]
-            if sum(int(token) == image_token_id for token in ids) != 256:
+            if sum(int(token) == self.image_token_index for token in ids) != 256:
                 raise ValueError("Tokenization/truncation must preserve all 256 image tokens.")
         return BatchFeature(data={**text_inputs, **image_inputs}, tensor_type=return_tensors)
 
