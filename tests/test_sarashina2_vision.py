@@ -208,6 +208,59 @@ def test_generate_accepts_unset_or_single_beam(monkeypatch, num_beams):
     assert generate.call_args.kwargs["use_cache"] is True
 
 
+def test_labels_use_full_sequence_logits_by_default():
+    from transformers.loss.loss_utils import ForCausalLMLoss
+
+    model = MobilintSarashina2VisionForCausalLM.__new__(MobilintSarashina2VisionForCausalLM)
+    torch.nn.Module.__init__(model)
+    model.config = small_config()
+    decoder = _SarashinaDecoder.__new__(_SarashinaDecoder)
+    torch.nn.Module.__init__(decoder)
+    decoder.config = SimpleNamespace(vocab_size=16, max_batch_size=1)
+    decoder.embed_tokens = torch.nn.Embedding(16, 4)
+    decoder._get_cache = Mock(return_value=SimpleNamespace(get_seq_length=lambda: 0))
+    decoder.resolve_batched_attention_mask = Mock(return_value=None)
+    decoder.loss_function = ForCausalLMLoss
+    logits = torch.arange(48, dtype=torch.float32).reshape(1, 3, 16)
+    decoder.llm_forward = Mock(side_effect=lambda *args, logits_to_keep, **kwargs:
+                               logits if logits_to_keep == 0 else logits[:, -logits_to_keep:])
+    model.model = decoder
+    labels = torch.tensor([[2, 3, 4]])
+    output = model(input_ids=labels, labels=labels)
+    assert decoder.llm_forward.call_args.kwargs["logits_to_keep"] == 0
+    assert output.logits.shape == (1, 3, 16)
+    assert torch.isfinite(output.loss)
+    expected = ForCausalLMLoss(logits=logits, labels=labels, vocab_size=16)
+    torch.testing.assert_close(output.loss, expected)
+
+
+@pytest.mark.parametrize("num_beams", [2, 4])
+def test_none_generation_config_does_not_bypass_beam_guard(num_beams):
+    model = MobilintSarashina2VisionForCausalLM.__new__(MobilintSarashina2VisionForCausalLM)
+    torch.nn.Module.__init__(model)
+    model.generation_config = SimpleNamespace(num_beams=num_beams, use_cache=True)
+    with pytest.raises(ValueError, match="beam search"):
+        model.generate(generation_config=None)
+
+
+def test_positional_generation_config_does_not_bypass_beam_guard():
+    model = MobilintSarashina2VisionForCausalLM.__new__(MobilintSarashina2VisionForCausalLM)
+    torch.nn.Module.__init__(model)
+    model.generation_config = SimpleNamespace(num_beams=1, use_cache=True)
+    config = SimpleNamespace(num_beams=2, use_cache=True)
+    with pytest.raises(ValueError, match="beam search"):
+        model.generate(torch.tensor([[2, 3]]), config)
+
+
+def test_explicit_single_beam_overrides_default_config(monkeypatch):
+    model = MobilintSarashina2VisionForCausalLM.__new__(MobilintSarashina2VisionForCausalLM)
+    torch.nn.Module.__init__(model)
+    model.generation_config = SimpleNamespace(num_beams=4, use_cache=True)
+    generate = Mock(return_value="generated")
+    monkeypatch.setattr(MobilintGenerationMixin, "generate", generate)
+    assert model.generate(generation_config=None, num_beams=1) == "generated"
+
+
 def test_no_cache_is_rejected():
     model = MobilintSarashina2VisionForCausalLM.__new__(MobilintSarashina2VisionForCausalLM)
     torch.nn.Module.__init__(model)

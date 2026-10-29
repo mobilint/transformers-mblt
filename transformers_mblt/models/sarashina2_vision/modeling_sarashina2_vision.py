@@ -104,7 +104,7 @@ class MobilintSarashina2VisionForCausalLM(PretrainedOnlyMixin, MobilintGeneratio
     @can_return_tuple
     def forward(self, input_ids=None, pixel_values=None, image_grid_thw=None, attention_mask=None,
                 position_ids=None, past_key_values=None, inputs_embeds=None, labels=None,
-                use_cache=None, cache_position=None, logits_to_keep=1,
+                use_cache=None, cache_position=None, logits_to_keep=0,
                 npu_prefill_chunk_size=None, count_npu_time=False, **kwargs):
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("Specify exactly one of input_ids or inputs_embeds.")
@@ -149,7 +149,9 @@ class MobilintSarashina2VisionForCausalLM(PretrainedOnlyMixin, MobilintGeneratio
         return model_inputs
 
     def generate(self, *args, **kwargs):
-        config = kwargs.get("generation_config", self.generation_config)
+        config = args[1] if len(args) > 1 else kwargs.get("generation_config")
+        if config is None:
+            config = self.generation_config
         if kwargs.get("use_cache", getattr(config, "use_cache", True)) is False:
             raise ValueError("Sarashina NPU generation requires use_cache=True.")
         if (kwargs.get("num_beams", getattr(config, "num_beams", 1)) or 1) != 1:
