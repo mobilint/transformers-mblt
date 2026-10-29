@@ -9,6 +9,7 @@ from PIL import Image
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedTokenizerFast
+from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.auto.processing_auto import PROCESSOR_MAPPING
 from transformers.models.qwen2_vl.image_processing_qwen2_vl import Qwen2VLImageProcessor
 
@@ -169,6 +170,31 @@ def test_forward_accepts_text_only_without_pixels():
     ids = torch.tensor([[2, 3]])
     assert model(input_ids=ids) == "decoded"
     torch.testing.assert_close(decoder.call_args.kwargs["inputs_embeds"], embedding(ids))
+
+
+@pytest.mark.parametrize("config_return_dict", [True, False])
+@pytest.mark.parametrize("explicit_return_dict", [None, True, False])
+def test_forward_respects_return_dict(config_return_dict, explicit_return_dict):
+    model = MobilintSarashina2VisionForCausalLM.__new__(MobilintSarashina2VisionForCausalLM)
+    torch.nn.Module.__init__(model)
+    model.config = small_config()
+    model.config.return_dict = config_return_dict
+    logits = torch.zeros(1, 1, 16)
+    cache = SimpleNamespace()
+    expected = CausalLMOutputWithPast(logits=logits, past_key_values=cache)
+    decoder = Mock(return_value=expected)
+    decoder.get_input_embeddings.return_value = torch.nn.Embedding(16, 4)
+    model.model = decoder
+    result = model(input_ids=torch.tensor([[2, 3]]), return_dict=explicit_return_dict)
+    structured = config_return_dict if explicit_return_dict is None else explicit_return_dict
+    if structured:
+        assert result is expected
+    else:
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        assert result[0] is logits
+        assert result[1] is cache
+    assert "return_dict" not in decoder.call_args.kwargs
 
 
 @pytest.mark.parametrize("num_beams", [None, 1])

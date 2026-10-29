@@ -5,6 +5,7 @@ import numpy as np
 import torch
 from transformers import AutoModel, AutoModelForCausalLM, AutoModelForImageTextToText
 from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.utils.generic import can_return_tuple
 
 from ...utils.base_utils import PretrainedOnlyMixin
 from ...utils.generation_utils import MobilintGenerationMixin
@@ -100,6 +101,7 @@ class MobilintSarashina2VisionForCausalLM(PretrainedOnlyMixin, MobilintGeneratio
             raise ValueError(f"Vision MXQ must produce 256 image tokens; got output shape {features.shape}.")
         return features.reshape(256, self.config.text_config.hidden_size)
 
+    @can_return_tuple
     def forward(self, input_ids=None, pixel_values=None, image_grid_thw=None, attention_mask=None,
                 position_ids=None, past_key_values=None, inputs_embeds=None, labels=None,
                 use_cache=None, cache_position=None, logits_to_keep=1,
