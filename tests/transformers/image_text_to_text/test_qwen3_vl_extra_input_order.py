@@ -103,7 +103,7 @@ def test_get_num_mxq_inputs_reads_variant_handle(shapes: list[tuple[int, ...]], 
 # ---------------------------------------------------------------------------
 # ``_classify_mxq_signature`` maps a compiled MXQ input count to the
 # ``(uses_split_deepstack_input, uses_rope_input)`` flags used by dispatch.
-# Bundled and split dynamic MXQ layouts are both valid for batched releases;
+# Bundled and split layouts, static and dynamic, are all valid for batched releases;
 # the runtime preserves the compiled input order when packing DeepStack data.
 # ---------------------------------------------------------------------------
 
@@ -120,6 +120,8 @@ def test_get_num_mxq_inputs_reads_variant_handle(shapes: list[tuple[int, ...]], 
         (4, 1, (True, False)),  # split/static
         (5, 1, (True, True)),  # split/dynamic
         (5, 16, (True, True)),  # split/dynamic Batch16
+        # Static (MRoPE baked in) batched
+        (4, 16, (True, False)),  # split/static Batch16
     ],
 )
 def test_classify_mxq_signature_supported(
@@ -134,12 +136,6 @@ def test_classify_mxq_signature_rejects_unknown_count(num_mxq_inputs: int) -> No
     """Any input count outside 2/3/4/5 is rejected at load with a legible error."""
     with pytest.raises(ValueError, match="input count is not recognized"):
         MobilintQwen3VLTextModel._classify_mxq_signature(num_mxq_inputs, max_batch_size=1)
-
-
-def test_classify_mxq_signature_rejects_split_static_batch() -> None:
-    """Split-static text MXQs cannot serve the batched dispatch path."""
-    with pytest.raises(ValueError, match=r"split-static.*max_batch_size == 1"):
-        MobilintQwen3VLTextModel._classify_mxq_signature(4, max_batch_size=16)
 
 
 # ---------------------------------------------------------------------------
@@ -489,6 +485,7 @@ class _RecordingBatchMxq:
         self.calls.append(
             {
                 "shapes": [tuple(np.asarray(x).shape) for x in inputs],
+                "inputs": [np.array(x, copy=True) for x in inputs],
                 "cache_size": int(cache_size),
                 "batch": None
                 if batch_params is None
@@ -588,25 +585,61 @@ def test_batched_pack_emits_rope_then_deepstack() -> None:
     assert shapes[2] == (num_layers, seq_len, hidden_size)
 
 
-def test_batched_path_rejects_2_input_mxq() -> None:
-    """Legacy 2-input batch MXQ (old HF Batch16 W4V8) is no longer supported."""
-    hidden_size = 4
-    seq_len = 2
+def _run_static_batch(model: MobilintQwen3VLTextModel, lengths: list[int], hidden_size: int) -> dict:
+    """Run one batched static forward whose every token is visual; DeepStack layer ``k`` of row ``j`` is ``10k + j``."""
+    from transformers_mblt.utils.multi_slot_dispatch import MultiSlotDispatcher
 
-    model = _make_batched_model(uses_rope_input=False, hidden_size=hidden_size)
-    inputs_embeds = torch.zeros((1, seq_len, hidden_size), dtype=torch.float32)
-    attention_mask = torch.ones((1, seq_len), dtype=torch.long)
+    # Room for one cache row per batch row.
+    model.npu_backend.k_per_model = len(lengths)
+    model.npu_backend.dispatcher = MultiSlotDispatcher(model.npu_backend)
+    width = max(lengths)
+    inputs_embeds = torch.zeros((len(lengths), width, hidden_size), dtype=torch.float32)
+    attention_mask = torch.zeros((len(lengths), width), dtype=torch.long)
+    for row, length in enumerate(lengths):
+        inputs_embeds[row, width - length :] = float(row + 1)
+        attention_mask[row, width - length :] = 1
+    deepstack = [
+        torch.cat([torch.full((length, hidden_size), float(10 * layer + row)) for row, length in enumerate(lengths)])
+        for layer in range(model.num_deepstack_layers)
+    ]
+    model._llm_forward_batch_deepstack(
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        deepstack_visual_embeds=deepstack,
+        visual_pos_masks=attention_mask.bool(),
+        past_key_values=None,
+        cache_position=torch.arange(width),
+        npu_prefill_chunk_size=width,
+        count_npu_time=False,
+        logits_to_keep=1,
+        position_embeddings=None,
+    )
+    mxq: _RecordingBatchMxq = model._recording_mxq  # type: ignore[assignment]
+    assert len(mxq.calls) == 1
+    return mxq.calls[0]
 
-    with pytest.raises(ValueError, match="requires a dynamic text MXQ"):
-        model._llm_forward_batch_deepstack(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            deepstack_visual_embeds=None,
-            visual_pos_masks=None,
-            past_key_values=None,
-            cache_position=torch.arange(seq_len),
-            npu_prefill_chunk_size=seq_len,
-            count_npu_time=False,
-            logits_to_keep=1,
-            position_embeddings=None,
-        )
+
+def test_batched_static_bundled_is_rejected_until_npu_validation() -> None:
+    with pytest.raises(ValueError, match="bundled-static.*unsupported"):
+        MobilintQwen3VLTextModel._classify_mxq_signature(2, max_batch_size=16)
+    model = _make_batched_model(uses_rope_input=False)
+    with pytest.raises(ValueError, match="bundled-static.*unsupported"):
+        _run_static_batch(model, [2, 3], 4)
+
+
+def test_batched_static_split_pack_one_input_per_deepstack_layer() -> None:
+    """A split static batch MXQ takes ``[inputs, deepstack_0, deepstack_1, deepstack_2]``, rows in batch order."""
+    hidden_size, num_layers, lengths = 4, 3, [2, 3]
+    model = _make_batched_model(uses_rope_input=False, hidden_size=hidden_size, num_deepstack_layers=num_layers)
+    model._uses_split_deepstack_input = True
+
+    call = _run_static_batch(model, lengths, hidden_size)
+
+    assert call["shapes"] == [(1, sum(lengths), hidden_size)] * (1 + num_layers)
+    np.testing.assert_array_equal(call["inputs"][0][0, :2], np.full((2, hidden_size), 1.0))
+    np.testing.assert_array_equal(call["inputs"][0][0, 2:], np.full((3, hidden_size), 2.0))
+    for layer in range(num_layers):
+        layer_input = call["inputs"][1 + layer]
+        np.testing.assert_array_equal(layer_input[0, :2], np.full((2, hidden_size), 10.0 * layer))
+        np.testing.assert_array_equal(layer_input[0, 2:], np.full((3, hidden_size), 10.0 * layer + 1))
+    assert call["batch"] is not None and [length for _, length, _ in call["batch"]] == lengths
