@@ -329,14 +329,15 @@ Supported layouts (`max_batch_size == 1` unless noted):
 | --- | --- | --- | --- |
 | Bundled static | `[inputs_embeds, deepstack]` | baked | 2B/4B W8 non-batch. MRoPE baked into the compiled decoder. |
 | Bundled dynamic | `[inputs_embeds, deepstack, rope]` | external | Non-batch dynamic; rope threaded via `MobilintQwen3VLRotaryEmbedding`. |
-| Split static | `[inputs_embeds, deepstack_0, deepstack_1, deepstack_2]` | baked | Non-batch static, one input per DeepStack layer. |
+| Split static | `[inputs_embeds, deepstack_0, deepstack_1, deepstack_2]` | baked | Non-batch and batch static, one input per DeepStack layer. |
 | Split dynamic | `[inputs_embeds, deepstack_0, deepstack_1, deepstack_2, rope]` | external | Dynamic split-per-layer + rope; supports non-batch and batch. |
 | Batched bundled | `[inputs_embeds, rope, deepstack]` | external | `max_batch_size > 1` (e.g. bundled Batch16 W8). |
 | Batched split dynamic | `[inputs_embeds, deepstack_0, deepstack_1, deepstack_2, rope]` | external | `max_batch_size > 1`; split-per-layer dynamic Batch16 layout. |
 
 The non-batch and batched 3-input orders differ (`[inputs, deepstack, rope]` vs `[inputs, rope,
 deepstack]`), while split dynamic batches use `[inputs, deepstack_0, deepstack_1, deepstack_2,
-rope]`; each dispatch honors its compiled signature. Split-static batches remain unsupported. The
+rope]`; each dispatch honors its compiled signature. Split-static batches use the same four-input
+order without rope. Bundled-static batches remain unsupported pending NPU validation. The
 split-input classifier assumes the Qwen3-VL family's three DeepStack layers. On composite construction,
 `MobilintQwen3VLModel.__init__` calls `_validate_split_deepstack_layout` to cross-check the split
 input count against `config.vision_config.deepstack_visual_indexes`; a MXQ/config layer-count
