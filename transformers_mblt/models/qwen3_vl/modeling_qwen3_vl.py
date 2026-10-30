@@ -1137,10 +1137,9 @@ class MobilintQwen3VLTextModel(MobilintModelMixin, MobilintGenerationMixin, Mobi
         #   * Batch (``max_batch_size > 1``, e.g. the Batch16 W8 build):
         #     dynamic bundled 3-input ``[inputs_embeds, rope, deepstack]`` or
         #     split 5-input ``[inputs_embeds, deepstack_0, deepstack_1,
-        #     deepstack_2, rope]``; static (MRoPE baked in) bundled 2-input
-        #     ``[inputs_embeds, deepstack]`` or split 4-input
-        #     ``[inputs_embeds, deepstack_0, deepstack_1, deepstack_2]``. All
-        #     four are supported by ``_llm_forward_batch_deepstack``.
+        #     deepstack_2, rope]``; static (MRoPE baked in) split 4-input
+        #     ``[inputs_embeds, deepstack_0, deepstack_1, deepstack_2]``.
+        #     Bundled static batch MXQs are rejected until validated on NPU.
         # The 3-input orders differ between non-batch and batch builds; the
         # compiled signatures are independent and each dispatch honors its own
         # layout. We trust the compiled MXQ over any config attr for the input
@@ -1185,7 +1184,7 @@ class MobilintQwen3VLTextModel(MobilintModelMixin, MobilintGenerationMixin, Mobi
     ) -> tuple[bool, bool]:
         """Map a compiled MXQ input count to ``(uses_split, uses_rope)`` or raise.
 
-        Batched dispatch supports both bundled and split DeepStack layouts;
+        Batched dispatch supports dynamic bundled/split and static split DeepStack layouts;
         the compiled input order is selected from ``_uses_split_deepstack_input``
         and ``_uses_rope_input`` at inference time.
         """
@@ -1201,7 +1200,11 @@ class MobilintQwen3VLTextModel(MobilintModelMixin, MobilintGenerationMixin, Mobi
                 "``_SPLIT_MXQ_INPUT_COUNTS``, and ``_ROPE_MXQ_INPUT_COUNTS`` when "
                 "a variant with a different DeepStack layer count ships."
             )
-        del max_batch_size  # Every layout runs both non-batch and batched.
+        if num_mxq_inputs == 2 and max_batch_size > 1:
+            raise ValueError(
+                "Batched Qwen3-VL bundled-static text MXQs are unsupported until validated on NPU; "
+                "use a split-static batch MXQ."
+            )
         uses_split = num_mxq_inputs in cls._SPLIT_MXQ_INPUT_COUNTS
         uses_rope = num_mxq_inputs in cls._ROPE_MXQ_INPUT_COUNTS
         return uses_split, uses_rope
@@ -1737,9 +1740,8 @@ class MobilintQwen3VLTextModel(MobilintModelMixin, MobilintGenerationMixin, Mobi
         The batched path supports bundled dynamic MXQs with
         ``[inputs, rope, deepstack]``, split dynamic MXQs with
         ``[inputs, deepstack_0, deepstack_1, deepstack_2, rope]``, and their
-        static counterparts without the rope input: bundled ``[inputs,
-        deepstack]`` and split ``[inputs, deepstack_0, deepstack_1,
-        deepstack_2]``. A static MXQ bakes the M-RoPE table of its compiled
+        split static inputs without rope: ``[inputs, deepstack_0,
+        deepstack_1, deepstack_2]``. A static MXQ bakes the M-RoPE table of its compiled
         prompt layout into the graph. Each prompt must match that layout;
         this forward cannot verify the baked image position from the MXQ.
         For a dynamic MXQ the
@@ -1750,6 +1752,8 @@ class MobilintQwen3VLTextModel(MobilintModelMixin, MobilintGenerationMixin, Mobi
         """
         del cache_position  # Batched path uses `update_seen_tokens` bookkeeping.
 
+        if not self._uses_rope_input and not self._uses_split_deepstack_input:
+            raise ValueError("Batched Qwen3-VL bundled-static text MXQs are unsupported until validated on NPU.")
         if self._uses_rope_input:
             assert position_embeddings is not None, (
                 "position_embeddings must be provided for a Qwen3-VL text MXQ with a rope input."

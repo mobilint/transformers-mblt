@@ -121,7 +121,6 @@ def test_get_num_mxq_inputs_reads_variant_handle(shapes: list[tuple[int, ...]], 
         (5, 1, (True, True)),  # split/dynamic
         (5, 16, (True, True)),  # split/dynamic Batch16
         # Static (MRoPE baked in) batched
-        (2, 16, (False, False)),  # bundled/static Batch16
         (4, 16, (True, False)),  # split/static Batch16
     ],
 )
@@ -620,18 +619,12 @@ def _run_static_batch(model: MobilintQwen3VLTextModel, lengths: list[int], hidde
     return mxq.calls[0]
 
 
-def test_batched_static_bundled_pack_omits_rope() -> None:
-    """A bundled static batch MXQ (MRoPE baked in) takes ``[inputs, deepstack]``."""
-    hidden_size, num_layers, lengths = 4, 3, [2, 3]
-    model = _make_batched_model(uses_rope_input=False, hidden_size=hidden_size, num_deepstack_layers=num_layers)
-
-    call = _run_static_batch(model, lengths, hidden_size)
-
-    assert call["shapes"] == [(1, sum(lengths), hidden_size), (num_layers, sum(lengths), hidden_size)]
-    deepstack = call["inputs"][1]
-    for layer in range(num_layers):
-        np.testing.assert_array_equal(deepstack[layer, :2], np.full((2, hidden_size), 10.0 * layer))
-        np.testing.assert_array_equal(deepstack[layer, 2:], np.full((3, hidden_size), 10.0 * layer + 1))
+def test_batched_static_bundled_is_rejected_until_npu_validation() -> None:
+    with pytest.raises(ValueError, match="bundled-static.*unsupported"):
+        MobilintQwen3VLTextModel._classify_mxq_signature(2, max_batch_size=16)
+    model = _make_batched_model(uses_rope_input=False)
+    with pytest.raises(ValueError, match="bundled-static.*unsupported"):
+        _run_static_batch(model, [2, 3], 4)
 
 
 def test_batched_static_split_pack_one_input_per_deepstack_layer() -> None:
