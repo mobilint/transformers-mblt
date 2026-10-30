@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.1
+
+### Added
+
+- Qwen3-VL split-static text MXQs support batched inference without an external RoPE input. The image position in
+  every prompt must match the layout baked into the compiled decoder. Bundled-static batch MXQs remain unsupported
+  pending NPU validation. See #41.
+
 ## 0.7.0
 
 ### Added
