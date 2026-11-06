@@ -4,9 +4,11 @@
 
 ### Changed
 
-- Require `mblt-tracker>=1.1.0`. It adds `JetsonDeviceTracker` and makes a repeated tracker `stop()` a no-op; before
-  1.1.0 the second `stop()` the TPS CLI issues in cleanup appended a late sample to the closed prefill window, so
-  prefill energy covered the whole request.
+- Require `mblt-tracker>=2.0.0`. 1.1.0 adds `JetsonDeviceTracker` and makes a repeated tracker `stop()` a no-op;
+  before it the second `stop()` the TPS CLI issues in cleanup appended a late sample to the closed prefill window, so
+  prefill energy covered the whole request. 2.0.0 moves the Mobilint NPU telemetry dependency from `mbltml` to
+  `mobilint-ml`, which publishes aarch64 wheels, so `transformers-mblt` now installs on NVIDIA Jetson. Both packages
+  install the `mbltml` module: when upgrading an environment that has `mbltml`, run `pip uninstall mbltml` first.
 
 ### Fixed
 
