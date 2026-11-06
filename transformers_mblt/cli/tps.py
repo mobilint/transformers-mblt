@@ -2308,8 +2308,11 @@ def _extract_device_time_series(tracker: Any) -> dict[str, list[dict[str, float]
     return _extract_device_time_series_common(tracker)
 
 
-def _energy_from_device_time_series(device_time_series: dict[str, list[dict[str, float]]]) -> Optional[float]:
-    return _energy_from_device_time_series_common(device_time_series)
+def _energy_from_device_time_series(
+    device_time_series: dict[str, list[dict[str, float]]],
+    duration_s: Optional[float] = None,
+) -> Optional[float]:
+    return _energy_from_device_time_series_common(device_time_series, duration_s=duration_s)
 
 
 def _vision_efficiency_metrics(vision_energy_j: Sequence[float], batch_size: int) -> tuple[list[float], list[float]]:
@@ -2495,6 +2498,7 @@ def _enrich_single_run_device(
     prefill_time_series: dict[str, list[dict[str, float]]] | None = None,
     decode_time_series: dict[str, list[dict[str, float]]] | None = None,
     decode_window: int | None = None,
+    scale_energy_to_phase_duration: bool = False,
 ) -> None:
     """Attach device metrics to a benchmark run.
 
@@ -2503,6 +2507,14 @@ def _enrich_single_run_device(
         prefill_metric: Device metrics measured during the prefill phase.
         decode_metric: Device metrics measured during the decode phase.
         batch_size: Number of sequences measured in parallel.
+        prefill_time_series: Device time series recorded by the prefill tracker.
+        decode_time_series: Device time series recorded by the decode tracker.
+        decode_window: Decode tokens per sweep point, for sweep results.
+        scale_energy_to_phase_duration: Compute each phase energy as the trace's time-weighted mean
+            power times ``run.prefill_latency`` / ``run.decode_duration`` instead of integrating the
+            trace span. Use it only when each tracker covers exactly the measured phase of a single
+            ``generate`` call; the trace samples can then span less than the phase and under-count
+            its energy. Sweep runs, whose trackers span many ``generate`` calls, must leave it off.
     """
     prefill_avg_power = prefill_metric.get("avg_power_w")
     decode_avg_power = decode_metric.get("avg_power_w")
@@ -2581,8 +2593,14 @@ def _enrich_single_run_device(
     )
 
     avg_power = run.avg_power_w
-    prefill_energy = _energy_from_device_time_series(prefill_time_series or {})
-    decode_energy = _energy_from_device_time_series(decode_time_series or {})
+    prefill_energy = _energy_from_device_time_series(
+        prefill_time_series or {},
+        duration_s=prefill_t if scale_energy_to_phase_duration else None,
+    )
+    decode_energy = _energy_from_device_time_series(
+        decode_time_series or {},
+        duration_s=decode_t if scale_energy_to_phase_duration else None,
+    )
     total_energy = _sum_required_energies(prefill_energy, decode_energy)
 
     run.avg_power_w = float(avg_power) if avg_power is not None else None
@@ -2979,6 +2997,7 @@ def _run_text_measure(args: argparse.Namespace) -> int:
                     batch_size=batch_size,
                     prefill_time_series=prefill_time_series,
                     decode_time_series=decode_time_series,
+                    scale_energy_to_phase_duration=True,
                 )
             runs.append(run)
     finally:

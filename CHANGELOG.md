@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.7.2
+
+### Fixed
+
+- `transformers-mblt tps` with `--device-backend gpu` uses mblt-tracker's `JetsonDeviceTracker` on NVIDIA Jetson
+  modules when the installed mblt-tracker provides it (1.1.0 and later), and `GPUDeviceTracker` otherwise. Jetson
+  NVML reports no power, so every power and TPS/W row read 0.000 on a Jetson AGX Orin.
+- `tps measure` for text generation computes each phase energy as the trace's time-weighted mean power times the
+  measured phase latency (TTFT for prefill, decode duration for decode). The tracker samples cover less than the
+  measured phase, so integrating only the trace under-counted the energy and over-stated TPS/W: Llama-3.2-3B with a
+  512-token prefill on a Jetson AGX Orin reported 3.6 J and 141 prefill tok/s/W for a 0.175 s TTFT whose trace spanned
+  0.097 s. Sweeps, whose trackers span many `generate` calls, and VLM `measure` still integrate the raw trace.
+
 ## 0.7.1
 
 ### Added

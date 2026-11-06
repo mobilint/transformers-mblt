@@ -17,6 +17,7 @@ from transformers_mblt.models.qwen2_vl.modeling_qwen2_vl import MobilintQwen2VLF
 from transformers_mblt.utils.benchmark_cli_common import (
     DEVICE_METRIC_KEYS,
     build_device_tracker,
+    energy_from_device_time_series,
     extract_device_metric,
     extract_device_time_series,
     integrate_power_trace_j,
@@ -489,6 +490,44 @@ def test_enrich_single_run_device_computes_energy_metrics_without_avg_power():
     assert measurement.total_tps_per_w == pytest.approx(1.5)
 
 
+@pytest.mark.parametrize(
+    ("scale_energy_to_phase_duration", "prefill_energy", "decode_energy"),
+    [(False, 1.0, 2.0), (True, 4.0, 4.0)],
+)
+def test_enrich_single_run_device_scales_phase_energy_only_when_requested(
+    scale_energy_to_phase_duration, prefill_energy, decode_energy
+):
+    """Phase energy uses the measured phase duration only for single-generate tracker windows."""
+    measurement = SingleMeasurement(
+        num_prefill=4,
+        num_decode=2,
+        prefill_latency=2.0,
+        prefill_tps=2.0,
+        decode_duration=1.0,
+        decode_tps=2.0,
+        total_time=3.0,
+        avg_total_prefill_token_latency=0.5,
+        avg_npu_prefill_token_latency=None,
+        avg_total_decode_token_latency=0.5,
+        avg_npu_decode_token_latency=None,
+    )
+
+    # The prefill trace spans 0.5 s of a 2 s prefill; the decode trace spans 0.5 s of a 1 s decode.
+    tps_cli._enrich_single_run_device(
+        run=measurement,
+        prefill_metric={},
+        decode_metric={},
+        prefill_time_series={"power_w": [{"timestamp_s": 0.0, "value": 2.0}, {"timestamp_s": 0.5, "value": 2.0}]},
+        decode_time_series={"power_w": [{"timestamp_s": 5.0, "value": 4.0}, {"timestamp_s": 5.5, "value": 4.0}]},
+        scale_energy_to_phase_duration=scale_energy_to_phase_duration,
+    )
+
+    assert measurement.prefill_energy_j == pytest.approx(prefill_energy)
+    assert measurement.decode_energy_j == pytest.approx(decode_energy)
+    assert measurement.total_energy_j == pytest.approx(prefill_energy + decode_energy)
+    assert measurement.prefill_tps_per_w == pytest.approx(4.0 / prefill_energy)
+
+
 def test_integrate_power_trace_j_uses_trapezoidal_rule():
     """Power traces should be integrated from time-series samples, not average power fallbacks."""
     trace = [
@@ -503,6 +542,22 @@ def test_integrate_power_trace_j_uses_trapezoidal_rule():
 def test_integrate_power_trace_j_requires_two_valid_points():
     """A single trace sample cannot produce a reliable energy integration."""
     assert integrate_power_trace_j([{"timestamp_s": 0.0, "value": 2.0}]) is None
+
+
+def test_energy_from_device_time_series_scales_trace_to_phase_duration():
+    """A trace that spans less than the measured phase is scaled to the phase duration."""
+    # 0.1 s of trace at a mean 40 W inside a 0.2 s prefill phase.
+    series = {"power_w": [{"timestamp_s": 10.0, "value": 38.0}, {"timestamp_s": 10.1, "value": 42.0}]}
+
+    assert energy_from_device_time_series(series) == pytest.approx(4.0)
+    assert energy_from_device_time_series(series, duration_s=0.2) == pytest.approx(8.0)
+
+
+@pytest.mark.parametrize("duration_s", [None, 0.0])
+def test_energy_from_device_time_series_without_duration_integrates_trace(duration_s):
+    series = {"power_w": [{"timestamp_s": 0.0, "value": 2.0}, {"timestamp_s": 1.0, "value": 6.0}]}
+
+    assert energy_from_device_time_series(series, duration_s=duration_s) == pytest.approx(4.0)
 
 
 def test_run_text_measure_forwards_resolved_batch_size(monkeypatch):
@@ -1524,6 +1579,62 @@ def test_run_text_measure_starts_phase_trackers_for_resolved_batch(monkeypatch, 
         {"timestamp_s": 0.0, "value": 2.0},
         {"timestamp_s": 1.0, "value": 2.0},
     ]
+
+
+def test_run_text_measure_scales_phase_energy_to_measured_latency(monkeypatch):
+    """Text measure integrates each phase over its measured latency, not the shorter trace span."""
+    import transformers_mblt.utils.benchmark_utils as benchmark_utils
+
+    pipeline = SimpleNamespace(model=SimpleNamespace(config=_DummyConfig(max_batch_size=1)))
+    measured: list[SingleMeasurement] = []
+
+    class _FakeTracker:
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+        def get_metric(self) -> dict[str, float]:
+            return {"avg_power_w": 2.0}
+
+        def get_total_power_trace(self) -> list[tuple[float, float]]:
+            # 0.25 s of samples inside a phase measured at 1.0 s.
+            return [(0.0, 2.0), (0.25, 2.0)]
+
+    class _FakeTPSMeasurer:
+        def __init__(self, pipeline_arg) -> None:
+            assert pipeline_arg is pipeline
+
+        def measure(self, **kwargs) -> SingleMeasurement:
+            measurement = SingleMeasurement(
+                num_prefill=kwargs["num_prefill"],
+                num_decode=kwargs["num_decode"],
+                prefill_latency=1.0,
+                prefill_tps=8.0,
+                decode_duration=1.0,
+                decode_tps=2.0,
+                total_time=2.0,
+                avg_total_prefill_token_latency=0.125,
+                avg_npu_prefill_token_latency=None,
+                avg_total_decode_token_latency=0.5,
+                avg_npu_decode_token_latency=None,
+            )
+            measured.append(measurement)
+            return measurement
+
+    monkeypatch.setattr(tps_cli, "_build_pipeline", lambda **kwargs: pipeline)
+    monkeypatch.setattr(tps_cli, "_build_phase_trackers", lambda args, pipeline: (_FakeTracker(), _FakeTracker()))
+    monkeypatch.setattr(tps_cli, "_print_device_status", lambda args, tracker: None)
+    monkeypatch.setattr(benchmark_utils, "TPSMeasurer", _FakeTPSMeasurer)
+
+    args = _base_measure_args(device_metrics=True, device_backend="gpu")
+
+    assert tps_cli._run_text_measure(args) == 0
+    (run,) = measured
+    assert run.prefill_energy_j == pytest.approx(2.0)
+    assert run.decode_energy_j == pytest.approx(2.0)
+    assert run.prefill_tps_per_w == pytest.approx(4.0)
 
 
 def test_run_vlm_measure_forwards_npu_prefill_chunk_size(monkeypatch):
@@ -2694,6 +2805,48 @@ def test_build_device_tracker_uses_gpu_interval_and_device_id(monkeypatch):
 
     assert isinstance(tracker, _FakeGPUDeviceTracker)
     assert created == {"interval": 1.0, "gpu_id": 1}
+
+
+@pytest.mark.parametrize("jetson_available", [True, False])
+def test_build_device_tracker_prefers_jetson_tracker_on_jetson(monkeypatch, jetson_available):
+    """Verify the GPU backend uses Jetson INA3221 tracking only when it is available."""
+    created = {}
+
+    class _FakeJetsonDeviceTracker:
+        def __init__(self, **kwargs) -> None:
+            created["jetson"] = kwargs
+
+        @staticmethod
+        def is_available() -> bool:
+            return jetson_available
+
+    class _FakeGPUDeviceTracker:
+        def __init__(self, **kwargs) -> None:
+            created["gpu"] = kwargs
+
+    fake_module = types.SimpleNamespace(
+        JetsonDeviceTracker=_FakeJetsonDeviceTracker,
+        GPUDeviceTracker=_FakeGPUDeviceTracker,
+    )
+    monkeypatch.setitem(sys.modules, "mblt_tracker", fake_module)
+    args = argparse.Namespace(
+        device_metrics=True,
+        device_backend="gpu",
+        device_npu_id=None,
+        device_npu_rail_metrics="npu",
+        device="cuda:0",
+        device_gpu_id=None,
+    )
+    pipeline = SimpleNamespace(model=SimpleNamespace())
+
+    tracker = build_device_tracker(args, pipeline)
+
+    if jetson_available:
+        assert isinstance(tracker, _FakeJetsonDeviceTracker)
+        assert created == {"jetson": {"interval": 1.0}}
+    else:
+        assert isinstance(tracker, _FakeGPUDeviceTracker)
+        assert created == {"gpu": {"interval": 1.0, "gpu_id": 0}}
 
 
 def test_extract_device_time_series_uses_tracker_100_trace_methods():
