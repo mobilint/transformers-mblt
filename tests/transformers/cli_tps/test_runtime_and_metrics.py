@@ -1432,6 +1432,44 @@ def test_text_generate_supports_phase_callbacks_for_all_batch_sizes(batch_size: 
     assert result.num_decode == 4
 
 
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_text_generate_phase_timing_excludes_slow_tracker_callbacks(batch_size: int):
+    """Slow tracker start/stop callbacks are left out of both the TTFT and the decode duration."""
+    import time
+
+    class _TimedGenerateModel(_DummyGenerateNPUModel):
+        def generate(self, **kwargs) -> torch.Tensor:
+            input_ids = kwargs["input_ids"]
+            prompt_len = int(input_ids.shape[1])
+            outputs = torch.zeros((int(input_ids.shape[0]), prompt_len + 2), dtype=torch.long)
+            streamer = kwargs.get("streamer")
+            if streamer is not None:
+                streamer.put(input_ids)
+            time.sleep(0.02)
+            if streamer is not None:
+                streamer.put(torch.zeros((1, 1), dtype=torch.long))
+            kwargs["stopping_criteria"](outputs[:, : prompt_len + 1], None)
+            time.sleep(0.02)
+            if streamer is not None:
+                streamer.put(torch.zeros((1, 1), dtype=torch.long))
+                streamer.end()
+            return outputs
+
+    measurer = TPSMeasurer(_DummyTextPipeline(_TimedGenerateModel()))
+
+    result = measurer.measure(
+        num_prefill=8,
+        num_decode=1,
+        batch_size=batch_size,
+        on_prefill_start=lambda: time.sleep(0.1),
+        on_prefill_end=lambda: time.sleep(0.1),
+        on_decode_start=lambda: time.sleep(0.1),
+    )
+
+    assert 0.015 <= result.prefill_latency < 0.1
+    assert 0.015 <= result.decode_duration < 0.1
+
+
 def test_batched_generate_derives_phase_boundary_without_npu_timing():
     """Batched generate on a non-NPU-timed backend must split prefill and decode
     at the first-generated-token callback rather than attributing the full wall
@@ -2121,6 +2159,39 @@ def test_vlm_streamer_llm_once_fires_phase_callbacks_at_first_token():
 
     assert events == ["prefill_start", "generate_start", "prefill_end", "decode_start", "generate_end", "decode_end"]
     assert result.num_decode == 3
+
+
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_vlm_llm_once_decode_duration_excludes_boundary_callbacks(batch_size):
+    """A slow prefill-end / decode-start callback (tracker stop/start) is not counted as decode time."""
+    import time
+
+    class _TimedVLMModel(_DummyBatchedVLMModel):
+        def generate(self, **kwargs) -> torch.Tensor:
+            streamer = kwargs.get("streamer")
+            if streamer is not None:
+                streamer.put(torch.zeros((1, 0), dtype=torch.long))
+                streamer.put(torch.ones((1, 1), dtype=torch.long))
+            kwargs["stopping_criteria"](torch.zeros((batch_size, 1), dtype=torch.long), None)
+            time.sleep(0.02)
+            if streamer is not None:
+                streamer.put(torch.ones((1, 1), dtype=torch.long))
+                streamer.end()
+            return torch.zeros((batch_size, 2), dtype=torch.long)
+
+    language_model = _DummyVLMLanguageModel()
+    measurer = _DummyBatchedVLMTPSMeasurer(language_model, generated_tokens=0)
+    measurer.model = _TimedVLMModel(language_model, generated_tokens=0)
+
+    result = measurer._measure_llm_once(
+        torch.zeros((batch_size, 8, 4), dtype=torch.float32),
+        num_decode=1,
+        on_prefill_end=lambda: time.sleep(0.1),
+        on_decode_start=lambda: time.sleep(0.1),
+    )
+
+    assert 0.015 <= result.decode_duration < 0.1
+    assert result.total_time >= 0.2
 
 
 def test_vlm_fake_prefill_decode_callbacks_bracket_decode_loop():

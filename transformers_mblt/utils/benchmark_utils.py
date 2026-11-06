@@ -76,12 +76,22 @@ class _GenerationPhaseCallbacks:
         self._decode_started = False
         self._decode_finished = False
         self._first_token_ns: Optional[int] = None
+        self._decode_start_ns: Optional[int] = None
         self._decode_end_ns: Optional[int] = None
 
     @property
     def first_token_ns(self) -> Optional[int]:
         """Return the perf-counter timestamp captured at the prefill/decode boundary."""
         return self._first_token_ns
+
+    @property
+    def decode_start_ns(self) -> Optional[int]:
+        """Return the perf-counter timestamp after the prefill-end and decode-start callbacks.
+
+        ``None`` unless one of those callbacks is configured. Their run time (for example a
+        device tracker stopping and starting) falls between ``first_token_ns`` and this value.
+        """
+        return self._decode_start_ns
 
     @property
     def decode_end_ns(self) -> Optional[int]:
@@ -116,6 +126,8 @@ class _GenerationPhaseCallbacks:
             self._decode_started = True
             if self._on_decode_start is not None:
                 self._on_decode_start()
+            if self._on_prefill_end is not None or self._on_decode_start is not None:
+                self._decode_start_ns = time.perf_counter_ns()
 
     def finish_decode(self) -> None:
         """Mark the decode phase as finished."""
@@ -261,6 +273,23 @@ def npu_latency_pct(total_latency: Optional[float], npu_latency: Optional[float]
     if total_latency <= 0:
         return None
     return (npu_latency / total_latency) * 100.0
+
+
+def _decode_window_start_ns(
+    first_token_ns: Optional[int],
+    decode_start_ns: Optional[int],
+    t_end_ns: int,
+) -> Optional[int]:
+    """Return where the measured decode window starts.
+
+    The phase-boundary callbacks (a device tracker stopping for prefill and starting for decode)
+    run after the first token is timestamped and before decoding continues, so their run time is
+    not decode work. ``decode_start_ns`` (``_GenerationPhaseCallbacks.decode_start_ns``) marks the
+    end of those callbacks; fall back to ``first_token_ns`` when it is unset or out of order.
+    """
+    if first_token_ns is None or decode_start_ns is None or not first_token_ns <= decode_start_ns <= t_end_ns:
+        return first_token_ns
+    return decode_start_ns
 
 
 def _split_batch_phase_wall_time(
@@ -1167,12 +1196,14 @@ class TPSMeasurer:
             prompt_length=int(input_ids.shape[1]),
             phase_callbacks=phase_callbacks,
         )
-        if device_sync is not None:
-            device_sync()
-        t_start_ns = time.perf_counter_ns()
+        # Fire the start callbacks before the timed window opens: starting a device tracker spawns
+        # its sampler thread and reads a first sample, which would otherwise land in the phase.
         phase_callbacks.start_prefill()
         if fake_prefill:
             phase_callbacks.finish_prefill_start_decode()
+        if device_sync is not None:
+            device_sync()
+        t_start_ns = time.perf_counter_ns()
         try:
             with torch.no_grad(), _temporarily_sanitize_generation_config(self.model):
                 outputs = self.model.generate(**gen_kwargs)
@@ -1210,6 +1241,9 @@ class TPSMeasurer:
             npu_prefill_time = 0.0
         else:
             prefill_latency, decode_duration = _split_batch_phase_wall_time(t_start_ns, t_end_ns, first_token_ns)
+            decode_start_ns = _decode_window_start_ns(first_token_ns, phase_callbacks.decode_start_ns, t_end_ns)
+            if decode_start_ns is not None and decode_start_ns != first_token_ns:
+                decode_duration = _ns_to_seconds(t_end_ns - decode_start_ns)
 
         prefill_latency_ns = _seconds_to_ns(prefill_latency) or 0
         decode_duration_ns = _seconds_to_ns(decode_duration) or 0
@@ -1375,8 +1409,9 @@ class TPSMeasurer:
 
             thread = Thread(target=_run_generate)
             
-            t_start_ns = time.perf_counter_ns()
+            # Started before the timed window so tracker start-up stays out of the measured TTFT.
             phase_callbacks.start_prefill()
+            t_start_ns = time.perf_counter_ns()
             thread.start()
             
             first_token_time_ns = None
@@ -1439,7 +1474,8 @@ class TPSMeasurer:
 
             # 4. Calculation
             prefill_latency_ns = first_token_time_ns - t_start_ns
-            decode_duration_ns = t_end_ns - first_token_time_ns
+            decode_start_ns = _decode_window_start_ns(first_token_time_ns, phase_callbacks.decode_start_ns, t_end_ns)
+            decode_duration_ns = t_end_ns - decode_start_ns
             total_time_ns = t_end_ns - t_start_ns
             prefill_latency = _ns_to_seconds(prefill_latency_ns)
             prefill_tps = num_prefill / prefill_latency if prefill_latency > 0 else 0
@@ -2112,6 +2148,9 @@ class VLMTPSMeasurer:
             has_npu_time, npu_prefill_time, npu_decode_time = _read_aggregate_npu_timing(npu_timing_target)
             first_token_ns = phase_callbacks.first_token_ns
             prefill_latency, decode_duration = _split_batch_phase_wall_time(t_start_ns, t_end_ns, first_token_ns)
+            decode_start_ns = _decode_window_start_ns(first_token_ns, phase_callbacks.decode_start_ns, t_end_ns)
+            if decode_start_ns is not None and decode_start_ns != first_token_ns:
+                decode_duration = _ns_to_seconds(t_end_ns - decode_start_ns)
             total_prefill_tokens = seq_len * batch_size
             total_decode_tokens = decode_count * batch_size
             avg_total_prefill_token_latency = (
@@ -2270,7 +2309,8 @@ class VLMTPSMeasurer:
             has_npu_time = True
 
         prefill_latency_ns = first_token_time_ns - t_start_ns
-        decode_duration_ns = t_end_ns - first_token_time_ns
+        decode_start_ns = _decode_window_start_ns(first_token_time_ns, phase_callbacks.decode_start_ns, t_end_ns)
+        decode_duration_ns = t_end_ns - decode_start_ns
         total_time_ns = t_end_ns - t_start_ns
         prefill_latency = _ns_to_seconds(prefill_latency_ns)
         prefill_tps = seq_len / prefill_latency if prefill_latency > 0 else 0.0

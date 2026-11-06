@@ -14,6 +14,11 @@
   to 167, and 5.45 J of prefill energy for a 113 ms TTFT at 27 W (3.07 J); it now reports 166 tok/s/W and 3.08 J,
   with the same 113 ms TTFT. The prefill tracker starts just before the timed window, so its start-up stays out of
   the TTFT. Vision energy and `tps sweep` energy are unchanged: sweep trackers still span each whole phase loop.
+- `tps measure` with device metrics, text and VLM, leaves the device trackers' start and stop out of the measured
+  TTFT and decode duration. The prefill tracker started after the timed window opened, and the tracker hand-off at the
+  first token (prefill stop, decode start) was counted as decode time, which lowered TTFT-based and decode TPS and
+  raised the duration-scaled energy. Starting a tracker reads a first sample and spawns its sampler thread: on a
+  Jetson AGX Orin the VLM TTFT rose from 113 ms to 120 to 158 ms with the tracker started inside the window.
 
 ## 0.7.2
 
