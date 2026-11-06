@@ -27,7 +27,7 @@ dependencies = [
     "packaging",
     "tqdm",
     "matplotlib",
-    "mblt-tracker>=1.0.1",
+    "mblt-tracker>=2.0.0",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",

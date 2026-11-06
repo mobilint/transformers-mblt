@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.7.2
+
+### Changed
+
+- Require `mblt-tracker>=2.0.0`. 1.1.0 adds `JetsonDeviceTracker` and makes a repeated tracker `stop()` a no-op;
+  before it the second `stop()` the TPS CLI issues in cleanup appended a late sample to the closed prefill window, so
+  prefill energy covered the whole request. 2.0.0 moves the Mobilint NPU telemetry dependency from `mbltml` to
+  `mobilint-ml`, which publishes aarch64 wheels, so `transformers-mblt` now installs on NVIDIA Jetson. Both packages
+  install the `mbltml` module: when upgrading an environment that has `mbltml`, run `pip uninstall mbltml` first.
+
+### Fixed
+
+- `transformers-mblt tps` with `--device-backend gpu` uses mblt-tracker's `JetsonDeviceTracker` on NVIDIA Jetson
+  modules when the installed mblt-tracker provides it (1.1.0 and later), and `GPUDeviceTracker` otherwise. Jetson
+  NVML reports no power, so every power and TPS/W row read 0.000 on a Jetson AGX Orin.
+- `tps measure` for text generation computes each phase energy as the trace's time-weighted mean power times the
+  measured phase latency (TTFT for prefill, decode duration for decode). The tracker samples cover less than the
+  measured phase, so integrating only the trace under-counted the energy and over-stated TPS/W: Llama-3.2-3B with a
+  512-token prefill on a Jetson AGX Orin reported 3.6 J and 141 prefill tok/s/W for a 0.175 s TTFT whose trace spanned
+  0.097 s. Sweeps, whose trackers span many `generate` calls, and VLM `measure` still integrate the raw trace.
+
 ## 0.7.1
 
 ### Added

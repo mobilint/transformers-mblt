@@ -516,9 +516,21 @@ def build_device_tracker(args: argparse.Namespace, pipeline: Any) -> DeviceTrack
             return None
 
     if backend == "gpu":
-        from mblt_tracker import GPUDeviceTracker
+        import mblt_tracker
 
         interval = resolve_device_tracker_interval_sec(backend)
+        # Jetson GPUs report no power or utilization through NVML; mblt-tracker>=1.1.0
+        # reads the on-module INA3221 rails instead.
+        jetson_tracker_cls = getattr(mblt_tracker, "JetsonDeviceTracker", None)
+        if jetson_tracker_cls is not None and jetson_tracker_cls.is_available():
+            try:
+                return jetson_tracker_cls(interval=interval)
+            except Exception as e:
+                print(f"[device] failed to initialize Jetson tracker: {e}")
+                return None
+
+        from mblt_tracker import GPUDeviceTracker
+
         gpu_id = infer_gpu_ids(args.device, args.device_gpu_id)
         try:
             return GPUDeviceTracker(interval=interval, gpu_id=gpu_id)
@@ -593,12 +605,38 @@ def energy_from_device_time_series(
     device_time_series: Mapping[str, Sequence[Mapping[str, object]]],
     *,
     power_key: str = "power_w",
+    duration_s: float | None = None,
 ) -> float | None:
-    """Return integrated energy from a benchmark device time-series payload."""
+    """Return integrated energy from a benchmark device time-series payload.
+
+    Args:
+        device_time_series: Benchmark device time-series payload.
+        power_key: Key of the power trace in ``device_time_series``.
+        duration_s: Measured duration of the phase the trace belongs to. When given, the
+            time-weighted mean power of the trace is multiplied by this duration. A tracker starts
+            and stops inside the phase callbacks, so its first and last samples can span much less
+            than the measured phase (a 512-token GPU prefill: about 0.1 s of trace for 0.17 s of
+            TTFT), and integrating only the trace span under-counts the phase energy.
+
+    Returns:
+        Energy in joules, or ``None`` when the trace cannot produce one.
+    """
     power_trace = device_time_series.get(power_key)
     if power_trace is None:
         return None
-    return integrate_power_trace_j(power_trace)
+    energy_j = integrate_power_trace_j(power_trace)
+    if energy_j is None or duration_s is None or duration_s <= 0.0:
+        return energy_j
+    timestamps = [
+        float(timestamp_s)
+        for item in power_trace
+        if isinstance(timestamp_s := item.get("timestamp_s"), (int, float))
+        and isinstance(item.get("value"), (int, float))
+    ]
+    span_s = max(timestamps) - min(timestamps)
+    if span_s <= 0.0:
+        return energy_j
+    return energy_j / span_s * duration_s
 
 
 def add_trace_energy_to_device_metric(
