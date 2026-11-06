@@ -2,6 +2,12 @@
 
 ## 0.7.2
 
+### Changed
+
+- Require `mblt-tracker>=1.1.0`. It adds `JetsonDeviceTracker` and makes a repeated tracker `stop()` a no-op; before
+  1.1.0 the second `stop()` the TPS CLI issues in cleanup appended a late sample to the closed prefill window, so
+  prefill energy covered the whole request.
+
 ### Fixed
 
 - `transformers-mblt tps` with `--device-backend gpu` uses mblt-tracker's `JetsonDeviceTracker` on NVIDIA Jetson
