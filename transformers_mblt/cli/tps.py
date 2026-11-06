@@ -3446,6 +3446,10 @@ def _run_vlm_measure(args: argparse.Namespace) -> int:
                     on_decode_start=(lambda: llm_tracker_decode.start()) if llm_tracker_decode is not None else None,
                     on_decode_end=(lambda: llm_tracker_decode.stop()) if llm_tracker_decode is not None else None,
                     temperature=temperature,
+                    # Bracket the measured TTFT and decode window, not the whole phase loop: the
+                    # loop also builds the input embeddings, and its decode `generate` re-runs the
+                    # prefill before the decode window.
+                    phase_callbacks_per_generate=True,
                 )
             finally:
                 _stop_tracker_safe(llm_tracker_prefill)
@@ -3463,6 +3467,7 @@ def _run_vlm_measure(args: argparse.Namespace) -> int:
                     batch_size=batch_size,
                     prefill_time_series=prefill_time_series,
                     decode_time_series=decode_time_series,
+                    scale_energy_to_phase_duration=True,
                 )
             llm_results.append(llm_measurement)
     finally:

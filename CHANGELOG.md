@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.7.3
+
+### Fixed
+
+- `tps measure` for VLMs reports LLM prefill and decode energy, and the TPS/W and J/token derived from them, for the
+  measured TTFT and decode window, as text `measure` does since 0.7.2. The prefill tracker ran around the whole prefill
+  step (input embedding build plus a `generate` that also produces one decode token), and the decode tracker around a
+  `generate` that re-runs the prefill before the decode window, and their raw traces were integrated. The trackers now
+  start and stop at the timed phase boundaries, and each phase energy is the trace's time-weighted mean power times
+  the measured TTFT or decode duration. Qwen3-VL-2B-Instruct (bf16, batch 1, 224 px image, prefill 512, decode 128)
+  on a Jetson AGX Orin reported a 94 tok/s/W prefill p50 while the per-run prefill TPS over average power was 165
+  to 167, and 5.45 J of prefill energy for a 113 ms TTFT at 27 W (3.07 J); it now reports 166 tok/s/W and 3.08 J,
+  with the same 113 ms TTFT. The prefill tracker starts just before the timed window, so its start-up stays out of
+  the TTFT. Vision energy and `tps sweep` energy are unchanged: sweep trackers still span each whole phase loop.
+
 ## 0.7.2
 
 ### Changed

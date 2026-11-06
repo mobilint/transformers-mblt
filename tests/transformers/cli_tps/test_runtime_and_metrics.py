@@ -1799,60 +1799,9 @@ def test_run_vlm_measure_scales_total_ms_by_batch_size(monkeypatch, tmp_path):
     assert payload["summary"]["total"]["mean"] == pytest.approx(6000.0)
 
 
-def test_run_vlm_measure_sums_phase_trace_energy_for_total_energy(monkeypatch, tmp_path):
-    import transformers_mblt.utils.benchmark_utils as benchmark_utils
-
-    pipeline = SimpleNamespace(model=SimpleNamespace(config=_DummyConfig(max_batch_size=4)))
-
-    class _FakeTracker:
-        def __init__(self, power_trace: list[tuple[float, float]]) -> None:
-            self._power_trace = power_trace
-
-        def start(self) -> None:
-            pass
-
-        def stop(self) -> None:
-            pass
-
-        def get_metric(self) -> dict[str, float]:
-            return {"avg_power_w": 2.0}
-
-        def get_total_power_trace(self) -> list[tuple[float, float]]:
-            return self._power_trace
-
-    class _FakeVLMTPSMeasurer:
-        def __init__(self, pipeline_arg) -> None:
-            assert pipeline_arg is pipeline
-
-        def measure_vision(self, **kwargs) -> list[tuple[float, float]]:
-            return [(1.0, 4.0)]
-
-        def measure_llm_full(self, **kwargs) -> BenchmarkResult:
-            result = BenchmarkResult()
-            result.prefill_sweep.x_values.append(kwargs["prefill_range"][0])
-            result.prefill_sweep.tps_values.append(8.0)
-            result.prefill_sweep.time_values.append(1.0)
-            result.prefill_sweep.avg_total_token_latency_values.append(0.125)
-            result.prefill_sweep.avg_npu_token_latency_values.append(None)
-            result.decode_sweep.x_values.append(kwargs["cache_lengths"][0])
-            result.decode_sweep.tps_values.append(2.0)
-            result.decode_sweep.time_values.append(1.0)
-            result.decode_sweep.avg_total_token_latency_values.append(0.5)
-            result.decode_sweep.avg_npu_token_latency_values.append(None)
-            return result
-
-    json_path = tmp_path / "vlm_measure_energy.json"
-    monkeypatch.setattr(tps_cli, "_build_pipeline", lambda **kwargs: pipeline)
-    monkeypatch.setattr(tps_cli, "_build_device_tracker", lambda args, pipeline: _FakeTracker([(0.0, 2.0), (1.0, 2.0)]))
-    monkeypatch.setattr(
-        tps_cli,
-        "_build_phase_trackers",
-        lambda args, pipeline: (_FakeTracker([(0.0, 2.0), (2.0, 2.0)]), _FakeTracker([(0.0, 2.0), (3.0, 2.0)])),
-    )
-    monkeypatch.setattr(tps_cli, "_print_device_status", lambda args, tracker: None)
-    monkeypatch.setattr(benchmark_utils, "VLMTPSMeasurer", _FakeVLMTPSMeasurer)
-
-    args = argparse.Namespace(
+def _vlm_measure_energy_args(json_path) -> argparse.Namespace:
+    """Return ``tps measure`` arguments for the VLM energy tests."""
+    return argparse.Namespace(
         task="image-text-to-text",
         model="dummy",
         tokenizer=None,
@@ -1893,27 +1842,111 @@ def test_run_vlm_measure_sums_phase_trace_energy_for_total_energy(monkeypatch, t
         device_backend="npu",
     )
 
-    assert tps_cli._run_vlm_measure(args) == 0
-    payload = json.loads(json_path.read_text(encoding="utf-8"))
+
+class _FakeEnergyTracker:
+    """Device tracker double with a fixed power trace and average power."""
+
+    def __init__(self, power_trace: list[tuple[float, float]], avg_power_w: float) -> None:
+        self._power_trace = power_trace
+        self._avg_power_w = avg_power_w
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def get_metric(self) -> dict[str, float]:
+        return {"avg_power_w": self._avg_power_w}
+
+    def get_total_power_trace(self) -> list[tuple[float, float]]:
+        return self._power_trace
+
+
+def _run_vlm_measure_with_energy_traces(monkeypatch, tmp_path, llm_full_calls: list[dict]) -> dict:
+    """Run VLM ``tps measure`` on fakes with distinct phase traces and return the JSON payload.
+
+    The fake LLM phase reports a 0.5 s TTFT (prefill TPS 32 / 0.5 = 64) and a 0.25 s decode
+    window (decode TPS 8 / 0.25 = 32) for batch 4, prefill 8, decode 2. The tracker traces span
+    longer than those phases, as they did before the trackers bracketed only the measured phases:
+
+    - vision: 2 W over 3 s, 6 J integrated (vision latency 1.0 s);
+    - LLM prefill: 10 W -> 30 W over 2 s, a 20 W time-weighted mean, 40 J integrated;
+    - LLM decode: 6 W over 3 s, 18 J integrated.
+    """
+    import transformers_mblt.utils.benchmark_utils as benchmark_utils
+
+    pipeline = SimpleNamespace(model=SimpleNamespace(config=_DummyConfig(max_batch_size=4)))
+
+    class _FakeVLMTPSMeasurer:
+        def __init__(self, pipeline_arg) -> None:
+            assert pipeline_arg is pipeline
+
+        def measure_vision(self, **kwargs) -> list[tuple[float, float]]:
+            return [(1.0, 4.0)]
+
+        def measure_llm_full(self, **kwargs) -> BenchmarkResult:
+            llm_full_calls.append(kwargs)
+            result = BenchmarkResult()
+            result.prefill_sweep.x_values.append(kwargs["prefill_range"][0])
+            result.prefill_sweep.tps_values.append(64.0)
+            result.prefill_sweep.time_values.append(0.5)
+            result.prefill_sweep.avg_total_token_latency_values.append(0.5 / 32)
+            result.prefill_sweep.avg_npu_token_latency_values.append(None)
+            result.decode_sweep.x_values.append(kwargs["cache_lengths"][0])
+            result.decode_sweep.tps_values.append(32.0)
+            result.decode_sweep.time_values.append(0.25)
+            result.decode_sweep.avg_total_token_latency_values.append(0.25 / 8)
+            result.decode_sweep.avg_npu_token_latency_values.append(None)
+            return result
+
+    json_path = tmp_path / "vlm_measure_energy.json"
+    monkeypatch.setattr(tps_cli, "_build_pipeline", lambda **kwargs: pipeline)
+    monkeypatch.setattr(
+        tps_cli,
+        "_build_device_tracker",
+        lambda args, pipeline: _FakeEnergyTracker([(0.0, 2.0), (3.0, 2.0)], avg_power_w=2.0),
+    )
+    monkeypatch.setattr(
+        tps_cli,
+        "_build_phase_trackers",
+        lambda args, pipeline: (
+            _FakeEnergyTracker([(0.0, 10.0), (2.0, 30.0)], avg_power_w=20.0),
+            _FakeEnergyTracker([(0.0, 6.0), (3.0, 6.0)], avg_power_w=6.0),
+        ),
+    )
+    monkeypatch.setattr(tps_cli, "_print_device_status", lambda args, tracker: None)
+    monkeypatch.setattr(benchmark_utils, "VLMTPSMeasurer", _FakeVLMTPSMeasurer)
+
+    assert tps_cli._run_vlm_measure(_vlm_measure_energy_args(json_path)) == 0
+    return json.loads(json_path.read_text(encoding="utf-8"))
+
+
+def test_run_vlm_measure_sums_phase_trace_energy_for_total_energy(monkeypatch, tmp_path):
+    payload = _run_vlm_measure_with_energy_traces(monkeypatch, tmp_path, [])
+
+    # LLM phase energy = trace time-weighted mean power x measured phase duration:
+    # prefill 20 W x 0.5 s TTFT = 10 J; decode 6 W x 0.25 s decode = 1.5 J; LLM total 11.5 J.
+    # Vision energy stays the integrated vision trace (2 W x 3 s = 6 J), so total = 17.5 J.
     # `device_runs` stays as the raw device-metric dict (not spec-canonical).
-    assert payload["device_runs"][0]["vision_energy_j"] == pytest.approx(2.0)
-    assert payload["device_runs"][0]["prefill_energy_j"] == pytest.approx(4.0)
-    assert payload["device_runs"][0]["decode_energy_j"] == pytest.approx(6.0)
-    assert payload["device_runs"][0]["llm_energy_j"] == pytest.approx(10.0)
-    assert payload["device_runs"][0]["total_energy_j"] == pytest.approx(12.0)
+    assert payload["device_runs"][0]["vision_energy_j"] == pytest.approx(6.0)
+    assert payload["device_runs"][0]["prefill_energy_j"] == pytest.approx(10.0)
+    assert payload["device_runs"][0]["decode_energy_j"] == pytest.approx(1.5)
+    assert payload["device_runs"][0]["llm_energy_j"] == pytest.approx(11.5)
+    assert payload["device_runs"][0]["total_energy_j"] == pytest.approx(17.5)
     # The spec-canonical summary uses bare, unit-free canonical keys with an
     # llm_ prefix on the LLM subtable inside a VLM section.
-    assert payload["summary"]["vision_energy"]["mean"] == pytest.approx(2.0)
-    assert payload["summary"]["llm_prefill_energy"]["mean"] == pytest.approx(4.0)
-    assert payload["summary"]["llm_decode_energy"]["mean"] == pytest.approx(6.0)
-    assert payload["summary"]["llm_total_energy"]["mean"] == pytest.approx(10.0)
-    assert payload["summary"]["total_energy"]["mean"] == pytest.approx(12.0)
-    # prefill_tokens = num_prefill * batch = 8 * 4 = 32; prefill_energy = 4.0
-    assert payload["summary"]["llm_prefill_tps_per_w"]["mean"] == pytest.approx(32 / 4.0)
-    # decode_tokens = num_decode * batch = 2 * 4 = 8; decode_energy = 6.0
-    assert payload["summary"]["llm_decode_tps_per_w"]["mean"] == pytest.approx(8 / 6.0)
-    assert payload["summary"]["llm_prefill_j_per_tok"]["mean"] == pytest.approx(4.0 / 32)
-    assert payload["summary"]["llm_decode_j_per_tok"]["mean"] == pytest.approx(6.0 / 8)
+    assert payload["summary"]["vision_energy"]["mean"] == pytest.approx(6.0)
+    assert payload["summary"]["llm_prefill_energy"]["mean"] == pytest.approx(10.0)
+    assert payload["summary"]["llm_decode_energy"]["mean"] == pytest.approx(1.5)
+    assert payload["summary"]["llm_total_energy"]["mean"] == pytest.approx(11.5)
+    assert payload["summary"]["total_energy"]["mean"] == pytest.approx(17.5)
+    # prefill_tokens = num_prefill * batch = 8 * 4 = 32; prefill_energy = 10 J
+    assert payload["summary"]["llm_prefill_tps_per_w"]["mean"] == pytest.approx(32 / 10.0)
+    # decode_tokens = num_decode * batch = 2 * 4 = 8; decode_energy = 1.5 J
+    assert payload["summary"]["llm_decode_tps_per_w"]["mean"] == pytest.approx(8 / 1.5)
+    assert payload["summary"]["llm_prefill_j_per_tok"]["mean"] == pytest.approx(10.0 / 32)
+    assert payload["summary"]["llm_decode_j_per_tok"]["mean"] == pytest.approx(1.5 / 8)
     # Regression guard for Codex-review gamma: llm_total_energy must be
     # sourced from run.llm_total_energy_j (LLM-only), NOT total_energy_j
     # (which was overwritten with vision+LLM).
@@ -1921,8 +1954,213 @@ def test_run_vlm_measure_sums_phase_trace_energy_for_total_energy(monkeypatch, t
     # Per-run canonical projection: efficiency keys carry the llm_ prefix in
     # a VLM section.
     run = payload["runs"][0]
-    assert run["llm_prefill_tps_per_w"] == pytest.approx(32 / 4.0)
-    assert run["llm_decode_tps_per_w"] == pytest.approx(8 / 6.0)
+    assert run["llm_prefill_tps_per_w"] == pytest.approx(32 / 10.0)
+    assert run["llm_decode_tps_per_w"] == pytest.approx(8 / 1.5)
+
+
+def test_run_vlm_measure_llm_tps_per_w_matches_tps_over_avg_power(monkeypatch, tmp_path):
+    """VLM measure LLM TPS/W equals phase TPS / phase average power, as text measure does.
+
+    Before the fix the phase energy integrated the whole tracker window (40 J prefill, 18 J
+    decode), so prefill TPS/W read 32 / 40 = 0.8 instead of 64 TPS / 20 W = 3.2.
+    """
+    llm_full_calls: list[dict] = []
+    payload = _run_vlm_measure_with_energy_traces(monkeypatch, tmp_path, llm_full_calls)
+
+    # The trackers bracket the measured TTFT and decode window, not the whole phase loop.
+    assert [call["phase_callbacks_per_generate"] for call in llm_full_calls] == [True]
+    run = payload["runs"][0]
+    assert run["llm_prefill_tps_per_w"] == pytest.approx(64.0 / 20.0)
+    assert run["llm_decode_tps_per_w"] == pytest.approx(32.0 / 6.0)
+    summary = payload["summary"]
+    assert summary["llm_prefill_tps_per_w"]["mean"] == pytest.approx(
+        summary["llm_prefill_tps"]["mean"] / summary["llm_prefill_avg_power"]["mean"]
+    )
+    assert summary["llm_decode_tps_per_w"]["mean"] == pytest.approx(
+        summary["llm_decode_tps"]["mean"] / summary["llm_decode_avg_power"]["mean"]
+    )
+    # Vision energy is not rescaled to the 1.0 s vision latency (which would give 2 J).
+    assert summary["vision_energy"]["mean"] == pytest.approx(6.0)
+    assert summary["vision_img_per_j"]["mean"] == pytest.approx(4 / 6.0)
+
+
+class _PhaseEventVLMModel(_DummyBatchedVLMModel):
+    """Batched VLM double that logs ``generate`` boundaries around the first-token marker."""
+
+    def __init__(self, language_model: _DummyVLMLanguageModel, generated_tokens: int, events: list[str]) -> None:
+        super().__init__(language_model, generated_tokens)
+        self.events = events
+
+    def generate(self, **kwargs) -> torch.Tensor:
+        self.events.append("generate_start")
+        batch_size = int(kwargs["inputs_embeds"].shape[0])
+        kwargs["stopping_criteria"](torch.zeros((batch_size, 1), dtype=torch.long), None)
+        self.events.append("generate_end")
+        return torch.zeros((batch_size, int(kwargs["max_new_tokens"])), dtype=torch.long)
+
+
+class _PhaseEventVLMTPSMeasurer(_DummyBatchedVLMTPSMeasurer):
+    """VLM measurer double whose ``measure_llm_full`` runs real batched ``generate`` timing."""
+
+    def __init__(self, events: list[str]) -> None:
+        language_model = _DummyVLMLanguageModel()
+        super().__init__(language_model, generated_tokens=0)
+        self.model = _PhaseEventVLMModel(language_model, generated_tokens=0, events=events)
+        self.events = events
+
+    def _build_inputs(self, image_resolution: int, prompt: str, batch_size: int = 1) -> dict[str, object]:
+        return {"batch_size": batch_size}
+
+    def _measure_vision_encode(self, inputs: dict) -> tuple[float, torch.Tensor]:
+        self.events.append("vision_encode")
+        return 0.0, torch.zeros((1, 4), dtype=torch.float32)
+
+    def _build_inputs_embeds_from_base(self, inputs, image_features, total_prefill_len):
+        self.events.append("build_inputs_embeds")
+        return torch.zeros((int(inputs["batch_size"]), total_prefill_len, 4), dtype=torch.float32), 1
+
+
+def _phase_event_callbacks(events: list[str]) -> dict[str, object]:
+    return {
+        "on_prefill_start": lambda: events.append("prefill_start"),
+        "on_prefill_end": lambda: events.append("prefill_end"),
+        "on_decode_start": lambda: events.append("decode_start"),
+        "on_decode_end": lambda: events.append("decode_end"),
+    }
+
+
+@pytest.mark.parametrize(
+    ("phase_callbacks_per_generate", "expected_events"),
+    [
+        (
+            False,
+            [
+                "vision_encode",
+                "prefill_start",
+                "build_inputs_embeds",
+                "generate_start",
+                "generate_end",
+                "prefill_end",
+                "decode_start",
+                "build_inputs_embeds",
+                "generate_start",
+                "generate_end",
+                "decode_end",
+            ],
+        ),
+        (
+            True,
+            [
+                "vision_encode",
+                "build_inputs_embeds",
+                "prefill_start",
+                "generate_start",
+                "prefill_end",
+                "generate_end",
+                "build_inputs_embeds",
+                "generate_start",
+                "decode_start",
+                "generate_end",
+                "decode_end",
+            ],
+        ),
+    ],
+)
+def test_vlm_measure_llm_full_phase_callback_windows(monkeypatch, phase_callbacks_per_generate, expected_events):
+    """Per-generate callbacks bracket the timed TTFT and the decode window of the decode ``generate``.
+
+    The loop-level default keeps the input embedding build and the decode ``generate``'s own prefill
+    inside the windows, which the sweep's whole-loop energy relies on.
+    """
+    import transformers_mblt.utils.benchmark_utils as benchmark_utils
+
+    monkeypatch.setattr(benchmark_utils, "_supports_fake_decode_prefill", lambda model: False)
+    events: list[str] = []
+    measurer = _PhaseEventVLMTPSMeasurer(events)
+
+    result = measurer.measure_llm_full(
+        image_resolution=224,
+        prompt="Describe the image.",
+        prefill_range=(8, 8, 8),
+        cache_lengths=[8],
+        decode_window=4,
+        batch_size=2,
+        phase_callbacks_per_generate=phase_callbacks_per_generate,
+        **_phase_event_callbacks(events),
+    )
+
+    assert events == expected_events
+    assert result.prefill_sweep.x_values == [8]
+    assert result.decode_sweep.x_values == [8]
+
+
+def test_vlm_streamer_llm_once_fires_phase_callbacks_at_first_token():
+    """The batch-1 streamer path brackets prefill and decode at the first generated token."""
+    events: list[str] = []
+
+    class _StreamingVLMModel(_DummyBatchedVLMModel):
+        def generate(self, **kwargs) -> None:
+            events.append("generate_start")
+            streamer = kwargs["streamer"]
+            streamer.put(torch.zeros((1, 0), dtype=torch.long))
+            for step in range(int(kwargs["max_new_tokens"])):
+                streamer.put(torch.ones((1, 1), dtype=torch.long))
+                kwargs["stopping_criteria"](torch.zeros((1, step + 1), dtype=torch.long), None)
+            events.append("generate_end")
+            streamer.end()
+
+    language_model = _DummyVLMLanguageModel()
+    measurer = _DummyBatchedVLMTPSMeasurer(language_model, generated_tokens=0)
+    measurer.model = _StreamingVLMModel(language_model, generated_tokens=0)
+
+    result = measurer._measure_llm_once(
+        torch.zeros((1, 8, 4), dtype=torch.float32),
+        num_decode=3,
+        **_phase_event_callbacks(events),
+    )
+
+    assert events == ["prefill_start", "generate_start", "prefill_end", "decode_start", "generate_end", "decode_end"]
+    assert result.num_decode == 3
+
+
+def test_vlm_fake_prefill_decode_callbacks_bracket_decode_loop():
+    events: list[str] = []
+    language_model = _DummyVLMLanguageModel()
+    original_forward = language_model.forward
+
+    def _forward(**kwargs):
+        events.append("forward")
+        return original_forward(**kwargs)
+
+    language_model.forward = _forward
+    measurer = _DummyVLMTPSMeasurer(language_model)
+
+    result = measurer._measure_llm_decode_with_fake_prefill(
+        cache_len=8,
+        num_decode=3,
+        on_decode_start=lambda: events.append("decode_start"),
+        on_decode_end=lambda: events.append("decode_end"),
+    )
+
+    assert events == ["decode_start", "forward", "forward", "forward", "decode_end"]
+    assert result.num_decode == 3
+
+
+@pytest.mark.parametrize(
+    ("prefill_range", "cache_lengths"),
+    [((8, 16, 8), [8]), ((8, 8, 8), [8, 16])],
+)
+def test_vlm_measure_llm_full_per_generate_callbacks_require_one_point(prefill_range, cache_lengths):
+    measurer = _PhaseEventVLMTPSMeasurer([])
+
+    with pytest.raises(ValueError, match="exactly one prefill length and one cache length"):
+        measurer.measure_llm_full(
+            image_resolution=224,
+            prompt="Describe the image.",
+            prefill_range=prefill_range,
+            cache_lengths=cache_lengths,
+            phase_callbacks_per_generate=True,
+        )
 
 
 def test_run_vlm_measure_ignores_tracker_stop_errors(monkeypatch):

@@ -2019,7 +2019,18 @@ class VLMTPSMeasurer:
         show_progress: bool = False,
         progress_desc: Union[str, None] = None,
         temperature: float = 0.0,
+        on_prefill_start: Optional[Callable[[], None]] = None,
+        on_prefill_end: Optional[Callable[[], None]] = None,
+        on_decode_start: Optional[Callable[[], None]] = None,
+        on_decode_end: Optional[Callable[[], None]] = None,
     ) -> SingleMeasurement:
+        """Measure one VLM language-model ``generate`` call from prepared ``inputs_embeds``.
+
+        The ``on_*`` callbacks fire at the boundaries the reported phase timings use: prefill from
+        the start of ``generate`` to the first generated token, decode from that token to the end
+        of ``generate``. ``on_prefill_start`` fires just before the timed window opens, so the
+        callback's own cost is not part of the measured TTFT.
+        """
         seq_len = int(inputs_embeds.shape[1])
         lm_for_npu = self._get_language_model()
         gen_model = self.model
@@ -2056,7 +2067,13 @@ class VLMTPSMeasurer:
                 _reset_npu_timing(npu_timing_target)
             _apply_eagle3_gen_kwargs(gen_kwargs, gen_model)
             device_sync = _make_device_sync_callable(inputs_embeds.device)
-            phase_callbacks = _GenerationPhaseCallbacks(sync_before_timestamp=device_sync)
+            phase_callbacks = _GenerationPhaseCallbacks(
+                on_prefill_start=on_prefill_start,
+                on_prefill_end=on_prefill_end,
+                on_decode_start=on_decode_start,
+                on_decode_end=on_decode_end,
+                sync_before_timestamp=device_sync,
+            )
             # HF ``generate`` seeds bookkeeping ``input_ids`` at shape ``(batch, 0)`` when only
             # ``inputs_embeds`` is passed, so the first-generated-token marker must compare
             # against zero rather than the embedding-prompt length.
@@ -2065,10 +2082,13 @@ class VLMTPSMeasurer:
                 prompt_length=0,
                 phase_callbacks=phase_callbacks,
             )
+            # Fire the prefill-start callback before the timed window opens: starting a device
+            # tracker spawns its sampler thread and reads a first sample, which would otherwise
+            # land in the measured TTFT.
+            phase_callbacks.start_prefill()
             if device_sync is not None:
                 device_sync()
             t_start_ns = time.perf_counter_ns()
-            phase_callbacks.start_prefill()
             try:
                 with torch.no_grad(), _temporarily_sanitize_generation_config(gen_model):
                     outputs = gen_model.generate(**gen_kwargs)
@@ -2172,6 +2192,19 @@ class VLMTPSMeasurer:
             gen_kwargs["count_npu_time"] = True
             _reset_npu_timing(npu_timing_target)
         _apply_eagle3_gen_kwargs(gen_kwargs, gen_model)
+        phase_callbacks = _GenerationPhaseCallbacks(
+            on_prefill_start=on_prefill_start,
+            on_prefill_end=on_prefill_end,
+            on_decode_start=on_decode_start,
+            on_decode_end=on_decode_end,
+        )
+        # ``generate`` seeds bookkeeping ``input_ids`` at ``(batch, 0)`` for an
+        # ``inputs_embeds``-only call, so the first-token marker compares against zero.
+        _with_first_token_stopping_criteria(
+            gen_kwargs,
+            prompt_length=0,
+            phase_callbacks=phase_callbacks,
+        )
 
         thread_error: list[Exception] = []
 
@@ -2184,6 +2217,8 @@ class VLMTPSMeasurer:
                 streamer.end()
 
         thread = Thread(target=_run_generate)
+        # Started before the timed window so tracker start-up stays out of the measured TTFT.
+        phase_callbacks.start_prefill()
         t_start_ns = time.perf_counter_ns()
         thread.start()
 
@@ -2221,7 +2256,9 @@ class VLMTPSMeasurer:
         t_end_ns = time.perf_counter_ns()
         thread.join()
         if thread_error:
+            phase_callbacks.close_on_error()
             raise RuntimeError(f"VLM LLM-phase generate failed: {thread_error[0]}") from thread_error[0]
+        phase_callbacks.finish_decode()
         assert first_token_time_ns is not None
 
         has_aggregate_npu_time, aggregate_prefill_time, aggregate_decode_time = _read_aggregate_npu_timing(
@@ -2286,8 +2323,13 @@ class VLMTPSMeasurer:
         batch_size: int = 1,
         show_progress: bool = False,
         progress_desc: Union[str, None] = None,
+        on_decode_start: Optional[Callable[[], None]] = None,
+        on_decode_end: Optional[Callable[[], None]] = None,
     ) -> SingleMeasurement:
-        """Measure VLM language-model decode TPS with fake prefilled cache length."""
+        """Measure VLM language-model decode TPS with fake prefilled cache length.
+
+        ``on_decode_start`` fires just before the timed decode loop and ``on_decode_end`` just after it.
+        """
         assert cache_len > 0, "cache_len should be positive! cache_len: %d" % cache_len
         assert num_decode > 0, "num_decode should be positive! num_decode: %d" % num_decode
         batch_size = _validate_batch_size(batch_size)
@@ -2322,10 +2364,6 @@ class VLMTPSMeasurer:
         npu_timing_target = _get_npu_timing_target(lm_for_npu)
         count_npu_time = npu_timing_target is not None
         _reset_npu_timing(npu_timing_target)
-        t_start_ns = time.perf_counter_ns()
-        decoded_tokens = 0
-        npu_decode_time = 0.0
-        has_npu_time = False
         token_pbar = None
         if show_progress:
             token_pbar = tqdm(
@@ -2333,6 +2371,13 @@ class VLMTPSMeasurer:
                 desc=progress_desc or f"vlm fake decode (cache={cache_len}, window={num_decode})",
                 leave=False,
             )
+        phase_callbacks = _GenerationPhaseCallbacks(on_decode_start=on_decode_start, on_decode_end=on_decode_end)
+        # Started before the timed window so tracker start-up stays out of the decode duration.
+        phase_callbacks.finish_prefill_start_decode()
+        t_start_ns = time.perf_counter_ns()
+        decoded_tokens = 0
+        npu_decode_time = 0.0
+        has_npu_time = False
 
         try:
             with torch.no_grad():
@@ -2362,11 +2407,14 @@ class VLMTPSMeasurer:
                     if npu_time is not None:
                         has_npu_time = True
                         npu_decode_time += npu_time
+            t_end_ns = time.perf_counter_ns()
+            phase_callbacks.finish_decode()
+        except Exception:
+            phase_callbacks.close_on_error()
+            raise
         finally:
             if token_pbar is not None:
                 token_pbar.close()
-
-        t_end_ns = time.perf_counter_ns()
 
         has_aggregate_npu_time, _, aggregate_decode_time = _read_aggregate_npu_timing(npu_timing_target)
         if has_aggregate_npu_time:
@@ -2495,22 +2543,51 @@ class VLMTPSMeasurer:
         on_decode_start: Optional[Callable[[], None]] = None,
         on_decode_end: Optional[Callable[[], None]] = None,
         temperature: float = 0.0,
+        phase_callbacks_per_generate: bool = False,
     ) -> BenchmarkResult:
+        """Measure VLM language-model prefill and decode sweeps from one shared image.
+
+        Args:
+            phase_callbacks_per_generate: By default, ``on_prefill_*`` bracket the whole prefill
+                sweep loop and ``on_decode_*`` the whole decode sweep loop (input embedding builds,
+                every ``generate`` call, and, on the real-prefill decode path, each call's prefill).
+                When ``True``, they instead bracket the measured phases of the single sweep point:
+                prefill from the start of the prefill ``generate`` to its first token, and decode
+                over the decode window only (from the first token of the decode ``generate``, or
+                the fake-prefill decode loop). This requires exactly one prefill length and one
+                cache length.
+        """
         full_result = BenchmarkResult()
         batch_size = _validate_batch_size(batch_size)
         prefix = f"{progress_prefix} " if progress_prefix else ""
         resolved_cache_lengths = list(cache_lengths or [1024, 2048, 4096, 8192])
+        p_start, p_end, p_step = prefill_range
+        if phase_callbacks_per_generate and (
+            len(range(p_start, p_end + 1, p_step)) != 1 or len(resolved_cache_lengths) != 1
+        ):
+            raise ValueError(
+                "phase_callbacks_per_generate=True needs exactly one prefill length and one cache length, "
+                f"got prefill_range={prefill_range} and cache_lengths={resolved_cache_lengths}."
+            )
+        prefill_phase_callbacks: dict[str, Optional[Callable[[], None]]] = {}
+        decode_phase_callbacks: dict[str, Optional[Callable[[], None]]] = {}
+        if phase_callbacks_per_generate:
+            loop_prefill_start = loop_prefill_end = loop_decode_start = loop_decode_end = None
+            prefill_phase_callbacks = {"on_prefill_start": on_prefill_start, "on_prefill_end": on_prefill_end}
+            decode_phase_callbacks = {"on_decode_start": on_decode_start, "on_decode_end": on_decode_end}
+        else:
+            loop_prefill_start, loop_prefill_end = on_prefill_start, on_prefill_end
+            loop_decode_start, loop_decode_end = on_decode_start, on_decode_end
         base_inputs = self._build_inputs(image_resolution=image_resolution, prompt=prompt, batch_size=batch_size)
         _, image_features = self._measure_vision_encode(base_inputs)
 
-        p_start, p_end, p_step = prefill_range
         prefill_iter = range(p_start, p_end + 1, p_step)
         if show_progress:
             prefill_iter = tqdm(prefill_iter, desc=f"{prefix}vlm llm prefill sweep", leave=False)
 
         t_prefill_start = time.perf_counter()
-        if on_prefill_start is not None:
-            on_prefill_start()
+        if loop_prefill_start is not None:
+            loop_prefill_start()
         min_total_len_seen: int | None = None
         try:
             for p_len in prefill_iter:
@@ -2534,6 +2611,7 @@ class VLMTPSMeasurer:
                     show_progress=show_progress,
                     progress_desc=f"{prefix}vlm llm prefill generate ({p_len})",
                     temperature=temperature,
+                    **prefill_phase_callbacks,
                 )
                 full_result.prefill_sweep.x_values.append(p_len)
                 full_result.prefill_sweep.tps_values.append(res.prefill_tps)
@@ -2542,8 +2620,8 @@ class VLMTPSMeasurer:
                 full_result.prefill_sweep.avg_npu_token_latency_values.append(res.avg_npu_prefill_token_latency)
         finally:
             t_prefill_end = time.perf_counter()
-            if on_prefill_end is not None:
-                on_prefill_end()
+            if loop_prefill_end is not None:
+                loop_prefill_end()
         full_result.prefill_phase_duration_s = max(0.0, t_prefill_end - t_prefill_start)
 
         decode_iter = resolved_cache_lengths
@@ -2551,8 +2629,8 @@ class VLMTPSMeasurer:
             decode_iter = tqdm(decode_iter, desc=f"{prefix}vlm llm decode sweep", leave=False)
 
         t_decode_start = time.perf_counter()
-        if on_decode_start is not None:
-            on_decode_start()
+        if loop_decode_start is not None:
+            loop_decode_start()
         use_fake_decode_prefill = _supports_fake_decode_prefill(self._get_language_model())
         try:
             for cache_len in decode_iter:
@@ -2564,6 +2642,7 @@ class VLMTPSMeasurer:
                         batch_size=batch_size,
                         show_progress=show_progress,
                         progress_desc=progress_desc,
+                        **decode_phase_callbacks,
                     )
                 else:
                     inputs_embeds, min_total_len = self._build_inputs_embeds_from_base(
@@ -2588,6 +2667,7 @@ class VLMTPSMeasurer:
                         show_progress=show_progress,
                         progress_desc=progress_desc,
                         temperature=temperature,
+                        **decode_phase_callbacks,
                     )
                 full_result.decode_sweep.x_values.append(cache_len)
                 full_result.decode_sweep.tps_values.append(res.decode_tps)
@@ -2597,8 +2677,8 @@ class VLMTPSMeasurer:
                 full_result.decode_prefill_modes.append(res.decode_prefill_mode)
         finally:
             t_decode_end = time.perf_counter()
-            if on_decode_end is not None:
-                on_decode_end()
+            if loop_decode_end is not None:
+                loop_decode_end()
         full_result.decode_phase_duration_s = max(0.0, t_decode_end - t_decode_start)
 
         if (

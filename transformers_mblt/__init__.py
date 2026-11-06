@@ -6,7 +6,7 @@ Import :mod:`transformers_mblt` and call :func:`register` to make the ``mobilint
 
 from typing import TYPE_CHECKING
 
-__version__ = "0.7.2"
+__version__ = "0.7.3"
 
 if TYPE_CHECKING:
     from . import models, utils
