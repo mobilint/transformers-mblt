@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.7.3
+
+### Fixed
+
+- `tps measure` for VLMs reports LLM prefill and decode energy, and the TPS/W and J/token derived from them, for the
+  measured TTFT and decode window, as text `measure` does since 0.7.2. The prefill tracker ran around the whole prefill
+  step (input embedding build plus a `generate` that also produces one decode token), and the decode tracker around a
+  `generate` that re-runs the prefill before the decode window, and their raw traces were integrated. The trackers now
+  start and stop at the timed phase boundaries, and each phase energy is the trace's time-weighted mean power times
+  the measured TTFT or decode duration. Qwen3-VL-2B-Instruct (bf16, batch 1, 224 px image, prefill 512, decode 128)
+  on a Jetson AGX Orin reported a 94 tok/s/W prefill p50 while the per-run prefill TPS over average power was 165
+  to 167, and 5.45 J of prefill energy for a 113 ms TTFT at 27 W (3.07 J); it now reports 166 tok/s/W and 3.08 J,
+  with the same 113 ms TTFT. The prefill tracker starts just before the timed window, so its start-up stays out of
+  the TTFT. Vision energy and `tps sweep` energy are unchanged: sweep trackers still span each whole phase loop.
+- `tps measure` with device metrics, text and VLM, leaves the device trackers' start and stop out of the measured
+  TTFT and decode duration. The prefill tracker started after the timed window opened, and the tracker hand-off at the
+  first token (prefill stop, decode start) was counted as decode time, which lowered TTFT-based and decode TPS and
+  raised the duration-scaled energy. Starting a tracker reads a first sample and spawns its sampler thread: on a
+  Jetson AGX Orin the VLM TTFT rose from 113 ms to 120 to 158 ms with the tracker started inside the window.
+
 ## 0.7.2
 
 ### Changed
