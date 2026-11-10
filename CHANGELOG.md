@@ -2,6 +2,13 @@
 
 ## 0.7.3
 
+### Added
+
+- EXAONE 3.5 EAGLE-3 speculative decoding: `MobilintExaoneEagle3Config` / `MobilintExaoneEagle3ForCausalLM`
+  (`model_type` `mobilint-exaone-eagle3`, `transformers_mblt/models/exaone_eagle3/`) wire the EXAONE 3.5 base body,
+  the Llama-family one-block draft, and the FC projector on the shared EAGLE-3 mixins, for the
+  `mobilint/EAGLE3-EXAONE-3.5-2.4B-Instruct` release.
+
 ### Changed
 
 - EAGLE-3 sampling computes the softmax and the next-token draw over the `TopKLogitsWarper` support instead of the
