@@ -20,7 +20,9 @@ logger = logging.get_logger(__name__)
 class MobilintQwen3MoEForCausalLM(MobilintMixtureOfExpertsModelMixin, MobilintMixtureOfExpertsGenerationMixin):
     """Qwen3-MoE causal LM running on the Mobilint NPU.
 
-    Only ``batch_size == 1`` is supported, so ``attention_mask`` must be all ones.
+    A release of individual MXQs serves one sequence (``attention_mask`` must be all ones). A BatchLLM MXQ package
+    release (``config.moe_mxq_package`` with ``max_batch_size > 1``) serves up to ``max_batch_size`` left-padded
+    sequences per call.
     """
 
     config: MobilintQwen3MoEConfig
@@ -56,13 +58,9 @@ class MobilintQwen3MoEForCausalLM(MobilintMixtureOfExpertsModelMixin, MobilintMi
             inputs_embeds = self.embed_tokens(input_ids)
 
         assert inputs_embeds is not None
-        if attention_mask is not None and not bool(torch.all(attention_mask == 1)):
-            raise NotImplementedError(
-                f"{type(self).__name__} supports only batch_size=1 without padding; attention_mask must be all ones."
-            )
-
+        configured_batch_size = max(1, int(self.config.max_batch_size))
         if use_cache and past_key_values is None:
-            past_key_values = self._get_cache("", 1, 0)
+            past_key_values = self._get_cache("", configured_batch_size, 0)
 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -77,6 +75,7 @@ class MobilintQwen3MoEForCausalLM(MobilintMixtureOfExpertsModelMixin, MobilintMi
             npu_prefill_chunk_size,
             count_npu_time=count_npu_time,
             logits_to_keep=logits_to_keep,
+            attention_mask=attention_mask,
         )
 
         loss = None

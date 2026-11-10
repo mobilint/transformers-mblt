@@ -96,12 +96,20 @@ def test_config_rejects_malformed_shared_output_order(order: Any) -> None:
         _small_config(moe_shared_output_order=order)
 
 
-def test_config_rejects_batched_generation() -> None:
+def test_config_records_the_compiled_batch_capacity() -> None:
     config = _small_config()
-
     assert config.max_batch_size == 1
-    with pytest.raises(ValueError, match="max_batch_size=1"):
-        config.max_batch_size = 2
+    assert config.moe_mxq_package is None
+    assert not config.is_batch_package
+
+    package = _small_config(moe_mxq_package="mxq/release.mxqpkg", max_batch_size=16)
+    assert package.max_batch_size == 16
+    assert package.is_batch_package
+    restored = MobilintQwen3MoEConfig.from_dict(package.to_dict())
+    assert restored.moe_mxq_package == "mxq/release.mxqpkg"
+    assert restored.max_batch_size == 16
+    with pytest.raises(ValueError):
+        package.max_batch_size = 0
 
 
 # ---- Backend topology -----------------------------------------------------------------------------------------

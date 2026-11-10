@@ -360,8 +360,9 @@ roles instead of one MXQ:
 - `lm_head`: one MXQ.
 
 The router (softmax, top-k, and renormalization when `norm_topk_prob` is set) and the weighted sum of the
-expert outputs run on the host between the shared and expert MXQs. Only `batch_size=1` is supported, so
-`max_batch_size` stays `1` and `attention_mask` must be all ones.
+expert outputs run on the host between the shared and expert MXQs. A release of individual MXQs serves one
+sequence at a time (`max_batch_size` is `1` and `attention_mask` must be all ones); a BatchLLM MXQ package
+release serves several, see below.
 
 ```python
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -370,6 +371,59 @@ model_id = "mobilint/Qwen3-30B-A3B-aries-rb"
 tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 model = AutoModelForCausalLM.from_pretrained(model_id, trust_remote_code=True)
 ```
+
+#### BatchLLM MXQ package releases
+
+The compiler can emit a whole MoE release as one qbruntime MXQ package (`.mxqpkg`, e.g.
+`mobilint/Qwen3-30B-A3B-Batch16-aries-rb`): every shared, expert and `lm_head` MXQ plus the compiler's
+`manifest.json`, read by `qbruntime.ModelPackage` without unpacking. This needs mobilint-qb-runtime 1.6.0 or
+later, which is not published yet; an older runtime raises a clear error when it meets such a release.
+`config.json` names it through `moe_mxq_package`, and the manifest supplies the entry names and the residual
+output of every shared MXQ, so `shared_mxq_path`, `expert_mxq_path`, `lm_head_mxq_path` and
+`moe_mxq_pack_index` are unused. A package compiled for BatchLLM (`"batch": true` in its manifest) serves
+`max_batch_size` sequences at once, each in its own KV slot of every shared MXQ; `config.json` records the
+compiled capacity and the loader checks it against the package.
+
+```python
+model_id = "mobilint/Qwen3-30B-A3B-Batch16-aries-rb"
+tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+tokenizer.padding_side = "left"
+model = AutoModelForCausalLM.from_pretrained(model_id, trust_remote_code=True)
+inputs = tokenizer(prompts, return_tensors="pt", padding=True)  # up to model.config.max_batch_size prompts
+outputs = model.generate(**inputs, max_new_tokens=128)
+```
+
+Each step feeds every unfinished sequence its next tokens, at most `npu_prefill_chunk_size` (capped by the
+package's per-sequence input width, 128 for the Qwen3-30B-A3B release) per sequence and at most the package's
+per-step width (512) over all sequences, so a full batch of long prompts prefills in smaller slices than a single
+prompt. Every shared MXQ runs once per step on the concatenated tokens with one `BatchParam` per sequence (its
+token count, KV length and KV slot). The routed `(token, slot)` pairs of all sequences are grouped by expert, so
+each selected expert runs once per layer and step on all of its tokens, which is where the batch throughput
+comes from. The last decoder layer of a batch package is post-slice: its shared MXQ emits one row per sequence
+(each sequence's last token), and that layer's experts and the `lm_head` take `BatchParam` rows of one token.
+A batch package therefore returns only each sequence's last-token logits (`logits_to_keep=1`, which
+`generate` uses); `logits_to_keep=0` raises `NotImplementedError`.
+
+`MobilintMixtureOfExpertsCache` follows `MobilintCache`'s slot model: `batch_size=K` KV entries per shared MXQ
+(`k_per_model`), row `r` on slot `slot_of(r)[1]`, `slots=[s]` for a single-row cache on a chosen slot, and
+`from_rows()` to join one-row caches for a step. `model.build_mobilint_cache(batch_size)` returns rows `0 ..
+batch_size - 1`; `model.build_mobilint_cache(1, slots=[s])` a request cache on slot `s`. `generate` sizes its
+own cache to the capacity, so any batch up to `max_batch_size` runs with row `j` on slot `j`. A serving engine
+keeps one cache per request and passes `MobilintMixtureOfExpertsCache.from_rows(step_caches)` with the step's
+left-padded batch, as it does with `MobilintCache`.
+
+Build the release `config.json` with `scripts/configure_moe_package.py`. It reads the manifest and the shared
+MXQs' shapes, scales and KV entries (no accelerator, no launch) and writes `moe_mxq_package`, `max_batch_size`,
+`moe_shared_output_order` and, when missing, `npu_prefill_chunk_size`; `--num-devices N` adds the round-robin
+`shared_` / `expert_` / `lm_head_` target cores for `N` boards:
+
+```bash
+python scripts/configure_moe_package.py release/mxq/model.mxqpkg --config release/config.json \
+    --base-config upstream/config.json --num-devices 4
+```
+
+The embedding shipped in `model.safetensors` is the upstream `embed_tokens` rotated by the quantizer's R1
+matrix (`SpinR1`), as the compiled network expects: `(E.astype(float64) @ R1).astype(float32)`.
 
 Each role has its own NPU settings under the `shared_`, `expert_`, and `lm_head_` prefixes. Only
 `core_mode="single"` is supported, and every role must target the same board. The roles are placed
