@@ -375,7 +375,8 @@ model = AutoModelForCausalLM.from_pretrained(model_id, trust_remote_code=True)
 #### BatchLLM MXQ package releases
 
 The compiler can emit a whole MoE release as one qbruntime MXQ package (`.mxqpkg`, e.g.
-`mobilint/Qwen3-30B-A3B-Batch16-aries-rb`): every shared, expert and `lm_head` MXQ plus the compiler's
+`mobilint/Qwen3-30B-A3B-Batch16-aries-rb` ships `Qwen3-30B-A3B-Batch16-W4V8.mxqpkg` at the repository root, like
+the dense releases' single `.mxq`): every shared, expert and `lm_head` MXQ plus the compiler's
 `manifest.json`, read by `qbruntime.ModelPackage` without unpacking. This needs mobilint-qb-runtime 1.6.0 or
 later, which is not published yet; an older runtime raises a clear error when it meets such a release.
 `config.json` names it through `moe_mxq_package`, and the manifest supplies the entry names and the residual
@@ -418,7 +419,7 @@ MXQs' shapes, scales and KV entries (no accelerator, no launch) and writes `moe_
 `shared_` / `expert_` / `lm_head_` target cores for `N` boards:
 
 ```bash
-python scripts/configure_moe_package.py release/mxq/model.mxqpkg --config release/config.json \
+python scripts/configure_moe_package.py release/Qwen3-30B-A3B-Batch16-W4V8.mxqpkg --config release/config.json \
     --base-config upstream/config.json --num-devices 4
 ```
 

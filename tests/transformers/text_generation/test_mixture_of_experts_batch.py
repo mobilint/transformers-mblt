@@ -41,7 +41,7 @@ def _config(**overrides: Any) -> MobilintQwen3MoEConfig:
         num_experts=6,
         num_experts_per_tok=2,
         norm_topk_prob=True,
-        moe_mxq_package="mxq/release.mxqpkg",
+        moe_mxq_package="release.mxqpkg",
         max_batch_size=4,
         shared_target_cores=["0:0:0", "1:0:0"],
         expert_target_cores=_ALL_CORES,
@@ -479,8 +479,7 @@ class _FakePackage:
 
 
 def test_backend_loads_a_batch_package_and_probes_its_capacity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    (tmp_path / "mxq").mkdir()
-    (tmp_path / "mxq/release.mxqpkg").write_bytes(b"pkg")
+    (tmp_path / "release.mxqpkg").write_bytes(b"pkg")
     _PackagedModel.launched = []
     _FakePackage.opened = []
     monkeypatch.setattr(moe_utils.qbruntime, "ModelPackage", _FakePackage, raising=False)
@@ -499,13 +498,14 @@ def test_backend_loads_a_batch_package_and_probes_its_capacity(tmp_path: Path, m
         num_expert_workers=2,
         shared_output_indices=[None, None],
         name_or_path=str(tmp_path),
-        mxq_package="mxq/release.mxqpkg",
+        mxq_package="release.mxqpkg",
         max_batch_size=16,
     )
     backend.create()
-    assert [os.path.normpath(path) for path in _FakePackage.opened] == [str(tmp_path / "mxq" / "release.mxqpkg")]
+    assert [os.path.normpath(path) for path in _FakePackage.opened] == [str(tmp_path / "release.mxqpkg")]
     assert backend.is_batch
     assert backend.shared_mxq_path(1) == "block_1_shared.mxq" and backend.lm_head_mxq_path() == "lm_head.mxq"
+    assert backend.mxq_package == "release.mxqpkg"  # the package sits at the release root, like a dense .mxq
 
     backend.launch()
     # The compiled capacity wins over config.max_batch_size, and the per-step widths come from the first models.
@@ -526,8 +526,7 @@ def test_backend_loads_a_batch_package_and_probes_its_capacity(tmp_path: Path, m
 def test_backend_rejects_a_manifest_that_contradicts_the_configured_residual(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    (tmp_path / "mxq").mkdir()
-    (tmp_path / "mxq/release.mxqpkg").write_bytes(b"pkg")
+    (tmp_path / "release.mxqpkg").write_bytes(b"pkg")
     monkeypatch.setattr(moe_utils.qbruntime, "ModelPackage", _FakePackage, raising=False)
     config = _config(
         num_hidden_layers=2, num_experts=3, moe_shared_output_order={"default": ["gate", "residual", "expert_in"]}
@@ -544,7 +543,7 @@ def test_backend_rejects_a_manifest_that_contradicts_the_configured_residual(
         num_expert_workers=2,
         shared_output_indices=[config.get_moe_shared_output_indices(i) for i in range(2)],
         name_or_path=str(tmp_path),
-        mxq_package="mxq/release.mxqpkg",
+        mxq_package="release.mxqpkg",
     )
     with pytest.raises(ValueError, match="residual add consumes output 0"):
         backend.create()
@@ -565,5 +564,5 @@ def test_backend_refuses_both_pack_index_and_package() -> None:
             num_expert_workers=2,
             shared_output_indices=[None] * 3,
             mxq_pack_index="mxq/index.json",
-            mxq_package="mxq/release.mxqpkg",
+            mxq_package="release.mxqpkg",
         )

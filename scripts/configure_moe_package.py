@@ -14,10 +14,13 @@ script reads that package (``Model`` creation only, no accelerator, no ``launch`
   of every device) and ``lm_head_target_cores`` (core 0 of the last device), the round-robin placement the
   backend expects.
 
+The package lives at the release root like a dense release's single ``.mxq`` (``<Repo>-<quant>.mxqpkg``).
+
 Usage:
-    python scripts/configure_moe_package.py release/mxq/model.mxqpkg --config release/config.json --num-devices 4
-    python scripts/configure_moe_package.py model.mxqpkg --config release/config.json \\
-        --package-path mxq/model.mxqpkg --base-config upstream/config.json
+    python scripts/configure_moe_package.py release/Qwen3-30B-A3B-Batch16-W4V8.mxqpkg --config release/config.json \\
+        --num-devices 4
+    python scripts/configure_moe_package.py compile_out/model.mxqpkg --config release/config.json \\
+        --package-path Qwen3-30B-A3B-Batch16-W4V8.mxqpkg --base-config upstream/config.json
 """
 
 from __future__ import annotations
