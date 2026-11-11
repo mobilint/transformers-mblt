@@ -98,6 +98,7 @@ print(list_models("text-generation"))
 | `automatic-speech-recognition` | Whisper, Qwen3-ASR, LFM2-Audio |
 | `image-to-text` | BLIP |
 | `fill-mask` | BERT |
+| `text-classification` | D1 (LiquidAI d1 decision model: `system_one`, `probabilities`) |
 
 ## Command line
 
