@@ -1201,43 +1201,57 @@ class MobilintMixtureOfExpertsNPUBackend:
         """Resolve ``(residual, expert_in, gate)`` for one layer.
 
         ``config.moe_shared_output_order`` is authoritative; the quantization scales only cross-check it. Without a
-        configured order, the gate is the output with ``num_experts`` channels and ``expert_in`` the output whose
-        scale is the reciprocal of the expert input scale.
+        configured order, the gate is the output with ``num_experts`` channels. The residual is the one an MXQ
+        package manifest names, leaving ``expert_in`` as the third output; without a manifest, ``expert_in`` is the
+        output whose scale is the reciprocal of the expert input scale.
         """
         output_shapes = shared.get_model_output_shape()
         if len(output_shapes) != 3:
             raise ValueError(f"shared[{layer_idx}] must have 3 outputs, got {len(output_shapes)}.")
         configured = self._configured_output_indices[layer_idx]
+        manifest_residual = (
+            self.package_layout.residual_output[layer_idx] if self.package_layout is not None else None
+        )
         if configured is not None:
             residual_idx, expert_in_idx, gate_idx = configured
         else:
-            gate_candidates = [idx for idx, shape in enumerate(output_shapes) if int(shape[-1]) == self.num_experts]
+            gate_candidates = [
+                idx
+                for idx, shape in enumerate(output_shapes)
+                if int(shape[-1]) == self.num_experts and idx != manifest_residual
+            ]
             if len(gate_candidates) != 1:
                 raise ValueError(
                     f"Cannot identify the router gate output of shared[{layer_idx}] from shapes {output_shapes}; "
                     "set moe_shared_output_order in config.json."
                 )
             gate_idx = gate_candidates[0]
-            detected = self._detect_expert_in_index(shared, expert, gate_idx)
-            if detected is None:
-                raise ValueError(
-                    f"Cannot identify the expert input output of shared[{layer_idx}] from its quantization "
-                    "scales (no output, or more than one, matches); set moe_shared_output_order in config.json."
-                )
-            expert_in_idx = detected
-            residual_idx = ({0, 1, 2} - {gate_idx, expert_in_idx}).pop()
+            if manifest_residual is not None:
+                # The manifest's residual add is authoritative, so scales that also match the residual cannot
+                # block the launch or swap the roles.
+                residual_idx = manifest_residual
+                expert_in_idx = ({0, 1, 2} - {gate_idx, residual_idx}).pop()
+            else:
+                detected = self._detect_expert_in_index(shared, expert, gate_idx)
+                if detected is None:
+                    raise ValueError(
+                        f"Cannot identify the expert input output of shared[{layer_idx}] from its quantization "
+                        "scales (no output, or more than one, matches); set moe_shared_output_order in config.json."
+                    )
+                expert_in_idx = detected
+                residual_idx = ({0, 1, 2} - {gate_idx, expert_in_idx}).pop()
 
         if int(output_shapes[gate_idx][-1]) != self.num_experts:
             raise ValueError(
                 f"shared[{layer_idx}] output {gate_idx} has {int(output_shapes[gate_idx][-1])} channels but the "
                 f"router gate must have num_experts={self.num_experts}; check moe_shared_output_order."
             )
-        if configured is not None:
+        if configured is not None or manifest_residual is not None:
             detected = self._detect_expert_in_index(shared, expert, gate_idx)
             if detected is not None and detected != expert_in_idx:
                 logger.warning(
-                    "shared[%d]: moe_shared_output_order places expert_in at output %d but the quantization "
-                    "scales point to output %d.",
+                    "shared[%d]: the configured order or package manifest places expert_in at output %d but the "
+                    "quantization scales point to output %d.",
                     layer_idx,
                     expert_in_idx,
                     detected,

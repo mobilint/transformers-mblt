@@ -17,6 +17,7 @@ import pytest
 import torch
 
 from transformers_mblt.models.qwen3_moe.configuration_qwen3_moe import MobilintQwen3MoEConfig
+from transformers_mblt.models.qwen3_moe.modeling_qwen3_moe import MobilintQwen3MoEForCausalLM
 from transformers_mblt.utils import moe_utils
 from transformers_mblt.utils.cache_utils import MobilintMixtureOfExpertsCache
 from transformers_mblt.utils.generation_utils import MobilintMixtureOfExpertsGenerationMixin
@@ -566,3 +567,60 @@ def test_backend_refuses_both_pack_index_and_package() -> None:
             mxq_pack_index="mxq/index.json",
             mxq_package="release.mxqpkg",
         )
+
+
+class _TiedScaleModel(_PackagedModel):
+    def get_output_scale(self):
+        if self.is_shared:
+            return [_Scale(0.25), _Scale(0.25), _Scale(0.1)]  # residual and expert input share the reciprocal scale
+        return [_Scale(1.0)]
+
+
+class _TiedScalePackage(_FakePackage):
+    def create_model(self, entry: str, config: Any = None) -> _PackagedModel:
+        return _TiedScaleModel(entry, None if config is None else config.slots)
+
+
+def test_backend_takes_the_residual_from_the_manifest_without_a_configured_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The scales alone cannot tell the residual from the expert input here; the manifest's residual add can.
+    (tmp_path / "release.mxqpkg").write_bytes(b"pkg")
+    _PackagedModel.launched = []
+    monkeypatch.setattr(moe_utils.qbruntime, "ModelPackage", _TiedScalePackage, raising=False)
+    monkeypatch.setattr(moe_utils, "Accelerator", lambda *args: object())
+    monkeypatch.setattr(moe_utils, "ModelConfig", _FakeConfig)
+    config = _config(num_hidden_layers=2, num_experts=3, moe_shared_output_order=None)
+    backend = MobilintMixtureOfExpertsNPUBackend(
+        shared_backend=config.shared_npu_backend,
+        expert_backend=config.expert_npu_backend,
+        lm_head_backend=config.lm_head_npu_backend,
+        num_layers=2,
+        num_experts=3,
+        num_experts_per_tok=2,
+        hidden_size=4,
+        vocab_size=7,
+        num_expert_workers=2,
+        shared_output_indices=[None, None],
+        name_or_path=str(tmp_path),
+        mxq_package="release.mxqpkg",
+    )
+    backend.create()
+    backend.launch()
+    assert [(layer.residual_idx, layer.expert_in_idx, layer.gate_idx) for layer in backend.layers] == [
+        (0, 1, 2),
+        (1, 0, 2),
+    ]
+    backend.dispose()
+
+
+def test_forward_sizes_a_new_cache_from_the_input_batch() -> None:
+    # config.max_batch_size (16) exceeds the compiled capacity (4) the backend probed; one sequence must still run.
+    generator = _Generator(4)
+    generator.config = _config(max_batch_size=16)
+    generator.embed_tokens = torch.nn.Embedding(7, 4)
+    generator.moe_forward = lambda inputs_embeds, *args, **kwargs: torch.zeros(inputs_embeds.shape[0], 1, 7)
+    out = MobilintQwen3MoEForCausalLM.forward(
+        generator, input_ids=torch.tensor([[1, 2, 3]]), use_cache=True, logits_to_keep=1
+    )
+    assert out.past_key_values.batch_size == 4 and out.logits.shape == (1, 1, 7)

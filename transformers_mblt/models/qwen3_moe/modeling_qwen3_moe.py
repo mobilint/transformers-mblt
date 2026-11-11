@@ -58,9 +58,10 @@ class MobilintQwen3MoEForCausalLM(MobilintMixtureOfExpertsModelMixin, MobilintMi
             inputs_embeds = self.embed_tokens(input_ids)
 
         assert inputs_embeds is not None
-        configured_batch_size = max(1, int(self.config.max_batch_size))
         if use_cache and past_key_values is None:
-            past_key_values = self._get_cache("", configured_batch_size, 0)
+            # The input's batch, not config.max_batch_size: the compiled package may serve fewer sequences, and
+            # _get_cache allocates the backend's probed capacity either way.
+            past_key_values = self._get_cache("", int(inputs_embeds.shape[0]), 0)
 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
