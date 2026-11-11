@@ -63,7 +63,26 @@ def _fake_package(root: Path, table: np.ndarray, yaml_extra: str = "") -> tuple[
     upstream.mkdir()
     (upstream / "LICENSE").write_text("LFM Open License v1.0\n", encoding="utf-8")
     (upstream / "prompt.py").write_text("# upstream prompt\n", encoding="utf-8")
+    (upstream / "tokenizer.json").write_bytes((package / "tokenizer.json").read_bytes())
+    (package / "compile-provenance.json").write_text(json.dumps({"inference_scheme": "all"}), encoding="utf-8")
     return package, upstream
+
+
+FACTS = {
+    "quantization": {"weights": "4 bit", "activations": "16 bit", "method": "Qronos", "compiler": "qbcompiler 1.4.1"},
+    "calibration": {
+        "prompts": 497,
+        "tokens": 318755,
+        "max_prompt_tokens": 7945,
+        "sources": [{"source": "FineWeb", "share": "22.2%", "licence": "ODC-By"}],
+    },
+    "fidelity": {
+        "intro": "Against bf16.",
+        "columns": ["This build", "Other"],
+        "rows": [{"set": "840 questions", "values": ["0.041", "0.091"]}],
+        "notes": ["MMLU note."],
+    },
+}
 
 
 def test_build_writes_the_hub_layout(tmp_path: Path) -> None:
@@ -101,7 +120,9 @@ def test_build_writes_the_hub_layout(tmp_path: Path) -> None:
     assert weights["embed_tokens.weight"].dtype == torch.bfloat16
     assert torch.equal(weights["embed_tokens.weight"].float(), torch.from_numpy(table))
     assert (out / "proxy_d1.py").read_text() == (_REPO_ROOT / "transformers_mblt/models/d1/proxy_d1.py").read_text()
-    assert "license_name: lfm1.0" in (out / "README.md").read_text()
+    card = (out / "README.md").read_text()
+    assert "license_name: lfm1.0" in card and f"pipeline_tag: {build.D1_TASK}" in card
+    assert "Liquid AI, Inc." in card and "## Requirements" in card
 
     from transformers import AutoConfig
 
@@ -110,6 +131,34 @@ def test_build_writes_the_hub_layout(tmp_path: Path) -> None:
     transformers_mblt.register()
     loaded = AutoConfig.from_pretrained(str(out))
     assert type(loaded).__name__ == "MobilintD1Config" and loaded.core_mode == "global8"
+
+
+def test_the_card_is_generated_whole(tmp_path: Path) -> None:
+    table = torch.randn(4, 8).to(torch.bfloat16).float().numpy()
+    package, upstream = _fake_package(tmp_path, table)
+    facts = tmp_path / "facts.json"
+    facts.write_text(json.dumps(FACTS), encoding="utf-8")
+    out = build.build(package, tmp_path / "hub", upstream, card_facts=facts)
+    card = (out / "README.md").read_text()
+    for heading in ("## Requirements", "## Quantization", "## Calibration", "## Fidelity", "## Licence"):
+        assert heading in card
+    assert "`global8` by default; `global4`, `single` also run" in card
+    assert "16,384 tokens" in card
+    assert "at most 2,046 tokens in `global8` and `global4`" in card and "at most 2,048 tokens in `single`" in card
+    assert "| FineWeb | 22.2% | ODC-By |" in card and "| 840 questions | 0.041 | 0.091 |" in card
+    assert "497 prompts, 318,755 tokens, at most 7,945 tokens per prompt" in card
+    assert "3 keys dropped (`backend`, `processor_class`, `is_local`)" in card
+    assert "`tokenizer_class` changed from `TokenizersBackend` to `PreTrainedTokenizerFast`" in card
+    assert "only" not in card.split("## Requirements")[1].split("##")[0]
+
+    # Re-running rewrites the same card: nothing hand-written is needed (or kept).
+    (out / "README.md").write_text("hand edit", encoding="utf-8")
+    build.build(package, tmp_path / "hub", upstream, card_facts=facts)
+    assert (out / "README.md").read_text() == card
+
+    # Without facts the measured sections are left out; the rest stays.
+    bare = build.build(package, tmp_path / "bare", upstream).joinpath("README.md").read_text()
+    assert "## Quantization" not in bare and "## Requirements" in bare and "## Licence" in bare
 
 
 def test_inexact_tables_stay_float32(tmp_path: Path) -> None:
@@ -130,3 +179,8 @@ def test_build_refuses_vision_packages_and_changed_prompts(tmp_path: Path) -> No
     (upstream / "prompt.py").write_text("# another revision\n", encoding="utf-8")
     with pytest.raises(SystemExit, match="prompt.py differs"):
         build.build(package, tmp_path / "hub2", upstream)
+
+    package, upstream = _fake_package(tmp_path / "third", np.zeros((4, 8), np.float32))
+    (upstream / "tokenizer.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(SystemExit, match="tokenizer.json differs"):
+        build.build(package, tmp_path / "hub3", upstream)
