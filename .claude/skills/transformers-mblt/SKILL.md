@@ -142,10 +142,13 @@ description: >-
   sets it (to `None` without a cache). Keep `moe_shared_output_order` authoritative; the
   quantization-scale detection is the fallback and the cross-check, and
   `scripts/pack_moe_mxq.py --config` derives it from the MXQs at packaging time.
-- D1 contract (`models/d1`): `prompt_d1.py` reproduces the checkpoint's `prompt.py` at the pinned
-  `base_model_revision`. The `test_token_rows_equal_the_upstream_runner` parity test runs the upstream runner from a
-  local snapshot, so run it after any prompt change. One question is tokenized as one prompt, several as the prefix
-  plus each question's tokens, as upstream does. The trunk (shared prefix) is prefilled once; the `FixedTailCache`
+- D1 contract (`models/d1`): the prompt is the checkpoint's own `prompt.py`, which the model folder and Hub repository
+  ship unmodified; `prompt_d1.py` imports it at runtime and holds only glue. The
+  `test_token_rows_equal_the_upstream_runner` parity test runs the upstream runner from a local snapshot, so run it
+  after any glue change; CPU tests use the stand-in `tests/transformers/decision/fixtures/prompt.py`. One question is
+  tokenized as one prompt, several as the prefix plus each question's tokens, as upstream does. A lock serializes
+  requests; `launch()`, `dispose()` and `forward()` drop the held trunk. `D1_TASK` (`models/d1/__init__.py`) is the one
+  place the Hub task tag lives. The trunk (shared prefix) is prefilled once; the `FixedTailCache`
   buffers are snapshotted after it and restored before every branch. `plan_chunks` keeps every infer call's length
   off `0`/`63` mod 64 in global core modes, because LFM2 hybrid graphs hang the NPU there. Only a branch's final call
   is zero-padded. Do not vendor upstream d1 code: it is LFM Open License v1.0, not BSD.
