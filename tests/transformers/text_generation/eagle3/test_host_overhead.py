@@ -88,6 +88,46 @@ def test_keep_awake_keeps_calls_from_different_threads_concurrent(keep_awake_on)
     assert elapsed < 1.6 * delay
 
 
+def test_keep_awake_auto_stays_off_without_load_average(monkeypatch):
+    # Windows has no os.getloadavg; auto mode must call infer directly instead of raising.
+    monkeypatch.setattr(eagle3_utils, "_KEEP_CPU_AWAKE_MODE", "auto")
+    monkeypatch.setattr(eagle3_utils, "_host_idle_cache", (float("-inf"), True))
+    monkeypatch.delattr(eagle3_utils.os, "getloadavg", raising=False)
+    mxq = _FakeMxq()
+    assert eagle3_utils.infer_keep_cpu_awake(mxq, [5]) == [10, 0]
+    assert mxq.threads == [threading.current_thread().name]
+
+
+@pytest.mark.parametrize("mode", ["0", "1"])
+def test_keep_awake_records_infer_time_only(monkeypatch, mode):
+    monkeypatch.setattr(eagle3_utils, "_KEEP_CPU_AWAKE_MODE", mode)
+    recorded: list = []
+    eagle3_utils.infer_keep_cpu_awake(_FakeMxq(delay=0.05), [1], record_npu_time=recorded.append)
+    assert len(recorded) == 1
+    assert 0.05 <= recorded[0] < 0.5
+
+
+def test_keep_awake_interrupt_waits_for_infer_then_propagates(keep_awake_on, monkeypatch):
+    delay = 0.2
+    mxq = _FakeMxq(delay=delay)
+    real_sleep = time.sleep
+    interrupted = []
+
+    def interrupting_sleep(seconds):
+        if not interrupted:  # interrupt the first poll, as a Ctrl+C would
+            interrupted.append(True)
+            raise KeyboardInterrupt
+        real_sleep(seconds)
+
+    monkeypatch.setattr(eagle3_utils.time, "sleep", interrupting_sleep)
+    start = time.perf_counter()
+    with pytest.raises(KeyboardInterrupt):
+        eagle3_utils.infer_keep_cpu_awake(mxq, [1])
+    # The caller left only after the NPU call it started had finished.
+    assert time.perf_counter() - start >= delay
+    assert mxq.threads == ["mblt-eagle3-infer"]
+
+
 def test_lazy_rotary_table_is_built_once_while_decoding():
     rope = eagle3_utils.CachedRotaryEmbedding(64, 4096, base=10000)
     assert rope.position_table is not None

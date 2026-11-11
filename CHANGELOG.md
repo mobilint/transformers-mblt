@@ -11,7 +11,8 @@
   draws different tokens. Applies when the processor list is Temperature, TopK and optionally TopP, in HF order.
 - EAGLE-3 NPU calls run on a per-thread worker while the calling thread polls, so its core is not clocked down or
   parked during the call and the host work between NPU calls runs at full speed. `MBLT_EAGLE3_KEEP_CPU_AWAKE`
-  selects `auto` (default: only while the 1-minute load average is below a quarter of the CPUs), `1` or `0`.
+  selects `auto` (default: only while the 1-minute load average is below a quarter of the CPUs, never on Windows),
+  `1` or `0`. The recorded NPU time covers the `infer` call only, not the thread hand-off.
   EAGLE3-Qwen3-4B on ARIES (default tree, 3 prompts x 256 tokens, idle host): sampling 22.1 to 26.6 tok/s, greedy
   26.5 to 26.7 tok/s with identical tokens.
 
