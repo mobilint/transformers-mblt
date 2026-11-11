@@ -149,12 +149,13 @@ description: >-
 
 - Load a release (for example `mobilint/EAGLE3-Qwen3-4B`) through
   `AutoModelForCausalLM.from_pretrained(...)`; the wrapper binds the base MXQ, one-block draft
-  MXQ, and FC stack as a single release. Qwen3 and Llama base families are supported through
-  `transformers_mblt/models/qwen3_eagle3/` and
-  `transformers_mblt/models/llama_eagle3/`. Each ships a
+  MXQ, and FC stack as a single release. Qwen3, Qwen2, Llama, and EXAONE 3.5 base families are supported through
+  `transformers_mblt/models/qwen3_eagle3/`, `transformers_mblt/models/qwen2_eagle3/`,
+  `transformers_mblt/models/llama_eagle3/`, and `transformers_mblt/models/exaone_eagle3/`. Each ships a
   `MobilintXxxEagle3Config` / `MobilintXxxEagle3ForCausalLM` pair
   (`MobilintQwen3Eagle3Config` / `MobilintQwen3Eagle3ForCausalLM`,
-  `MobilintLlamaEagle3Config` / `MobilintLlamaEagle3ForCausalLM`) that wires
+  `MobilintLlamaEagle3Config` / `MobilintLlamaEagle3ForCausalLM`,
+  `MobilintExaoneEagle3Config` / `MobilintExaoneEagle3ForCausalLM`, ...) that wires
   `MobilintEagle3FCProjector`, the family-specific base backend, and the family-specific
   one-block draft backend on top of the shared `MobilintEagle3BaseModelMixin` /
   `MobilintEagle3DraftModelMixin`. The mixins own `embed_tokens` and `rotary_emb`
