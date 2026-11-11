@@ -23,6 +23,7 @@ from ..cache_utils import (
     note_eagle3_fed_tokens,
     take_eagle3_unfed_tokens,
 )
+from ..sampling_utils import MobilintTopKTopPLogitsWarper
 
 logger = logging.get_logger(__name__)
 
@@ -401,7 +402,7 @@ def _sample_next_token_from_processor(
     if sliceable is not None and x.numel() == x.shape[-1] and sliceable[0] < x.shape[-1]:
         # Sample over TopK's support only: entries outside it are -inf after the list, so the softmax over
         # the support is the same distribution. Ties at the k-th value stay in, as in HF's strict-less-than
-        # filter. The RNG draws differ from the full-vocab multinomial, the distribution does not.
+        # filter. The RNG draws differ from the full-vocab multinomial.
         top_k, k_pos = sliceable
         assert logits_processor is not None
         # Temperature runs before TopK, so take the threshold on the scaled row: scaling can merge
@@ -409,7 +410,16 @@ def _sample_next_token_from_processor(
         row = _apply_logits_processor(x.reshape(-1), LogitsProcessorList(logits_processor[:k_pos]))
         threshold = torch.topk(row, top_k, sorted=False).values.min()
         support_idx = (row >= threshold).nonzero(as_tuple=True)[0]
-        processed = _apply_logits_processor(row[support_idx], LogitsProcessorList(logits_processor[k_pos:]))
+        processed = row[support_idx]
+        # TopK leaves its own support unchanged, so it is skipped. TopP uses the fused sampler's rule: when equal
+        # logits straddle its cutoff, higher token ids survive. Upstream the survivors depend on the unstable
+        # full-vocab sort, which a slice cannot reproduce; see ``sampling_utils``.
+        for warper in logits_processor[k_pos + 1 :]:
+            if isinstance(warper, TopPLogitsWarper):
+                fused = MobilintTopKTopPLogitsWarper(logits_processor[k_pos], warper)
+                processed = fused._top_p(processed, support_idx)
+            else:
+                processed = _apply_logits_processor(processed, LogitsProcessorList([warper]))
         choice = torch.multinomial(torch.softmax(processed, dim=-1), 1)
         token = support_idx[choice].to(torch.long)
         return token if input_ndim == 1 else token.view(1, 1)

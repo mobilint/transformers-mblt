@@ -189,3 +189,18 @@ def test_sampler_keeps_ties_created_by_temperature():
     torch.manual_seed(0)
     drawn = {int(_sample_next_token_from_processor(logits, processors)) for _ in range(200)}
     assert drawn == {2, 5}
+
+
+def test_sampler_top_p_ties_keep_higher_token_ids():
+    from transformers.generation.logits_process import LogitsProcessorList, TopKLogitsWarper, TopPLogitsWarper
+
+    from transformers_mblt.utils.eagle3.tree_decoding import _sample_next_token_from_processor
+
+    # TopK(3) keeps ids 1, 3, 5 with probs 0.576, 0.212, 0.212. TopP(0.7) drops one of the equal pair; as in the
+    # fused top-k/top-p sampler, the lower token id goes.
+    logits = torch.full((8,), -10.0)
+    logits[1], logits[3], logits[5] = 2.0, 1.0, 1.0
+    processors = LogitsProcessorList([TopKLogitsWarper(3), TopPLogitsWarper(0.7)])
+    torch.manual_seed(0)
+    drawn = {int(_sample_next_token_from_processor(logits, processors)) for _ in range(200)}
+    assert drawn == {1, 5}
