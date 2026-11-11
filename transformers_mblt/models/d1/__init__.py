@@ -1,5 +1,9 @@
 from typing import TYPE_CHECKING
 
+# The Hub pipeline task D1 is listed under: `list_tasks()`, the model card's `pipeline_tag`, and the README table.
+# Change it here; tests/transformers/decision/test_d1.py checks that README.md and CHANGELOG.md follow.
+D1_TASK = "image-text-classification"
+
 if TYPE_CHECKING:
     from .configuration_d1 import MobilintD1Config
     from .modeling_d1 import MobilintD1Model

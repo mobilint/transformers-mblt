@@ -2,13 +2,15 @@ import os
 import sys
 from typing import Dict, List, Optional, Union
 
+from ..models.d1 import D1_TASK
+
 TASKS = [
     "text-generation",
     "image-text-to-text",
     "automatic-speech-recognition",
     "image-to-text",
     "fill-mask",
-    "image-text-classification",
+    D1_TASK,
 ]
 
 
