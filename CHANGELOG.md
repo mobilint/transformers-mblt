@@ -9,7 +9,7 @@
   `system_one_batch`, `probabilities`, `probabilities_batch`) with the same answer shapes. Prompt and option token
   ids match the upstream renderer. Several questions on one state share one state prefill, and a later call on the same
   state reuses it. Builds are text-only. `scripts/build_d1_hf_package.py` assembles the Hub folder from a compiled D1
-  package. `list_tasks()` adds `text-classification`.
+  package. `list_tasks()` adds `image-text-classification`.
 
 ### Fixed
 

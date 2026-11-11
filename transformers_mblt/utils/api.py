@@ -8,7 +8,7 @@ TASKS = [
     "automatic-speech-recognition",
     "image-to-text",
     "fill-mask",
-    "text-classification",
+    "image-text-classification",
 ]
 
 

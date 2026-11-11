@@ -135,7 +135,7 @@ license: other
 license_name: lfm1.0
 license_link: LICENSE
 base_model: {base}
-pipeline_tag: text-classification
+pipeline_tag: image-text-classification
 tags:
 - mobilint
 - npu
