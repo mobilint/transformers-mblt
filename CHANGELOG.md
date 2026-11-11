@@ -10,7 +10,8 @@
   support HF's `TopKLogitsWarper` keeps. The random stream differs, so a seeded run draws different tokens. Applies
   when the processor list is Temperature, TopK and optionally TopP, in HF order. With TopP, equal logits that
   straddle the cutoff follow the fused top-k/top-p rule (higher token ids survive) instead of the order of the
-  unstable full-vocabulary sort, so which of those tokens can be drawn may differ from upstream.
+  unstable full-vocabulary sort, in both the draw and the draft acceptance probabilities, so which of those tokens
+  can be drawn or accepted may differ from upstream.
 - EAGLE-3 NPU calls run on a per-thread worker while the calling thread polls, so its core is not clocked down or
   parked during the call and the host work between NPU calls runs at full speed. `MBLT_EAGLE3_KEEP_CPU_AWAKE`
   selects `auto` (default: only while the 1-minute load average is below a quarter of the CPUs, never on Windows),

@@ -204,3 +204,29 @@ def test_sampler_top_p_ties_keep_higher_token_ids():
     torch.manual_seed(0)
     drawn = {int(_sample_next_token_from_processor(logits, processors)) for _ in range(200)}
     assert drawn == {1, 5}
+
+
+@pytest.mark.parametrize("shape", [(8,), (1, 8)])
+def test_posterior_and_sampler_share_top_p_tie_rule(shape, monkeypatch):
+    from transformers.generation.logits_process import LogitsProcessorList, TopKLogitsWarper, TopPLogitsWarper
+
+    from transformers_mblt.utils.eagle3 import tree_decoding
+    from transformers_mblt.utils.eagle3.tree_decoding import (
+        _sample_next_token_from_processor,
+        softmax_topk_cpu_torch,
+    )
+
+    monkeypatch.setattr(tree_decoding, "SOFTMAX_TOPK_MODE", "auto")
+
+    # TopK(2) keeps ids 1, 3, 5, 6, 7 (four tied at the k-th value): probs 0.405, 0.149 x 4. TopP(0.75) drops one
+    # of the tied ids, the lowest. The ties overflow the 4-wide slice, so the 2-D row takes the full-vocab path and
+    # the 1-D row the widened slice.
+    logits = torch.full((8,), -10.0)
+    logits[1], logits[3], logits[5], logits[6], logits[7] = 2.0, 1.0, 1.0, 1.0, 1.0
+    logits = logits.view(shape)
+    processors = LogitsProcessorList([TopKLogitsWarper(2), TopPLogitsWarper(0.75)])
+    probs, indices = softmax_topk_cpu_torch(logits, max_return_k=4, logits_processor=processors)
+    supported = {int(i) for p, i in zip(probs.reshape(-1), indices.reshape(-1)) if p > 0}
+    torch.manual_seed(0)
+    drawn = {int(_sample_next_token_from_processor(logits, processors)) for _ in range(300)}
+    assert supported == drawn == {1, 5, 6, 7}
