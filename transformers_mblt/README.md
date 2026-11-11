@@ -539,6 +539,12 @@ most steps. Two things differ from upstream Transformers:
 tok/s with the upstream processors and 38.3 tok/s greedy. Set `MBLT_FUSED_TOPK_TOPP=0` to use the upstream
 processors and draw. EAGLE-3 generation has its own sampling path and is unaffected.
 
+EAGLE-3 generation has its own sampling path. With Temperature, TopK and optionally TopP in HF order, it takes the
+softmax and the draw over the TopK support (ties at the k-th logit included) rather than the whole vocabulary; the
+probabilities match upstream and the random stream differs. During each NPU call the calling thread polls instead of
+blocking, so its core stays clocked up for the host work that follows. `MBLT_EAGLE3_KEEP_CPU_AWAKE=auto` (default)
+does this only while the 1-minute load average is below a quarter of the CPUs; `1` always, `0` never.
+
 ## Host CPU Threads
 
 PyTorch sizes its CPU thread pool from the cores the process can see. When several processes drive NPUs from one

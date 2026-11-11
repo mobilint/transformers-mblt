@@ -204,6 +204,28 @@ def _extract_top_k_from_processor(
     return None
 
 
+def _sliceable_top_k(logits_processor: Optional[LogitsProcessorList]) -> Optional[tuple[int, int]]:
+    """Return ``(top_k, index of TopK)`` when the list is only Temperature -> TopK (-> TopP) in HF order, else ``None``.
+
+    Those warpers are monotone or act only on the TopK support, so applying them to the support slice
+    gives the same values as applying them to the full vocab. A warper with a finite ``filter_value``
+    leaves mass outside the support, so it is not sliceable.
+    """
+    if not logits_processor:
+        return None
+    kinds = [type(w) for w in logits_processor]
+    if any(k not in (TemperatureLogitsWarper, TopKLogitsWarper, TopPLogitsWarper) for k in kinds):
+        return None
+    if TopKLogitsWarper not in kinds:
+        return None
+    if any(getattr(w, "filter_value", -float("inf")) != -float("inf") for w in logits_processor):
+        return None
+    k_pos = kinds.index(TopKLogitsWarper)
+    if TopPLogitsWarper in kinds and kinds.index(TopPLogitsWarper) < k_pos:
+        return None
+    return int(logits_processor[k_pos].top_k), k_pos
+
+
 def _softmax_topk_full_vocab(
     logits: torch.Tensor,
     max_return_k: int,
@@ -251,9 +273,18 @@ def _softmax_topk_sliced_by_top_k(
     # cheaper than the full-vocab ``exp`` we take on fallback.
     if slice_size < vocab:
         threshold = topk_vals[..., -1:]
-        total_at_or_above = (x >= threshold).sum(dim=-1)
+        at_or_above = x >= threshold
+        total_at_or_above = at_or_above.sum(dim=-1)
         if bool((total_at_or_above > slice_size).any().item()):
-            return _softmax_topk_full_vocab(logits, max_return_k, logits_processor)
+            if x.ndim != 1:
+                return _softmax_topk_full_vocab(logits, max_return_k, logits_processor)
+            # Boundary tie: HF's TopK keeps every entry >= the threshold, so widen the slice to exactly
+            # that support instead of taking the full-vocab path. Same support and values, so the same
+            # softmax denominator; only the order among equal logits is unspecified, as in torch.topk.
+            support_idx = at_or_above.nonzero(as_tuple=True)[0]
+            topk_vals, order = torch.sort(x[support_idx], descending=True)
+            topk_idx = support_idx[order]
+            slice_size = int(topk_vals.shape[-1])
     processed_slice = _apply_logits_processor(topk_vals, logits_processor)
     max_val = processed_slice.max(dim=-1, keepdim=True).values
     exp_slice = torch.exp(processed_slice - max_val)
@@ -366,6 +397,22 @@ def _sample_next_token_from_processor(
     """
     input_ndim = logits.ndim
     x = logits.float()
+    sliceable = _sliceable_top_k(logits_processor)
+    if sliceable is not None and x.numel() == x.shape[-1] and sliceable[0] < x.shape[-1]:
+        # Sample over TopK's support only: entries outside it are -inf after the list, so the softmax over
+        # the support is the same distribution. Ties at the k-th value stay in, as in HF's strict-less-than
+        # filter. The RNG draws differ from the full-vocab multinomial, the distribution does not.
+        top_k, k_pos = sliceable
+        assert logits_processor is not None
+        # Temperature runs before TopK, so take the threshold on the scaled row: scaling can merge
+        # neighbouring logits into a tie that HF's TopK keeps.
+        row = _apply_logits_processor(x.reshape(-1), LogitsProcessorList(logits_processor[:k_pos]))
+        threshold = torch.topk(row, top_k, sorted=False).values.min()
+        support_idx = (row >= threshold).nonzero(as_tuple=True)[0]
+        processed = _apply_logits_processor(row[support_idx], LogitsProcessorList(logits_processor[k_pos:]))
+        choice = torch.multinomial(torch.softmax(processed, dim=-1), 1)
+        token = support_idx[choice].to(torch.long)
+        return token if input_ndim == 1 else token.view(1, 1)
     x2d = x.unsqueeze(0) if input_ndim == 1 else x
     processed = _apply_logits_processor(x2d, logits_processor)
     probs = torch.softmax(processed, dim=-1)
