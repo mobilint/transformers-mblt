@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.8.0
+
+### Added
+
+- Mixture-of-Experts releases compiled as one qbruntime MXQ package (`.mxqpkg`, `config.moe_mxq_package`). Loading
+  one needs mobilint-qb-runtime 1.6.0 (`qbruntime.ModelPackage`), which is not published yet; an older runtime
+  raises a clear error for such a release and every other release keeps working. `MobilintMixtureOfExpertsNPUBackend`
+  opens the package with `qbruntime.ModelPackage`,
+  takes the shared / expert / `lm_head` entry names and the residual output of every shared MXQ from the compiler's
+  `manifest.json`, and creates each model from its entry without unpacking. `scripts/configure_moe_package.py`
+  writes `moe_mxq_package`, `max_batch_size`, `moe_shared_output_order`, `npu_prefill_chunk_size` and the
+  round-robin target cores of a release `config.json` from the package.
+- Batched Mixture-of-Experts generation on a BatchLLM package (`"batch": true`, e.g.
+  `mobilint/Qwen3-30B-A3B-Batch16-aries-rb`): up to `max_batch_size` left-padded sequences per `generate`, each in
+  its own KV slot of every shared MXQ. Every shared MXQ runs once per step on the sequences' tokens with one
+  `BatchParam` per sequence; the routed tokens of all sequences are grouped by expert so each selected expert runs
+  once per layer and step; the post-slice last layer's experts and the `lm_head` run one `BatchParam` row per
+  sequence. Steps respect the package's per-sequence (128) and per-step (512) token widths. A batch package returns
+  only last-token logits (`logits_to_keep=1`).
+- `MobilintMixtureOfExpertsCache` follows `MobilintCache`'s slot model for serving engines: `batch_size=K` KV
+  entries per shared MXQ (`k_per_model`, `n_models == 1`), `slots=[s]` for a one-row request cache on slot `s`,
+  `slot_of` / `group_by_model`, `from_rows()` to join one-row caches for a step, `bind_rows(backend, rows)`, and
+  per-row `get_seq_length` / `set_seq_length` / `update_seen_tokens` / `fake_prefill`. Rows of a batch cache dump to
+  `row_{r}/layer_{l}`; a one-row cache keeps the `layer_{l}` layout. `model.build_mobilint_cache(batch_size,
+  slots=None)` builds either.
+
+### Changed
+
+- `MobilintMixtureOfExpertsConfigMixin.max_batch_size` records the compiled batch capacity (`1` for a release of
+  individual MXQs) instead of rejecting values above `1`; the runtime rejects a batch larger than the loaded
+  release's capacity. `MobilintMixtureOfExpertsGenerationMixin._require_single_batch` is kept as an alias of
+  `_require_batch_size`.
+
 ## 0.7.3
 
 ### Added

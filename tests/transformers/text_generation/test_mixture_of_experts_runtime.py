@@ -265,7 +265,9 @@ def test_failed_model_config_setup_releases_the_accelerators(
 
     monkeypatch.setattr(moe_utils, "Accelerator", TrackedAccelerator)
     backend = _backend(_release_dir(tmp_path))
-    monkeypatch.setattr(backend, "_make_model_config", lambda role, dev: (_ for _ in ()).throw(ValueError("bad cores")))
+    monkeypatch.setattr(
+        backend, "_make_model_config", lambda role, dev, *args: (_ for _ in ()).throw(ValueError("bad cores"))
+    )
 
     with pytest.raises(ValueError, match="bad cores"):
         backend.launch()
@@ -334,7 +336,10 @@ class _SlotBackend:
 
 
 class _Generator:
-    _require_single_batch = staticmethod(MobilintMixtureOfExpertsGenerationMixin._require_single_batch)
+    _moe_capacity = MobilintMixtureOfExpertsGenerationMixin._moe_capacity
+    _require_batch_size = MobilintMixtureOfExpertsGenerationMixin._require_batch_size
+    _require_single_batch = MobilintMixtureOfExpertsGenerationMixin._require_single_batch
+    build_mobilint_cache = MobilintMixtureOfExpertsGenerationMixin.build_mobilint_cache
     _prepare_cache_for_generation = MobilintMixtureOfExpertsGenerationMixin._prepare_cache_for_generation
     _cache_matches_backend = MobilintMixtureOfExpertsGenerationMixin._cache_matches_backend
     _get_cache = MobilintMixtureOfExpertsGenerationMixin._get_cache

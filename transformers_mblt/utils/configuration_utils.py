@@ -1324,10 +1324,16 @@ class MobilintMixtureOfExpertsConfigMixin(PretrainedConfig):
     core sets (one core per shared MXQ versus eight per expert MXQ), so an unprefixed ``dev_no`` would expand
     every role to every core of the device and multiply the shared/lm_head footprint by eight.
 
+    ``moe_mxq_package`` names the qbruntime MXQ package (``.mxqpkg``) of a release compiled as one package: the
+    compiler's ``manifest.json`` inside it lists the shared, expert and ``lm_head`` entries, so the role
+    ``mxq_path`` templates and ``moe_mxq_pack_index`` are unused. A package compiled for BatchLLM (``"batch": true``
+    in its manifest) serves up to ``max_batch_size`` sequences at once; its shared MXQs hold that many KV cache
+    entries, and ``max_batch_size`` in ``config.json`` records the compiled capacity (``1`` for a non-batch release).
+
     ``moe_mxq_pack_index`` points at the index JSON of a packed release (see
     :class:`~transformers_mblt.utils.moe_utils.MobilintMixtureOfExpertsPackIndex`); the shared and expert MXQs then
-    come from the per-layer packs and ``shared_mxq_path`` / ``expert_mxq_path`` are unused. Without it the role
-    templates name individual MXQ files.
+    come from the per-layer packs and ``shared_mxq_path`` / ``expert_mxq_path`` are unused. Without it (and without
+    ``moe_mxq_package``) the role templates name individual MXQ files.
 
     ``moe_shared_output_order`` lists the role of each shared MXQ output (``residual``, ``expert_in``,
     ``gate``). The ``"default"`` entry applies to every layer without a per-layer override keyed by the layer
@@ -1381,6 +1387,12 @@ class MobilintMixtureOfExpertsConfigMixin(PretrainedConfig):
         if "moe_mxq_pack_index" not in self.__dict__:
             pack_index = kwargs.pop("moe_mxq_pack_index", None)
             self.__dict__["moe_mxq_pack_index"] = str(pack_index) if pack_index else None
+        if "moe_mxq_package" not in self.__dict__:
+            package = kwargs.pop("moe_mxq_package", None)
+            self.__dict__["moe_mxq_package"] = str(package) if package else None
+        # ``max_batch_size`` is a property, so ``hasattr`` cannot tell whether it was set: check the instance dict.
+        if "max_batch_size" not in self.__dict__:
+            self.max_batch_size = kwargs.pop("max_batch_size", 1)
         if "moe_shared_output_order" not in self.__dict__:
             self.__dict__["moe_shared_output_order"] = self._coerce_moe_shared_output_order(
                 kwargs.pop("moe_shared_output_order", None)
@@ -1429,13 +1441,20 @@ class MobilintMixtureOfExpertsConfigMixin(PretrainedConfig):
 
     @property
     def max_batch_size(self) -> int:
-        """MoE releases run one sequence at a time: every shared MXQ holds a single KV cache entry."""
-        return 1
+        """Sequences the release serves at once: the KV cache entries of every shared MXQ (``1`` unless the release
+        was compiled as a BatchLLM MXQ package, see ``moe_mxq_package``)."""
+        return int(self.__dict__.get("max_batch_size", 1))
 
     @max_batch_size.setter
     def max_batch_size(self, value: int) -> None:
-        if int(value) > 1:
-            raise ValueError(f"Mixture-of-Experts releases support only max_batch_size=1, got {value}.")
+        self.__dict__["max_batch_size"] = MobilintEagle3ConfigMixin._coerce_positive_runtime_int(
+            "max_batch_size", value, default_value=1
+        )
+
+    @property
+    def is_batch_package(self) -> bool:
+        """Whether the release is an MXQ package compiled for more than one sequence."""
+        return self.moe_mxq_package is not None and self.max_batch_size > 1
 
     def __init__(self, **kwargs):
         self._ensure_moe_npu_backends(kwargs)
