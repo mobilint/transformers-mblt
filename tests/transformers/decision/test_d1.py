@@ -1,12 +1,14 @@
-"""Hardware-free checks of Mobilint D1: the prompt format, the call planning and the trunk/branch runtime.
+"""Hardware-free checks of Mobilint D1: the prompt glue, the call planning and the trunk/branch runtime.
 
 The runtime tests drive :class:`MobilintD1Model` with a fake MXQ that behaves like a causal hybrid graph: each
 position attends to the KV of every earlier position and also reads the previous token's embedding, which it keeps
 in a ``FixedTailCache``. A wrong KV position, a missed tail-cache restore or a mis-planned chunk changes the hidden
 state, so the trunk/branch results must equal one plain pass over each prompt.
 
-The upstream parity tests load the checkpoint's own ``prompt.py`` / ``runner.py`` and tokenizer from a local
-``LiquidAI/d1-3B`` snapshot (``MBLT_D1_UPSTREAM`` or the Hugging Face cache) and are skipped without one.
+The runtime tests read prompts through ``fixtures/prompt.py``, a stand-in with the checkpoint file's call signatures
+and a simple format of its own; the package ships no prompt code. The upstream parity tests load the checkpoint's own
+``prompt.py`` / ``runner.py`` and tokenizer from a local ``LiquidAI/d1-3B`` snapshot (``MBLT_D1_UPSTREAM`` or the
+Hugging Face cache) and are skipped without one.
 """
 
 from __future__ import annotations
@@ -16,6 +18,8 @@ import json
 import math
 import os
 import sys
+import threading
+import time
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any, Optional
@@ -26,12 +30,14 @@ import torch
 import torch.nn as nn
 
 import transformers_mblt
-from transformers_mblt.models.d1 import prompt_d1
+from transformers_mblt.models.d1 import D1_TASK
 from transformers_mblt.models.d1.configuration_d1 import MobilintD1Config
 from transformers_mblt.models.d1.modeling_d1 import Chunk, MobilintD1Model, is_unsafe_length, plan_chunks
-from transformers_mblt.models.d1.prompt_d1 import Choice, D1Prompter, Noul, Score, as_question
+from transformers_mblt.models.d1.prompt_d1 import D1Prompter, answer, load_prompt_module, resolve_prompt_file
 
 UPSTREAM_REVISION = "051bcc464b01b9f92942b364d9586b0ef5912432"
+REPO_ROOT = Path(__file__).resolve().parents[3]
+FIXTURE_PROMPT = Path(__file__).parent / "fixtures" / "prompt.py"
 
 QUESTIONS: dict[str, dict[str, Any]] = {
     "refund": {"type": "noul", "instructions": "Is the customer asking for a refund?"},
@@ -74,7 +80,7 @@ STATES: list[Any] = [
 class FakeTokenizer:
     """Greedy longest-match tokenizer: known words and special tokens are one token, anything else one per char."""
 
-    WORDS = ("<|startoftext|>", "<|im_start|>", "<|im_end|>", "yes", "Yes", "YES", "no", "No", "NO")
+    WORDS = ("<|startoftext|>", "<|im_start|>", "<|im_end|>", "yes", "Yes", "no", "No")
 
     def __init__(self) -> None:
         self.vocab: dict[str, int] = {}
@@ -104,10 +110,12 @@ class FakeCacheInfo:
 class FakeHybridMxq:
     """A causal graph: ``h_t = mean(e_0..e_t) + 0.5 * e_{t-1}``, with ``e_{t-1}`` carried in a FixedTailCache."""
 
-    def __init__(self, hidden: int, capacity: int = 4096, max_width: int = 64, core_mode: str = "global8") -> None:
+    def __init__(
+        self, hidden: int, capacity: int = 4096, max_width: int = 64, core_mode: str = "global8", delay: float = 0.0
+    ) -> None:
         self.kv = np.zeros((capacity, hidden), dtype=np.float64)
         self.tail = np.zeros((hidden,), dtype=np.float64)
-        self.capacity, self.max_width, self.core_mode = capacity, max_width, core_mode
+        self.capacity, self.max_width, self.core_mode, self.delay = capacity, max_width, core_mode, delay
         self.calls: list[tuple[int, int]] = []
 
     def get_input_buffer_info(self):
@@ -143,6 +151,8 @@ class FakeHybridMxq:
         for i, e in enumerate(x):
             position = cache_size + i
             self.kv[position] = e
+            if self.delay:
+                time.sleep(self.delay)  # lets another thread interleave, as a device call would
             out[i] = self.kv[: position + 1].mean(0) + 0.5 * self.tail
             self.tail = e
         return [out.astype(np.float32)[None]]
@@ -155,7 +165,13 @@ def reference_hidden(table: np.ndarray, row: list[int]) -> np.ndarray:
 
 
 def make_model(
-    tokenizer: Any, vocab: int, hidden: int = 8, core_mode: str = "global8", max_width: int = 64, capacity: int = 4096
+    tokenizer: Any,
+    vocab: int,
+    hidden: int = 8,
+    core_mode: str = "global8",
+    max_width: int = 64,
+    capacity: int = 4096,
+    delay: float = 0.0,
 ) -> tuple[MobilintD1Model, FakeHybridMxq, np.ndarray]:
     model = object.__new__(MobilintD1Model)
     nn.Module.__init__(model)
@@ -164,71 +180,95 @@ def make_model(
     model.embed_tokens = nn.Embedding(vocab, hidden)
     with torch.no_grad():
         model.embed_tokens.weight.copy_(torch.randn(vocab, hidden, generator=generator))
-    mxq = FakeHybridMxq(hidden, capacity=capacity, max_width=max_width, core_mode=core_mode)
-    model.npu_backend = SimpleNamespace(core_mode=core_mode, mxq_model=mxq)
+    mxq = FakeHybridMxq(hidden, capacity=capacity, max_width=max_width, core_mode=core_mode, delay=delay)
+    launches: list[str] = []
+    model.npu_backend = SimpleNamespace(
+        core_mode=core_mode,
+        mxq_model=mxq,
+        launch=lambda: launches.append("launch"),
+        dispose=lambda: launches.append("dispose"),
+        launches=launches,
+    )
     model._tokenizer, model._prompter, model._context, model._tail_cache_names = tokenizer, None, None, None
+    model._prompt_module, model.calibration = load_prompt_module(FIXTURE_PROMPT), None
     return model, mxq, model.embed_tokens.weight.detach().numpy().copy()
+
+
+def row_of(model: MobilintD1Model, state: Any, q: Any) -> list[int]:
+    return model.prompter.encode(model.render(state, q))
 
 
 def expected_probs(model: MobilintD1Model, table: np.ndarray, row: list[int], q: Any) -> list[float]:
     hidden = reference_hidden(table, row)
-    scores = [max(float(table[t] @ hidden) for t in g) for g in model.prompter.readout_ids(as_question(q))]
+    scores = [max(float(table[t] @ hidden) for t in g) for g in model.prompter.readout_ids(model.prompter.question(q))]
     top = max(scores)
     exps = [math.exp(s - top) for s in scores]
     return [e / sum(exps) for e in exps]
 
 
 # --------------------------------------------------------------------------- #
-# prompt format
+# prompt glue
 # --------------------------------------------------------------------------- #
 
 
-def test_prompt_text_matches_the_d1_format() -> None:
-    prompter = D1Prompter(FakeTokenizer(), bos="<|startoftext|>")
-    team = as_question(QUESTIONS["team"])
-    assert prompter.render("Hello", team) == (
-        "<|startoftext|><|im_start|>user\nHello\n\n\nQUESTION:\n"
-        "Which team should handle this?\n\nOptions:\nA Charges, refunds, invoices\nB App or site faults\nC fraud\n\n"
-        "Reply with the option code only.<|im_end|>\n<|im_start|>assistant\n"
-    )
-    assert prompter.suffix_text(as_question(QUESTIONS["refund_defined"])) == (
-        "Does the message ask for money back?\nYes: A refund or chargeback\nNo: Anything else\n\n"
-        "Reply with yes or no only.<|im_end|>\n<|im_start|>assistant\n"
-    )
-    assert prompter.suffix_text(as_question(QUESTIONS["urgency"])).startswith(
-        "How urgent is this?\n\n0 Can wait\n1 Today\n2 Blocking the customer now\n\nReply with a single digit 0-2 only."
-    )
-    assert prompter.prefix_text(None) == "<|startoftext|><|im_start|>user\n"
-    assert prompter.prefix_text({"a": 1}) == '<|startoftext|><|im_start|>user\n{\n  "a": 1\n}\n\n\nQUESTION:\n'
-    assert prompter.question_block(as_question(QUESTIONS["letters"])).count("\nx Ex\ny Why\nz Zed\n") == 1
+def test_prompt_py_is_loaded_from_the_model_folder(tmp_path: Path) -> None:
+    (tmp_path / "prompt.py").write_bytes(FIXTURE_PROMPT.read_bytes())
+    assert resolve_prompt_file(tmp_path) == tmp_path / "prompt.py"
+    assert load_prompt_module(tmp_path / "prompt.py") is load_prompt_module(FIXTURE_PROMPT)
+    (tmp_path / "empty").mkdir()
+    with pytest.raises(FileNotFoundError, match="no prompt.py"):
+        resolve_prompt_file(tmp_path / "empty")
+    (tmp_path / "other.py").write_text("X = 1\n", encoding="utf-8")
+    with pytest.raises(ImportError, match="not a D1 prompt.py"):
+        load_prompt_module(tmp_path / "other.py")
 
 
-def test_option_codes_and_fallback_aliases() -> None:
-    assert prompt_d1.option_codes(["a", "b"]) == ["a", "b"]
-    assert prompt_d1.option_codes(["one", "two"]) == ["A", "B"]
-    assert prompt_d1.option_codes([str(i) for i in range(27)])[:3] == ["00", "01", "02"]
-    # "00".."26" are two tokens with a per-character tokenizer, so the aliases fall back to single tokens.
-    prompter = D1Prompter(FakeTokenizer())
-    aliases = prompter.aliases([f"opt{i}" for i in range(27)])
-    assert len({tid for _, tid in aliases}) == 27
-    assert [code for code, _ in aliases[:2]] == ["A", "B"]
+def test_the_package_ships_no_prompt_code() -> None:
+    package = REPO_ROOT / "transformers_mblt" / "models" / "d1"
+    text = "\n".join(p.read_text(encoding="utf-8") for p in package.glob("*.py"))
+    for marker in ("_FALLBACK_POOL", "Reply with the option code only", "def _sections", "QUESTION:"):
+        assert marker not in text
 
 
-def test_as_question_accepts_dicts_dataclasses_and_lookalikes() -> None:
-    assert as_question({"instructions": "Pick", "criteria": {"a": None}}) == Choice("Pick", {"a": None})
-    assert as_question({"type": "score", "instructions": "s", "criteria": ("lo", "hi")}) == Score("s", ["lo", "hi"])
-    lookalike = SimpleNamespace(type="noul", instructions="Is it?", criteria=None)
-    assert as_question(lookalike) == Noul("Is it?")
+def test_questions_accept_dicts_module_classes_and_lookalikes() -> None:
+    module = load_prompt_module(FIXTURE_PROMPT)
+    prompter = D1Prompter(module, FakeTokenizer(), "json_only", "none", "desc", "")
+    assert prompter.question({"instructions": "Pick", "criteria": {"a": None}}) == module.Choice("Pick", {"a": None})
+    noul = module.Noul("Is it?")
+    assert prompter.question(noul) is noul
+    lookalike = SimpleNamespace(type="score", instructions="s", criteria=("lo", "hi"))
+    assert prompter.question(lookalike) == module.Score("s", ["lo", "hi"])
     with pytest.raises(ValueError, match="question type"):
-        as_question({"type": "rank", "instructions": "x"})
+        prompter.question({"type": "rank", "instructions": "x"})
+    with pytest.raises(ValueError, match="needs criteria"):
+        prompter.question({"type": "choice", "instructions": "x"})
+    with pytest.raises(TypeError):
+        prompter.question(3)
 
 
 def test_answer_shapes_match_the_system_one_schema() -> None:
-    assert prompt_d1.answer(Noul("?"), [0.7, 0.3]) == {"type": "noul", "noul": 0.7}
-    choice = prompt_d1.answer(Choice("?", {"a": None, "b": None}), [0.25, 0.75])
+    module = load_prompt_module(FIXTURE_PROMPT)
+    assert answer(module.Noul("?"), [0.7, 0.3]) == {"type": "noul", "noul": 0.7}
+    choice = answer(module.Choice("?", {"a": None, "b": None}), [0.25, 0.75])
     assert choice == {"type": "choice", "choice": "b", "confidence": 0.75, "probabilities": {"a": 0.25, "b": 0.75}}
-    score = prompt_d1.answer(Score("?", ["lo", "hi"]), [0.4, 0.6])
-    assert score["score"] == pytest.approx(0.6) and score["legend"] == {"0": "lo", "1": "hi"}
+    score = answer(module.Score("?", ["lo", "hi"]), [0.4, 0.6])
+    assert score == {
+        "type": "score",
+        "score": pytest.approx(0.6),
+        "confidence": 0.6,
+        "probabilities": {"0": 0.4, "1": 0.6},
+        "legend": {"0": "lo", "1": "hi"},
+    }
+
+
+def test_task_tag_is_one_constant() -> None:
+    from transformers_mblt.utils.api import TASKS
+
+    assert D1_TASK in TASKS
+    assert f"| `{D1_TASK}` | D1" in (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    assert f"`{D1_TASK}`" in (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    script = (REPO_ROOT / "scripts" / "build_d1_hf_package.py").read_text(encoding="utf-8")
+    assert "pipeline_tag: {D1_TASK}" in script
 
 
 # --------------------------------------------------------------------------- #
@@ -267,9 +307,10 @@ def test_trunk_and_branches_equal_one_pass_per_prompt(state: Any, core_mode: str
     got = model.probabilities(state, questions)
     prompter = model.prompter
     rows = [
-        prompter.encode(prompter.prefix_text(state)) + prompter.encode(prompter.suffix_text(as_question(q)))
+        prompter.encode(prompter.prefix(state)) + prompter.encode(prompter.suffix(prompter.question(q)))
         for q in questions
     ]
+    assert model.tokens(state, questions) == max(map(len, rows))
     for probs, row, q in zip(got, rows, questions):
         assert probs == pytest.approx(expected_probs(model, table, row, q), rel=1e-4, abs=1e-6)
 
@@ -279,17 +320,17 @@ def test_single_question_reads_the_whole_prompt_and_reuses_the_state() -> None:
     model, mxq, table = make_model(tokenizer, vocab=4096, max_width=48)
     state = STATES[1]
     first = model.system_one(state, {"team": QUESTIONS["team"]})
-    row = model.prompter.encode(model.prompter.render(state, as_question(QUESTIONS["team"])))
+    row = row_of(model, state, QUESTIONS["team"])
     assert first["usage"] == {"input_tokens": len(row), "output_tokens": 0}
     team = first["answers"]["team"]
     assert list(team["probabilities"].values()) == pytest.approx(expected_probs(model, table, row, QUESTIONS["team"]))
 
-    prefix_tokens = len(model.prompter.encode(model.prompter.prefix_text(state)))
+    prefix_tokens = len(model.prompter.encode(model.prompter.prefix(state)))
     mxq.calls.clear()
     second = model.system_one(state, {"urgency": QUESTIONS["urgency"]})
     # The state's KV and tail state are still on the device: only the question is prefilled.
     assert min(position for position, _ in mxq.calls) == prefix_tokens
-    row = model.prompter.encode(model.prompter.render(state, as_question(QUESTIONS["urgency"])))
+    row = row_of(model, state, QUESTIONS["urgency"])
     probs = list(second["answers"]["urgency"]["probabilities"].values())
     assert probs == pytest.approx(expected_probs(model, table, row, QUESTIONS["urgency"]), rel=1e-4)
 
@@ -302,9 +343,8 @@ def test_a_new_state_replaces_the_held_trunk() -> None:
     mxq.calls.clear()
     probs = model.probabilities("log line one and two", questions)
     assert mxq.calls[0][0] == 0
-    prompter = model.prompter
     for p, q in zip(probs, questions):
-        row = prompter.encode(prompter.render("log line one and two", as_question(q)))
+        row = row_of(model, "log line one and two", q)
         assert p == pytest.approx(expected_probs(model, table, row, q), rel=1e-4)
     model.reset_context()
     mxq.calls.clear()
@@ -322,6 +362,64 @@ def test_batch_returns_one_response_per_request_in_order() -> None:
     )
     batch = model.probabilities_batch([(STATES[0], [QUESTIONS["refund"]]), (STATES[1], [QUESTIONS["team"]], None)])
     assert [len(p[0]) for p in batch] == [2, 3]
+
+
+def test_launch_dispose_and_forward_drop_the_held_trunk() -> None:
+    model, mxq, _ = make_model(FakeTokenizer(), vocab=4096)
+    for step in ("launch", "dispose"):
+        model.probabilities(STATES[0], [QUESTIONS["refund"], QUESTIONS["urgency"]])
+        assert model._context is not None
+        getattr(model, step)()
+        assert model._context is None
+    assert model.npu_backend.launches == ["launch", "dispose"]
+
+
+def test_concurrent_requests_are_serialized() -> None:
+    model, _, table = make_model(FakeTokenizer(), vocab=4096, max_width=48, delay=1e-4)
+    questions = [QUESTIONS["refund"], QUESTIONS["team"]]
+    states = STATES[:4]
+    results: dict[int, Any] = {}
+    errors: list[BaseException] = []
+
+    def worker(i: int) -> None:
+        try:
+            for _ in range(3):
+                results[i] = model.probabilities(states[i], questions)
+        except BaseException as exc:  # noqa: BLE001 - reported below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(len(states))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors
+    prompter = model.prompter
+    for i, state in enumerate(states):
+        for probs, q in zip(results[i], questions):
+            row = prompter.encode(prompter.prefix(state)) + prompter.encode(prompter.suffix(prompter.question(q)))
+            assert probs == pytest.approx(expected_probs(model, table, row, q), rel=1e-4, abs=1e-6)
+
+
+def test_calibration_sees_log_probabilities() -> None:
+    model, _, table = make_model(FakeTokenizer(), vocab=4096)
+    seen: list[list[float]] = []
+
+    class Shift:
+        def apply(self, q: Any, scores: list[float]) -> list[float]:
+            seen.append(list(scores))
+            return [s + (2.0 if i == 0 else 0.0) for i, s in enumerate(scores)]
+
+    q = QUESTIONS["refund"]
+    plain = model.probabilities(STATES[0], [q])[0]
+    model.calibration = Shift()
+    shifted = model.probabilities(STATES[0], [q])[0]
+    hidden = reference_hidden(table, row_of(model, STATES[0], q))
+    logits = table.astype(np.float64) @ hidden
+    logz = logits - np.log(np.exp(logits - logits.max()).sum()) - logits.max()
+    groups = model.prompter.readout_ids(model.prompter.question(q))
+    assert seen[0] == pytest.approx([max(logz[t] for t in g) for g in groups], rel=1e-4, abs=1e-4)
+    assert shifted[0] / shifted[1] == pytest.approx(math.exp(2.0) * plain[0] / plain[1], rel=1e-4)
 
 
 def test_images_and_overlong_prompts_are_rejected() -> None:
@@ -390,7 +488,22 @@ def upstream() -> SimpleNamespace:
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(str(snapshot))
-    return SimpleNamespace(prompt=prompt, runner=runner, tokenizer=tokenizer)
+    # What the model loads at runtime: the checkpoint's prompt.py, imported on its own.
+    loaded = load_prompt_module(snapshot / "prompt.py")
+    prompter = D1Prompter(loaded, tokenizer, "json_only", "none", "desc", "")
+    return SimpleNamespace(prompt=prompt, runner=runner, tokenizer=tokenizer, loaded=loaded, prompter=prompter)
+
+
+def test_prompt_text_matches_the_d1_format(upstream: SimpleNamespace) -> None:
+    prompter = D1Prompter(upstream.loaded, FakeTokenizer(), "json_only", "none", "desc", "")
+    team = prompter.question(QUESTIONS["team"])
+    assert prompter.render("Hello", team) == (
+        "<|startoftext|><|im_start|>user\nHello\n\n\nQUESTION:\n"
+        "Which team should handle this?\n\nOptions:\nA Charges, refunds, invoices\nB App or site faults\nC fraud\n\n"
+        "Reply with the option code only.<|im_end|>\n<|im_start|>assistant\n"
+    )
+    assert prompter.prefix(None) == "<|startoftext|><|im_start|>user\n"
+    assert prompter.prefix({"a": 1}) == '<|startoftext|><|im_start|>user\n{\n  "a": 1\n}\n\n\nQUESTION:\n'
 
 
 class _RecordingBackbone(nn.Module):
@@ -424,18 +537,20 @@ def test_token_rows_equal_the_upstream_runner(upstream: SimpleNamespace, state: 
     up_questions = [upstream.prompt.as_question(QUESTIONS[n]) for n in names]
     [(_, read)] = system_one.run([(state, up_questions, ())])
 
-    prompter = D1Prompter(tokenizer, bos=tokenizer.bos_token)
-    rows, shared, our_read = prompter.request_rows(state, [as_question(QUESTIONS[n]) for n in names])
+    prompter = upstream.prompter
+    ours = [prompter.question(QUESTIONS[n]) for n in names]
+    rows, shared, our_read = prompter.request_rows(state, ours)
     assert rows == backbone.rows
     assert our_read == read
     assert all(row[:shared] == rows[0][:shared] for row in rows)
-    for name, up_q in zip(names, up_questions):
-        assert prompter.readout_ids(as_question(QUESTIONS[name])) == upstream.prompt.readout_ids(tokenizer, up_q)
+    assert prompter.tokens(state, ours) == system_one.tokens(state, up_questions)
+    for q, up_q in zip(ours, up_questions):
+        assert prompter.readout_ids(q) == upstream.prompt.readout_ids(tokenizer, up_q)
 
 
 def test_readout_and_many_options_match_upstream(upstream: SimpleNamespace) -> None:
     tokenizer = upstream.tokenizer
-    prompter = D1Prompter(tokenizer, bos=tokenizer.bos_token)
+    prompter = upstream.prompter
     many = {"type": "choice", "instructions": "Which?", "criteria": {f"item_{i}": f"Item {i}" for i in range(40)}}
     for q in [
         *QUESTIONS.values(),
@@ -443,15 +558,13 @@ def test_readout_and_many_options_match_upstream(upstream: SimpleNamespace) -> N
         {"type": "score", "instructions": "s", "criteria": [str(i) for i in range(10)]},
     ]:
         up_q = upstream.prompt.as_question(q)
-        ours = as_question(q)
+        ours = prompter.question(q)
         assert prompter.render(STATES[1], ours) == upstream.prompt.render(
             tokenizer, STATES[1], up_q, tokenizer.bos_token
         )
         logz = torch.randn(len(tokenizer), generator=torch.Generator().manual_seed(len(json.dumps(q))))
-        groups = prompter.readout_ids(ours)
-        scores = [max(float(logz[i]) for i in g) for g in groups]
-        top = max(scores)
-        probs = [math.exp(s - top) / sum(math.exp(t - top) for t in scores) for s in scores]
+        selected = {t for g in prompter.readout_ids(ours) for t in g}
+        probs = prompter.probabilities(ours, {t: float(logz[t]) for t in selected})
         assert probs == pytest.approx(upstream.prompt.readout(tokenizer, up_q, logz), rel=1e-9)
 
 

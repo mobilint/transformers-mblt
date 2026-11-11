@@ -8,7 +8,6 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.models.auto.configuration_auto import AutoConfig
 
 from ...utils.configuration_utils import MobilintConfigMixin
-from .prompt_d1 import DEFAULT_LEAD, DEFAULT_OPTION_STYLE, DEFAULT_STATE_STYLE, DEFAULT_SYSTEM
 
 
 class MobilintD1Config(MobilintConfigMixin, PretrainedConfig):
@@ -22,12 +21,12 @@ class MobilintD1Config(MobilintConfigMixin, PretrainedConfig):
         hidden_size: Width of the embedding and of the graph's hidden state.
         max_position_embeddings: KV capacity the graph was compiled for; the MXQ's own capacity wins when it differs.
         image_token_id: Image placeholder token. Mobilint D1 builds are text-only, so it is never placed.
-        state_style: How a non-string state is written (``json_only``, ``json`` or ``sections``).
-        system: The optional system turn (``none`` or ``isolated``).
-        option_style: Choice option lines (``desc`` or ``name_desc``).
-        lead: Text between the assistant header and the answer slot.
+        state_style: ``style`` argument of the checkpoint's ``prompt.py`` (``json_only``, ``json`` or ``sections``).
+        system: ``system`` argument of ``prompt.py`` (``none`` or ``isolated``).
+        option_style: ``option_style`` argument of ``prompt.py`` (``desc`` or ``name_desc``).
+        lead: ``lead`` argument of ``prompt.py``: text between the assistant header and the answer slot.
         base_model: The upstream checkpoint the MXQ was compiled from.
-        base_model_revision: Its revision; the prompt format is pinned to it.
+        base_model_revision: Its revision; the model folder ships that revision's ``prompt.py``.
     """
 
     model_type = "mobilint-d1"
@@ -38,10 +37,10 @@ class MobilintD1Config(MobilintConfigMixin, PretrainedConfig):
         hidden_size: int = 2048,
         max_position_embeddings: int = 16384,
         image_token_id: int = 124907,
-        state_style: str = DEFAULT_STATE_STYLE,
-        system: str = DEFAULT_SYSTEM,
-        option_style: str = DEFAULT_OPTION_STYLE,
-        lead: str = DEFAULT_LEAD,
+        state_style: str = "json_only",
+        system: str = "none",
+        option_style: str = "desc",
+        lead: str = "",
         base_model: Optional[str] = "LiquidAI/d1-3B",
         base_model_revision: Optional[str] = "051bcc464b01b9f92942b364d9586b0ef5912432",
         pad_token_id: int = 124893,

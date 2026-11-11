@@ -13,12 +13,16 @@ on the same state skips its prefill.
 LFM2 hybrid graphs hang the NPU in the global core modes for infer calls whose length is ``0`` or ``63`` modulo 64.
 Calls are planned so no call has such a length: a prefill of real tokens is split into safe calls, and only a
 branch's final call may get trailing zeros instead. Zeros land in KV slots
-past the branch's end, which the causal graph never reads and the next branch overwrites.
+past the branch's end, which the causal graph never reads and the next branch overwrites. ``single`` core mode has no
+such restriction, so its calls use the full chunk width.
+
+The prompt format and the option readout are the checkpoint's own ``prompt.py``, loaded from the model folder (or the
+Hub snapshot) at runtime; :mod:`.prompt_d1` only arranges its calls.
 """
 
 from __future__ import annotations
 
-import math
+import threading
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
@@ -35,7 +39,7 @@ from transformers.utils.generic import logging
 
 from ...utils.modeling_utils import MobilintModelMixin
 from .configuration_d1 import MobilintD1Config
-from .prompt_d1 import D1Prompter, Question, answer, as_question
+from .prompt_d1 import D1Prompter, answer, load_prompt_module, resolve_prompt_file
 
 logger = logging.get_logger(__name__)
 
@@ -88,15 +92,6 @@ def plan_chunks(
     return chunks
 
 
-def _softmax(scores: Sequence[float]) -> list[float]:
-    if not scores or not all(math.isfinite(s) for s in scores):
-        raise RuntimeError("option scores must be nonempty and finite")
-    top = max(scores)
-    exps = [math.exp(s - top) for s in scores]
-    total = sum(exps)
-    return [e / total for e in exps]
-
-
 @dataclass
 class _DeviceContext:
     """The trunk whose KV the device holds: its token ids and the short-convolution state after it."""
@@ -132,8 +127,14 @@ class MobilintD1Model(MobilintModelMixin, MobilintD1PreTrainedModel):
     - :meth:`run` is the primitive under them: each ``(state, questions, images)`` request's probabilities and the
       number of tokens it read.
 
-    Requests run one after another on one MXQ, so ``max_batch_size`` stays 1. The checkpoint's tokenizer is loaded
-    on first use; assign :attr:`tokenizer` to supply one.
+    Requests run one after another on one MXQ, so ``max_batch_size`` stays 1. The device holds one request's state at
+    a time, so a lock serializes requests: calls from several threads are safe and run one by one.
+
+    The checkpoint's tokenizer and its ``prompt.py`` are loaded from the model folder (or the Hub snapshot) on first
+    use; assign :attr:`tokenizer` or :attr:`prompt_module` to supply them. Set :attr:`calibration` to an object with
+    the upstream ``apply(question, scores)`` hook to calibrate the option scores, as upstream's ``calibration=``.
+    Not provided: pictures (Mobilint D1 builds are text-only), and upstream's ``plan_batches`` / ``token_budget`` and
+    ``compile`` options, which concern its GPU batching.
     """
 
     config: MobilintD1Config
@@ -143,7 +144,9 @@ class MobilintD1Model(MobilintModelMixin, MobilintD1PreTrainedModel):
         super().__init__(config, *args, **kwargs)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self._tokenizer: Any = None
+        self._prompt_module: Any = None
         self._prompter: Optional[D1Prompter] = None
+        self.calibration: Any = None
         self._context: Optional[_DeviceContext] = None
         self._tail_cache_names: Optional[list[str]] = None
 
@@ -159,14 +162,16 @@ class MobilintD1Model(MobilintModelMixin, MobilintD1PreTrainedModel):
 
     # -- tokenizer and prompt ---------------------------------------------------------------------------
 
+    def _revision(self) -> Optional[str]:
+        return getattr(self.config, "revision", None) or getattr(self.config, "_commit_hash", None)
+
     @property
     def tokenizer(self) -> Any:
         """The checkpoint's tokenizer, loaded from the model folder or repository on first use."""
         if self._tokenizer is None:
             from transformers import AutoTokenizer
 
-            revision = getattr(self.config, "revision", None) or getattr(self.config, "_commit_hash", None)
-            self._tokenizer = AutoTokenizer.from_pretrained(self.config.name_or_path, revision=revision)
+            self._tokenizer = AutoTokenizer.from_pretrained(self.config.name_or_path, revision=self._revision())
         return self._tokenizer
 
     @tokenizer.setter
@@ -175,13 +180,24 @@ class MobilintD1Model(MobilintModelMixin, MobilintD1PreTrainedModel):
         self._prompter = None
 
     @property
+    def prompt_module(self) -> Any:
+        """The checkpoint's ``prompt.py``, imported from the model folder or the repository snapshot on first use."""
+        if self._prompt_module is None:
+            self._prompt_module = load_prompt_module(resolve_prompt_file(self.config.name_or_path, self._revision()))
+        return self._prompt_module
+
+    @prompt_module.setter
+    def prompt_module(self, value: Any) -> None:
+        self._prompt_module = value
+        self._prompter = None
+
+    @property
     def prompter(self) -> D1Prompter:
-        """Renders prompts and readout ids with :attr:`tokenizer` and the config's prompt settings."""
+        """Calls :attr:`prompt_module` with :attr:`tokenizer` and the config's prompt settings."""
         if self._prompter is None:
-            bos = getattr(self.tokenizer, "bos_token", None)
             self._prompter = D1Prompter(
+                self.prompt_module,
                 self.tokenizer,
-                bos=bos if isinstance(bos, str) else "",
                 state_style=self.config.state_style,
                 system=self.config.system,
                 option_style=self.config.option_style,
@@ -189,17 +205,29 @@ class MobilintD1Model(MobilintModelMixin, MobilintD1PreTrainedModel):
             )
         return self._prompter
 
+    def _lock(self) -> threading.RLock:
+        # Created on first use: MobilintModelMixin.__init__ launches the backend before this class's __init__ runs.
+        return self.__dict__.setdefault("_request_lock", threading.RLock())
+
+    def render(self, state: Any, question: Any) -> str:
+        """The whole prompt of one question over ``state``, as the checkpoint's ``prompt.py`` renders it."""
+        return self.prompter.render(state, self.prompter.question(question))
+
+    def tokens(self, state: Any, questions: Sequence[Any]) -> int:
+        """The longest prompt one of ``questions`` makes over a text ``state``: its state's tokens and its own."""
+        return self.prompter.tokens(state, [self.prompter.question(q) for q in questions])
+
     # -- System One API ---------------------------------------------------------------------------------
 
     def probabilities(
         self, state: Any, questions: Sequence[Any], images: Optional[Sequence] = None
     ) -> list[list[float]]:
         """Each question's distribution over its options (``yes``, ``no`` for a noul), in one pass."""
-        return self.run([(state, [as_question(q) for q in questions], images or ())])[0][0]
+        return self.run([(state, list(questions), images or ())])[0][0]
 
     def probabilities_batch(self, requests: Sequence[tuple]) -> list[list[list[float]]]:
         """:meth:`probabilities` for many ``(state, questions[, images])`` requests."""
-        reqs = [(r[0], [as_question(q) for q in r[1]], (r[2] if len(r) > 2 else None) or ()) for r in requests]
+        reqs = [(r[0], list(r[1]), (r[2] if len(r) > 2 else None) or ()) for r in requests]
         return [probs for probs, _ in self.run(reqs)]
 
     def system_one(self, state: Any, questions: Mapping[str, Any], images: Optional[Sequence] = None) -> dict:
@@ -212,7 +240,7 @@ class MobilintD1Model(MobilintModelMixin, MobilintD1PreTrainedModel):
     def system_one_batch(self, requests: Sequence[tuple]) -> list[dict]:
         """Many ``(state, questions)`` or ``(state, questions, images)`` requests, one response each."""
         named = [
-            (r[0], {name: as_question(q) for name, q in r[1].items()}, (r[2] if len(r) > 2 else None) or ())
+            (r[0], {name: self.prompter.question(q) for name, q in r[1].items()}, (r[2] if len(r) > 2 else None) or ())
             for r in requests
         ]
         done = self.run([(state, list(qs.values()), images) for state, qs, images in named])
@@ -225,10 +253,11 @@ class MobilintD1Model(MobilintModelMixin, MobilintD1PreTrainedModel):
         ]
 
     @torch.inference_mode()
-    def run(self, requests: Sequence[tuple[Any, Sequence[Question], Sequence]]) -> list[tuple[list[list[float]], int]]:
+    def run(self, requests: Sequence[tuple[Any, Sequence[Any], Sequence]]) -> list[tuple[list[list[float]], int]]:
         """Each ``(state, questions, images)`` request's probabilities, in its questions' order, and the tokens it read.
 
-        Requests run in order; consecutive requests on the same state reuse its prefill.
+        Requests run in order; consecutive requests on the same state reuse its prefill. Each request holds the model's
+        lock from its prefill to its last readout.
         """
         for _, questions, images in requests:
             if images:
@@ -240,21 +269,27 @@ class MobilintD1Model(MobilintModelMixin, MobilintD1PreTrainedModel):
                 raise ValueError("a request needs at least one question")
         out = []
         for state, questions, _ in requests:
-            qs = [as_question(q) for q in questions]
+            qs = [self.prompter.question(q) for q in questions]
             rows, shared, read = self.prompter.request_rows(state, qs)
-            hidden = self._decide(rows, shared)
+            with self._lock():
+                hidden = self._decide(rows, shared)
             out.append(([self._readout(q, h) for q, h in zip(qs, hidden)], read))
         return out
 
-    def _readout(self, q: Question, hidden: np.ndarray) -> list[float]:
+    def _readout(self, q: Any, hidden: np.ndarray) -> list[float]:
+        """The checkpoint's readout over the answer slot's scores of the option tokens."""
         groups = self.prompter.readout_ids(q)
         selected = sorted({t for g in groups for t in g})
-        rows = self.embed_tokens.weight.detach()[torch.tensor(selected)].float().cpu().numpy()
-        values = rows @ hidden
+        weight = self.embed_tokens.weight.detach()
+        values = weight[torch.tensor(selected)].float().cpu().numpy() @ hidden
         if not np.isfinite(values).all():
             raise RuntimeError("the option readout is not finite")
-        logits = dict(zip(selected, values.tolist()))
-        return _softmax([max(logits[t] for t in g) for g in groups])
+        calibration = getattr(self, "calibration", None)
+        if calibration is not None:
+            # A calibration hook sees log-probabilities, as upstream; the softmax alone is shift-invariant.
+            logits = torch.from_numpy(weight.float().cpu().numpy() @ hidden)
+            values = values - float(torch.logsumexp(logits, dim=0))
+        return self.prompter.probabilities(q, dict(zip(selected, values.tolist())), calibration)
 
     # -- NPU ----------------------------------------------------------------------------------------------
 
@@ -361,11 +396,18 @@ class MobilintD1Model(MobilintModelMixin, MobilintD1PreTrainedModel):
 
     def reset_context(self) -> None:
         """Forget the trunk held on the device; the next request prefills its state from scratch."""
-        self._context = None
+        with self._lock():
+            self._context = None
+
+    def launch(self) -> None:
+        with self._lock():
+            self._context = None
+            super().launch()
 
     def dispose(self) -> None:
-        self._context = None
-        super().dispose()
+        with self._lock():
+            self._context = None
+            super().dispose()
 
     # -- plain forward ------------------------------------------------------------------------------------
 
@@ -383,9 +425,10 @@ class MobilintD1Model(MobilintModelMixin, MobilintD1PreTrainedModel):
         if input_ids is None or input_ids.ndim != 2 or input_ids.shape[0] != 1:
             raise ValueError("Mobilint D1 forward takes input_ids of shape (1, length)")
         ids = input_ids[0].tolist()
-        self._context = None
-        self.get_mxq_model().reset_fixed_tail_cache_memory()
-        hidden = torch.from_numpy(self._infer(ids, 0, final=True))
+        with self._lock():
+            self._context = None
+            self.get_mxq_model().reset_fixed_tail_cache_memory()
+            hidden = torch.from_numpy(self._infer(ids, 0, final=True))
         logits = self.embed_tokens.weight.detach().float() @ hidden
         return CausalLMOutputWithPast(logits=cast(torch.FloatTensor, logits.view(1, 1, -1)))
 

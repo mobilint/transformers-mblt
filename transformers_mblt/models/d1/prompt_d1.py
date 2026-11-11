@@ -1,371 +1,194 @@
-"""The D1 decision prompt and readout, written for the Mobilint NPU runtime.
+"""Glue between :class:`MobilintD1Model` and the checkpoint's own ``prompt.py``.
 
-A D1 decision is one forward pass that stops at the answer slot. The prompt is
-``prefix + suffix``: the prefix holds the state and is shared by every question
-on that state, the suffix holds one question and the assistant header. The
-answer is a softmax over the logits of each option's tokens, max-pooled per
-option.
-
-This module reproduces the prompt format that LiquidAI/d1-3B defines in its
-``prompt.py`` (revision ``051bcc464b01b9f92942b364d9586b0ef5912432``) so the
-token ids match the upstream renderer exactly; ``tests/transformers/decision``
-checks that against the checkpoint's own ``prompt.py`` whenever it is available
-locally. The module holds no weights and needs no NPU.
+The D1 prompt format, the question classes and the option readout belong to the checkpoint: its ``prompt.py`` (LFM
+Open License v1.0) ships unmodified in every D1 model folder and Hub repository. This module holds none of that code.
+It loads the file from the model folder (or the Hub snapshot) at runtime and only arranges its calls the way the
+NPU runtime needs them: token rows per request, readout ids, and the typed answer of each question.
 """
 
 from __future__ import annotations
 
-import json
-import re
+import hashlib
+import importlib.util
+import os
+import sys
+import threading
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
-from typing import Any, Optional, Union
+from pathlib import Path
+from types import ModuleType
+from typing import Any, Optional
 
-IM_START = "<|im_start|>"
-IM_END = "<|im_end|>"
+PROMPT_FILE = "prompt.py"
+QUESTION_TYPES = ("choice", "noul", "score")
+_REQUIRED = ("as_question", "prefix_text", "suffix_text", "render", "readout_ids", "readout")
 
-# The optional system turn (``system=`` in the config). D1 uses none by default.
-SYSTEMS: dict[str, Optional[str]] = {
-    "none": None,
-    "isolated": (
-        "You are a System One decision model. Answer only the current isolated "
-        "question from the shared state. Other questions do not exist."
-    ),
-}
-DEFAULT_SYSTEM = "none"
-DEFAULT_STATE_STYLE = "json_only"
-DEFAULT_OPTION_STYLE = "desc"
-# What sits between the assistant header and the answer slot: nothing on LFM2-VL.
-DEFAULT_LEAD = ""
-
-YES_FORMS = ("yes", "Yes", "YES")
-NO_FORMS = ("no", "No", "NO")
+_LOADED: dict[str, ModuleType] = {}
+_LOAD_LOCK = threading.Lock()
 
 
-# --------------------------------------------------------------------------- #
-# question types (the Decision Index schema)
-# --------------------------------------------------------------------------- #
+def resolve_prompt_file(name_or_path: str | os.PathLike, revision: Optional[str] = None) -> Path:
+    """The ``prompt.py`` of a local model folder, or of a Hub repository's snapshot (downloaded on first use)."""
+    folder = Path(name_or_path)
+    if folder.is_dir():
+        path = folder / PROMPT_FILE
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"{folder} has no {PROMPT_FILE}. A D1 model folder ships the checkpoint's own {PROMPT_FILE}; "
+                "rebuild it with scripts/build_d1_hf_package.py or copy it from the base model revision."
+            )
+        return path
+    from huggingface_hub import hf_hub_download
+
+    return Path(hf_hub_download(str(name_or_path), PROMPT_FILE, revision=revision))
 
 
-@dataclass(frozen=True)
-class Choice:
-    """Pick one of named options: ``criteria`` maps each option name to its description (or ``None``)."""
-
-    instructions: str
-    criteria: Mapping[str, Optional[str]]
-    type: str = "choice"
-
-
-@dataclass(frozen=True)
-class Noul:
-    """Yes or no; ``criteria`` may define each side as ``{"true": ..., "false": ...}``."""
-
-    instructions: str
-    criteria: Optional[Mapping[str, Any]] = None
-    type: str = "noul"
-
-
-@dataclass(frozen=True)
-class Score:
-    """An ordered scale of 2 to 10 levels, lowest first."""
-
-    instructions: str
-    criteria: Sequence[str]
-    type: str = "score"
-
-
-Question = Union[Choice, Noul, Score]
-
-
-def as_question(q: Any) -> Question:
-    """A question given as a Decision Index dict (``type``, ``instructions``, ``criteria``) or as an object.
-
-    Objects with the same ``type`` / ``instructions`` / ``criteria`` attributes, such as the classes of the
-    upstream ``prompt.py``, are accepted too. A missing ``type`` means ``choice``, as upstream.
-    """
-    if isinstance(q, (Choice, Noul, Score)):
-        return q
-    if isinstance(q, Mapping):
-        kind, instructions, criteria = q.get("type", "choice"), q["instructions"], q.get("criteria")
-    elif hasattr(q, "instructions"):
-        kind, instructions, criteria = getattr(q, "type", "choice"), q.instructions, getattr(q, "criteria", None)
-    else:
-        raise TypeError(f"a question is a dict with type/instructions/criteria, got {type(q).__name__}")
-    if kind == "noul":
-        return Noul(instructions, criteria)
-    if kind == "score":
-        if criteria is None:
-            raise ValueError("a score question needs criteria: a list of level descriptions")
-        return Score(instructions, list(criteria))
-    if kind != "choice":
-        raise ValueError(f"question type must be 'choice', 'noul' or 'score', got {kind!r}")
-    if criteria is None:
-        raise ValueError("a choice question needs criteria: {name: description}")
-    return Choice(instructions, criteria)
-
-
-# --------------------------------------------------------------------------- #
-# option codes
-# --------------------------------------------------------------------------- #
-
-
-def option_codes(labels: Sequence[Any]) -> list[str]:
-    """Labels that are single letters keep them; otherwise ``A``..``Z``, or ``00``.. beyond 26 options."""
-    labs = [str(x).strip() for x in labels]
-    if labs and all(len(k) == 1 and k.isalpha() for k in labs):
-        return labs
-    if len(labs) <= 26:
-        return [chr(ord("A") + i) for i in range(len(labs))]
-    return [f"{i:02d}" for i in range(len(labs))]
-
-
-# Codes tried, in order, when a code is not one distinct token.
-_FALLBACK_POOL: tuple[str, ...] = tuple(
-    [chr(c) for c in range(ord("A"), ord("Z") + 1)]
-    + [f"{i:02d}" for i in range(100)]
-    + [chr(c) for c in range(ord("a"), ord("z") + 1)]
-    + [f"#{i}" for i in range(200)]
-    + [chr(a) + chr(b) for a in range(ord("A"), ord("Z") + 1) for b in range(ord("A"), ord("Z") + 1)]
-)
+def load_prompt_module(path: str | os.PathLike) -> ModuleType:
+    """Import a checkpoint ``prompt.py`` as its own module; the same file content is imported once."""
+    source = Path(path).read_bytes()
+    digest = hashlib.sha256(source).hexdigest()[:16]
+    with _LOAD_LOCK:
+        module = _LOADED.get(digest)
+        if module is not None:
+            return module
+        name = f"_mblt_d1_prompt_{digest}"
+        spec = importlib.util.spec_from_file_location(name, Path(path))
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot import {path}")
+        module = importlib.util.module_from_spec(spec)
+        # dataclasses resolve string annotations through sys.modules while the module executes.
+        sys.modules[name] = module
+        try:
+            spec.loader.exec_module(module)
+            missing = [n for n in _REQUIRED if not hasattr(module, n)]
+            if missing:
+                raise ImportError(f"{path} is not a D1 prompt.py: it has no {', '.join(missing)}")
+        except BaseException:
+            sys.modules.pop(name, None)
+            raise
+        _LOADED[digest] = module
+        return module
 
 
 class D1Prompter:
-    """Render D1 prompts and option readout ids with one tokenizer.
+    """One tokenizer and the prompt settings of a config, over a loaded ``prompt.py`` module.
 
     Args:
-        tokenizer: Any object with ``encode(text, add_special_tokens=False) -> list[int]``.
-        bos: Text written at the very start of the prompt (the tokenizer's BOS token text).
-        state_style: How a non-string state is written: ``json_only`` (default), ``json`` or ``sections``.
-        system: Key of :data:`SYSTEMS` for the optional system turn.
-        option_style: ``desc`` (default) or ``name_desc`` for choice option lines.
-        lead: Text between the assistant header and the answer slot.
+        module: The checkpoint's ``prompt.py``, as :func:`load_prompt_module` returns it.
+        tokenizer: The checkpoint's tokenizer (``encode(text, add_special_tokens=False)``).
+        state_style: ``state_style`` of the config.
+        system: ``system`` of the config.
+        option_style: ``option_style`` of the config.
+        lead: ``lead`` of the config.
     """
 
     def __init__(
         self,
+        module: ModuleType,
         tokenizer: Any,
-        bos: str = "",
-        state_style: str = DEFAULT_STATE_STYLE,
-        system: str = DEFAULT_SYSTEM,
-        option_style: str = DEFAULT_OPTION_STYLE,
-        lead: str = DEFAULT_LEAD,
+        state_style: str,
+        system: str,
+        option_style: str,
+        lead: str,
     ) -> None:
-        if system not in SYSTEMS:
-            raise ValueError(f"system must be one of {sorted(SYSTEMS)}, got {system!r}")
+        self.module = module
         self.tokenizer = tokenizer
-        self.bos = bos
+        bos = getattr(tokenizer, "bos_token", None)
+        self.bos = bos if isinstance(bos, str) else ""
         self.state_style = state_style
         self.system = system
         self.option_style = option_style
         self.lead = lead
-        self._single_token: dict[str, Optional[int]] = {}
-        self._aliases: dict[tuple[str, ...], tuple[tuple[str, int], ...]] = {}
-
-    # -- tokens -------------------------------------------------------------------------------------
 
     def encode(self, text: str) -> list[int]:
         return list(self.tokenizer.encode(text, add_special_tokens=False))
 
-    def _token(self, text: str) -> Optional[int]:
-        """The id of ``text`` when it encodes to exactly one token."""
-        if text not in self._single_token:
-            ids = self.encode(text)
-            self._single_token[text] = ids[0] if len(ids) == 1 else None
-        return self._single_token[text]
+    def question(self, q: Any) -> Any:
+        """``q`` as one of the module's question classes.
 
-    def _ids(self, texts: Sequence[str]) -> list[int]:
-        """Distinct single-token ids of ``texts``, in order; multi-token texts are skipped."""
-        out: list[int] = []
-        for text in texts:
-            tid = self._token(text)
-            if tid is not None and tid not in out:
-                out.append(tid)
-        return out
+        Accepts a Decision Index dict (``type``, ``instructions``, ``criteria``; no ``type`` means ``choice``), an
+        instance of the module's classes, or any object with those attributes (such as the classes of another copy of
+        ``prompt.py``).
+        """
+        classes = tuple(getattr(self.module, n) for n in ("Choice", "Noul", "Score") if hasattr(self.module, n))
+        if classes and isinstance(q, classes):
+            return q
+        if isinstance(q, Mapping):
+            spec = dict(q)
+        elif hasattr(q, "instructions"):
+            spec = {
+                "type": getattr(q, "type", "choice"),
+                "instructions": q.instructions,
+                "criteria": getattr(q, "criteria", None),
+            }
+        else:
+            raise TypeError(f"a question is a dict with type/instructions/criteria, got {type(q).__name__}")
+        kind = spec.get("type", "choice")
+        if kind not in QUESTION_TYPES:
+            raise ValueError(f"question type must be one of {QUESTION_TYPES}, got {kind!r}")
+        if "instructions" not in spec:
+            raise ValueError("a question needs instructions")
+        if kind != "noul" and spec.get("criteria") is None:
+            raise ValueError(f"a {kind} question needs criteria")
+        return self.module.as_question(spec)
 
-    def aliases(self, labels: Sequence[Any]) -> list[tuple[str, int]]:
-        """A distinct single-token ``(code, token_id)`` per label, in label order."""
-        codes = tuple(option_codes(labels))
-        if codes not in self._aliases:
-            used: set[int] = set()
-            out: list[tuple[str, int]] = []
+    def prefix(self, state: Any) -> str:
+        return self.module.prefix_text(self.tokenizer, state, self.bos, self.state_style, self.system)
 
-            def take(raw: str) -> bool:
-                tid = self._token(raw)
-                if tid is None or tid in used:
-                    return False
-                out.append((raw, tid))
-                used.add(tid)
-                return True
+    def suffix(self, q: Any) -> str:
+        return self.module.suffix_text(self.tokenizer, q, self.lead, self.option_style)
 
-            for code in codes:
-                if not take(code) and not any(take(raw) for raw in _FALLBACK_POOL):
-                    raise RuntimeError(f"no single-token alias left for {len(codes)} options")
-            self._aliases[codes] = tuple(out)
-        return list(self._aliases[codes])
+    def render(self, state: Any, q: Any) -> str:
+        """The whole prompt of one question, as the checkpoint renders it."""
+        return self.module.render(
+            self.tokenizer, state, q, self.bos, self.lead, self.state_style, self.system, self.option_style
+        )
 
-    def readout_ids(self, q: Question) -> list[list[int]]:
-        """Token ids scored for each option, one group per option; an option scores its best token."""
-        if isinstance(q, Noul):
-            yes, no = self._ids(YES_FORMS), self._ids(NO_FORMS)
-            if not yes or not no:
-                raise RuntimeError("tokenizer has no single-token yes/no")
-            return [yes, no]
-        if isinstance(q, Score):
-            groups = [self._ids([str(i)]) for i in range(len(q.criteria))]
-            if any(not g for g in groups):
-                raise RuntimeError(
-                    f"score with {len(q.criteria)} levels needs single-token digits; "
-                    "the primitive is defined for 2 to 10"
-                )
-            return groups
-        groups = []
-        for code, tid in self.aliases(list(q.criteria.keys())):
-            groups.append([tid] + [i for i in self._ids([f" {code}"]) if i != tid])
-        if not groups:
-            raise RuntimeError("choice with no options")
-        return groups
+    def request_rows(self, state: Any, questions: Sequence[Any]) -> tuple[list[list[int]], int, int]:
+        """Token rows of one request, the length of their shared state prefix, and the tokens the request reads.
 
-    # -- text -----------------------------------------------------------------------------------------
-
-    def state_block(self, state: Any) -> str:
-        """The state as the block that precedes ``QUESTION:``."""
-        style = self.state_style
-        if isinstance(state, dict) and not style.endswith("_only"):
-            keys = set(state.keys())
-            if keys == {"text"}:
-                return f"Message: {state['text']}\n\n"
-            if {"passage", "question"} <= keys and len(keys) == 2:
-                return f"Passage: {state['passage']}\n\nAsked: {state['question']}\n\n"
-            if keys == {"question"}:
-                return f"{state['question']}\n\n"
-        if style.startswith("json"):
-            if isinstance(state, str):
-                return f"{state}\n\n"
-            return json.dumps(state, ensure_ascii=False, indent=2) + "\n\n"
-        return f"{_render_sections(state)}\n\n"
-
-    def question_block(self, q: Question) -> str:
-        if isinstance(q, Choice):
-            labels = list(q.criteria.keys())
-            codes = self.aliases(labels)
-            lines = "\n".join(
-                _option_line(codes[i][0], label, q.criteria[label], self.option_style)
-                for i, label in enumerate(labels)
-            )
-            return f"{q.instructions}\n\nOptions:\n{lines}\n\nReply with the option code only."
-        if isinstance(q, Noul):
-            extra = f"\nYes: {q.criteria.get('true')}\nNo: {q.criteria.get('false')}" if q.criteria else ""
-            return f"{q.instructions}{extra}\n\nReply with yes or no only."
-        if isinstance(q, Score):
-            legend = "\n".join(f"{i} {name}" for i, name in enumerate(q.criteria))
-            return f"{q.instructions}\n\n{legend}\n\nReply with a single digit 0-{len(q.criteria) - 1} only."
-        raise TypeError(f"unknown question type {type(q).__name__}")
-
-    def prefix_text(self, state: Any, images: str = "") -> str:
-        """Everything before the question: BOS, the optional system turn, the user header, images, the state."""
-        system = SYSTEMS[self.system]
-        turn = "" if system is None else f"{IM_START}system\n{system}{IM_END}\n"
-        body = "" if state is None else f"{self.state_block(state)}\nQUESTION:\n"
-        return f"{self.bos}{turn}{IM_START}user\n{images}{body}"
-
-    def suffix_text(self, q: Question) -> str:
-        """The question and the assistant header, up to the answer slot."""
-        return f"{self.question_block(q)}{IM_END}\n{IM_START}assistant\n{self.lead}"
-
-    def render(self, state: Any, q: Question) -> str:
-        return self.prefix_text(state) + self.suffix_text(q)
-
-    # -- one request ----------------------------------------------------------------------------------
-
-    def request_rows(self, state: Any, questions: Sequence[Question]) -> tuple[list[list[int]], int, int]:
-        """Token rows of one request, the length of the shared state prefix, and the tokens it reads.
-
-        As upstream, one question is tokenized as a whole prompt, and several questions as the prefix
+        As the checkpoint's runner does, one question is tokenized as one prompt, several as the state prefix
         followed by each question's own tokens. Each row ends at its question's answer slot.
         """
-        prefix = self.prefix_text(state)
+        trunk = self.encode(self.prefix(state))
         if len(questions) == 1:
-            row = self.encode(prefix + self.suffix_text(questions[0]))
-            shared = _common_prefix_length([row, self.encode(prefix)])
+            row = self.encode(self.render(state, questions[0]))
+            shared = next((i for i, (a, b) in enumerate(zip(row, trunk)) if a != b), min(len(row), len(trunk)))
             return [row], shared, len(row)
-        trunk = self.encode(prefix)
-        branches = [self.encode(self.suffix_text(q)) for q in questions]
+        branches = [self.encode(self.suffix(q)) for q in questions]
         return [trunk + b for b in branches], len(trunk), len(trunk) + sum(map(len, branches))
 
+    def tokens(self, state: Any, questions: Sequence[Any]) -> int:
+        """The longest prompt one of ``questions`` makes over ``state``: the state's tokens and its own."""
+        return len(self.encode(self.prefix(state))) + max(len(self.encode(self.suffix(q))) for q in questions)
 
-_PLACEHOLDER = re.compile(r"^opt\d+$")
+    def readout_ids(self, q: Any) -> list[list[int]]:
+        """Token ids scored for each option, one group per option."""
+        return self.module.readout_ids(self.tokenizer, q)
 
-
-def _option_line(code: str, label: str, desc: Optional[str], style: str) -> str:
-    text = desc or label.replace("_", " ")
-    if style == "name_desc" and not _PLACEHOLDER.match(label) and label != text:
-        return f"{code} {label}: {text}"
-    return f"{code} {text}"
-
-
-def _is_scalar(v: Any) -> bool:
-    return v is None or isinstance(v, (str, int, float, bool)) and "\n" not in str(v)
+    def probabilities(self, q: Any, logz: Mapping[int, float], calibration: Any = None) -> list[float]:
+        """The option distribution from the answer slot's log-probabilities of (at least) the readout ids."""
+        return self.module.readout(self.tokenizer, q, logz, calibration)
 
 
-def _sections(obj: Any, path: str, out: list[str]) -> None:
-    """Flatten a nested state into labelled blocks, keeping real newlines."""
-    head = f"[{path}]\n" if path else ""
-    if isinstance(obj, dict):
-        scalars = [(k, v) for k, v in obj.items() if _is_scalar(v)]
-        rest = [(k, v) for k, v in obj.items() if not _is_scalar(v)]
-        if scalars:
-            body = "\n".join(f"{k}: {'' if v is None else v}" for k, v in scalars)
-            out.append(f"{head}{body}")
-        for k, v in rest:
-            _sections(v, f"{path}.{k}" if path else str(k), out)
-        return
-    if isinstance(obj, (list, tuple)):
-        if obj and all(_is_scalar(v) for v in obj):
-            body = "\n".join(f"- {'' if v is None else v}" for v in obj)
-            out.append(f"{head}{body}")
-            return
-        for i, v in enumerate(obj, start=1):
-            _sections(v, f"{path} {i}/{len(obj)}" if path else f"{i}/{len(obj)}", out)
-        return
-    out.append(f"{head}{'' if obj is None else obj}")
-
-
-def _render_sections(state: Any) -> str:
-    if isinstance(state, str):
-        return state
-    out: list[str] = []
-    _sections(state, "", out)
-    return "\n\n".join(out)
-
-
-def _common_prefix_length(rows: Sequence[Sequence[int]]) -> int:
-    """Length of the longest token prefix shared by every row."""
-    if not rows:
-        return 0
-    n = min(map(len, rows))
-    for k in range(n):
-        if len({row[k] for row in rows}) > 1:
-            return k
-    return n
-
-
-def answer(q: Question, probs: Sequence[float]) -> dict:
-    """The typed answer of one question: a noul's P(yes), a choice's pick, a score's expected level."""
-    if isinstance(q, Noul):
+def answer(q: Any, probs: Sequence[float]) -> dict:
+    """The typed System One answer of question ``q`` (any of the module's classes) from its option distribution."""
+    kind = getattr(q, "type", None)
+    if kind == "noul":
         return {"type": "noul", "noul": probs[0]}
-    best = max(range(len(probs)), key=probs.__getitem__)
-    if isinstance(q, Choice):
-        names = list(q.criteria)
-        return {
-            "type": "choice",
-            "choice": names[best],
-            "confidence": probs[best],
-            "probabilities": dict(zip(names, probs)),
-        }
-    return {
-        "type": "score",
-        "score": sum(i * p for i, p in enumerate(probs)),
-        "confidence": probs[best],
-        "probabilities": {str(i): p for i, p in enumerate(probs)},
-        "legend": {str(i): text for i, text in enumerate(q.criteria)},
-    }
+    if kind == "choice":
+        labels = list(q.criteria)
+    elif kind == "score":
+        labels = [str(level) for level in range(len(q.criteria))]
+    else:
+        raise TypeError(f"unknown question type {kind!r}")
+    top = max(range(len(probs)), key=lambda i: probs[i])
+    out: dict[str, Any] = {"type": kind}
+    if kind == "choice":
+        out["choice"] = labels[top]
+    else:
+        out["score"] = sum(level * p for level, p in enumerate(probs))
+    out["confidence"] = probs[top]
+    out["probabilities"] = dict(zip(labels, probs))
+    if kind == "score":
+        out["legend"] = dict(zip(labels, q.criteria))
+    return out
