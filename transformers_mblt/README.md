@@ -514,6 +514,58 @@ the end-of-audio code. When `generate()` receives only `input_features` (the pip
 than the encoder window (10 s) is transcribed window by window and the tokens are joined; a prompt built by the
 processor for such a clip concatenates the windows' embeddings into one sequence instead.
 
+### D1 decision model
+
+`mobilint-d1` runs LiquidAI's [d1-3B](https://huggingface.co/LiquidAI/d1-3B) decision model. A decision reads a state
+and named questions and returns calibrated, typed answers in one forward pass with no generated tokens. The LFM2 text
+graph runs on the NPU and maps input embeddings to the final hidden state. The token embedding lookup and the answer
+readout run on the host: each option is scored with the tied head rows of its tokens, and the answer is a softmax over
+the options. The model folder holds the `.mxq`, `model.safetensors` with the embedding table, the tokenizer, and the
+checkpoint's unmodified `prompt.py` and `LICENSE`.
+
+`MobilintD1Model` has the upstream System One API and returns the same shapes:
+
+- `system_one(state, questions, images=None)` takes named questions and returns
+  `{"answers": {name: answer}, "usage": {"input_tokens": n, "output_tokens": 0}}`.
+- `system_one_batch([(state, questions[, images]), ...])` returns one such response per request.
+- `probabilities(state, questions)` and `probabilities_batch(requests)` return each question's distribution over its
+  options, in question order (`[P(yes), P(no)]` for a `noul`).
+
+A state is a string, any JSON value, or `None`. Questions follow the Decision Index schema: `noul` (yes or no),
+`choice` (`criteria` maps names to descriptions), and `score` (2 to 10 levels, lowest first).
+
+```python
+import transformers_mblt
+from transformers import AutoModel
+
+transformers_mblt.register()
+model = AutoModel.from_pretrained("mobilint/d1-3B")
+questions = {
+    "refund": {"type": "noul", "instructions": "Is the customer asking for a refund?"},
+    "team": {
+        "type": "choice",
+        "instructions": "Which team should handle this?",
+        "criteria": {"billing": "Charges, refunds, invoices", "technical": "App or site faults"},
+    },
+    "urgency": {"type": "score", "instructions": "How urgent is this?", "criteria": ["Can wait", "Today", "Now"]},
+}
+print(model.system_one("I was charged twice this month, please refund one of them.", questions))
+model.dispose()
+```
+
+The prompt and the option token ids match the upstream renderer token for token. Several questions on one state
+share one prefill of the state; each question then continues from it. The last state stays on the device, so a later
+call on the same state prefills only its questions; `reset_context()` forgets it. Requests run one at a time.
+
+Mobilint D1 builds are text-only. Passing `images` raises `NotImplementedError`. The prompt length is limited by the
+MXQ's KV capacity (16K tokens for the Aries build); a longer prompt raises `ValueError`.
+
+`scripts/build_d1_hf_package.py` assembles the model folder from a compiled D1 package (`model.yaml` with
+`kind: decision`, `model.mxq`, `token_table.npy`, the tokenizer, and `prompt.py`).
+
+The base model is licensed under the LFM Open License v1.0, which limits commercial use by organizations with annual
+revenue of USD 10 million or more. The model repository ships that license.
+
 ## Host-Side Sampling
 
 With `do_sample=True` and both `top_k` and `top_p` set (Qwen3 ships `temperature=0.6, top_k=20, top_p=0.95`),

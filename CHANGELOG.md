@@ -2,6 +2,15 @@
 
 ## 0.7.3
 
+### Added
+
+- D1 (`mobilint-d1`): `MobilintD1Model` runs LiquidAI's d1-3B decision model with its LFM2 text graph on the NPU and
+  the embedding lookup and option readout on the host. It provides the upstream System One API (`system_one`,
+  `system_one_batch`, `probabilities`, `probabilities_batch`) with the same answer shapes. Prompt and option token
+  ids match the upstream renderer. Several questions on one state share one state prefill, and a later call on the same
+  state reuses it. Builds are text-only. `scripts/build_d1_hf_package.py` assembles the Hub folder from a compiled D1
+  package. `list_tasks()` adds `image-text-classification`.
+
 ### Fixed
 
 - `tps measure` for VLMs reports LLM prefill and decode energy, and the TPS/W and J/token derived from them, for the
