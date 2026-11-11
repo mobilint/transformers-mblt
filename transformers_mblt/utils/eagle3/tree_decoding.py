@@ -23,6 +23,7 @@ from ..cache_utils import (
     note_eagle3_fed_tokens,
     take_eagle3_unfed_tokens,
 )
+from ..sampling_utils import MobilintTopKTopPLogitsWarper
 
 logger = logging.get_logger(__name__)
 
@@ -204,14 +205,67 @@ def _extract_top_k_from_processor(
     return None
 
 
+def _sliceable_top_k(logits_processor: Optional[LogitsProcessorList]) -> Optional[tuple[int, int]]:
+    """Return ``(top_k, index of TopK)`` when the list is only Temperature -> TopK (-> TopP) in HF order, else ``None``.
+
+    Those warpers are monotone or act only on the TopK support, so applying them to the support slice
+    gives the same values as applying them to the full vocab. A warper with a finite ``filter_value``
+    leaves mass outside the support, so it is not sliceable.
+    """
+    if not logits_processor:
+        return None
+    kinds = [type(w) for w in logits_processor]
+    if any(k not in (TemperatureLogitsWarper, TopKLogitsWarper, TopPLogitsWarper) for k in kinds):
+        return None
+    if TopKLogitsWarper not in kinds:
+        return None
+    if any(getattr(w, "filter_value", -float("inf")) != -float("inf") for w in logits_processor):
+        return None
+    k_pos = kinds.index(TopKLogitsWarper)
+    if TopPLogitsWarper in kinds and kinds.index(TopPLogitsWarper) < k_pos:
+        return None
+    return int(logits_processor[k_pos].top_k), k_pos
+
+
+def _apply_warpers_token_id_ties(
+    values: torch.Tensor,
+    indices: Optional[torch.Tensor],
+    warpers: list,
+    top_k_warper: TopKLogitsWarper,
+) -> torch.Tensor:
+    """Apply ``warpers`` in order, with TopP breaking cutoff ties by token id as the fused sampler does.
+
+    When equal logits straddle the TopP cutoff, higher token ids survive. Upstream the survivors depend on the
+    unstable full-vocab sort, which a slice cannot reproduce (see ``sampling_utils``), so the sampler and the
+    posterior evaluation share this rule to agree on the support. ``indices`` holds the vocabulary ids of the
+    last dimension of ``values``, or ``None`` when ``values`` is the whole vocabulary.
+    """
+    for warper in warpers:
+        if isinstance(warper, TopPLogitsWarper):
+            values = MobilintTopKTopPLogitsWarper(top_k_warper, warper)._top_p(values, indices)
+        else:
+            values = _apply_logits_processor(values, LogitsProcessorList([warper]))
+    return values
+
+
 def _softmax_topk_full_vocab(
     logits: torch.Tensor,
     max_return_k: int,
     logits_processor: Optional[LogitsProcessorList],
+    *,
+    token_id_ties: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply the processor list on full-vocab logits, softmax with a full-vocab denominator."""
+    """Apply the processor list on full-vocab logits, softmax with a full-vocab denominator.
+
+    ``token_id_ties`` applies a sliceable list with :func:`_apply_warpers_token_id_ties`, as the ``auto`` paths do.
+    """
     x = logits.float()
-    processed = _apply_logits_processor(x, logits_processor)
+    sliceable = _sliceable_top_k(logits_processor) if token_id_ties else None
+    if sliceable is not None:
+        assert logits_processor is not None
+        processed = _apply_warpers_token_id_ties(x, None, list(logits_processor), logits_processor[sliceable[1]])
+    else:
+        processed = _apply_logits_processor(x, logits_processor)
     return_k = min(int(max_return_k), processed.shape[-1])
     max_val = processed.max(dim=-1, keepdim=True).values
     denom = torch.exp(processed - max_val).sum(dim=-1, keepdim=True)
@@ -251,10 +305,27 @@ def _softmax_topk_sliced_by_top_k(
     # cheaper than the full-vocab ``exp`` we take on fallback.
     if slice_size < vocab:
         threshold = topk_vals[..., -1:]
-        total_at_or_above = (x >= threshold).sum(dim=-1)
+        at_or_above = x >= threshold
+        total_at_or_above = at_or_above.sum(dim=-1)
         if bool((total_at_or_above > slice_size).any().item()):
-            return _softmax_topk_full_vocab(logits, max_return_k, logits_processor)
-    processed_slice = _apply_logits_processor(topk_vals, logits_processor)
+            if x.ndim != 1:
+                return _softmax_topk_full_vocab(logits, max_return_k, logits_processor, token_id_ties=True)
+            # Boundary tie: HF's TopK keeps every entry >= the threshold, so widen the slice to exactly
+            # that support instead of taking the full-vocab path. Same support and values, so the same
+            # softmax denominator; only the order among equal logits is unspecified, as in torch.topk.
+            support_idx = at_or_above.nonzero(as_tuple=True)[0]
+            topk_vals, order = torch.sort(x[support_idx], descending=True)
+            topk_idx = support_idx[order]
+            slice_size = int(topk_vals.shape[-1])
+    sliceable = _sliceable_top_k(logits_processor)
+    if sliceable is not None:
+        # Same TopP tie rule as ``_sample_next_token_from_processor``, so acceptance and sampling share a support.
+        assert logits_processor is not None
+        processed_slice = _apply_warpers_token_id_ties(
+            topk_vals, topk_idx, list(logits_processor), logits_processor[sliceable[1]]
+        )
+    else:
+        processed_slice = _apply_logits_processor(topk_vals, logits_processor)
     max_val = processed_slice.max(dim=-1, keepdim=True).values
     exp_slice = torch.exp(processed_slice - max_val)
     denom = exp_slice.sum(dim=-1, keepdim=True)
@@ -366,6 +437,25 @@ def _sample_next_token_from_processor(
     """
     input_ndim = logits.ndim
     x = logits.float()
+    sliceable = _sliceable_top_k(logits_processor)
+    if sliceable is not None and x.numel() == x.shape[-1] and sliceable[0] < x.shape[-1]:
+        # Sample over TopK's support only: entries outside it are -inf after the list, so the softmax over
+        # the support is the same distribution. Ties at the k-th value stay in, as in HF's strict-less-than
+        # filter. The RNG draws differ from the full-vocab multinomial.
+        top_k, k_pos = sliceable
+        assert logits_processor is not None
+        # Temperature runs before TopK, so take the threshold on the scaled row: scaling can merge
+        # neighbouring logits into a tie that HF's TopK keeps.
+        row = _apply_logits_processor(x.reshape(-1), LogitsProcessorList(logits_processor[:k_pos]))
+        threshold = torch.topk(row, top_k, sorted=False).values.min()
+        support_idx = (row >= threshold).nonzero(as_tuple=True)[0]
+        # TopK leaves its own support unchanged, so it is skipped.
+        processed = _apply_warpers_token_id_ties(
+            row[support_idx], support_idx, list(logits_processor[k_pos + 1 :]), logits_processor[k_pos]
+        )
+        choice = torch.multinomial(torch.softmax(processed, dim=-1), 1)
+        token = support_idx[choice].to(torch.long)
+        return token if input_ndim == 1 else token.view(1, 1)
     x2d = x.unsqueeze(0) if input_ndim == 1 else x
     processed = _apply_logits_processor(x2d, logits_processor)
     probs = torch.softmax(processed, dim=-1)

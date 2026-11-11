@@ -537,7 +537,15 @@ most steps. Two things differ from upstream Transformers:
   several when equal small probabilities sit at the cutoff.
 - The random stream differs, so a seeded run draws different tokens. Qwen3-0.6B on ARIES (global8, 200 tokens) decodes at 34.9 tok/s this way, against 24.2
 tok/s with the upstream processors and 38.3 tok/s greedy. Set `MBLT_FUSED_TOPK_TOPP=0` to use the upstream
-processors and draw. EAGLE-3 generation has its own sampling path and is unaffected.
+processors and draw.
+
+EAGLE-3 generation has its own sampling path, unaffected by `MBLT_FUSED_TOPK_TOPP`. With Temperature, TopK and optionally TopP in HF order, it takes the
+softmax and the draw over the TopK support (ties at the k-th logit included) rather than the whole vocabulary, and
+the random stream differs. TopP on that support has the same two differences as the fused path above: ties at the
+cutoff keep higher token ids, and float rounding near `1 - top_p` can move the cutoff. During each NPU call the calling thread polls instead of
+blocking, so its core stays clocked up for the host work that follows. `MBLT_EAGLE3_KEEP_CPU_AWAKE=auto` (default)
+does this only while the 1-minute load average is below a quarter of the CPUs, and never on Windows, which has no
+load average; `1` always, `0` never. The recorded NPU time covers the `infer` call only, not the thread hand-off.
 
 ## Host CPU Threads
 

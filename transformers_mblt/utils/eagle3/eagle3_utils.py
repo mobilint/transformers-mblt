@@ -18,8 +18,11 @@ Typical tensor shapes (batch is currently fixed to 1):
 from __future__ import annotations
 
 import math
+import os
+import queue
+import threading
 import time
-from typing import TYPE_CHECKING, Any, Optional, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Optional, Protocol
 
 import numpy as np
 import torch
@@ -35,6 +38,112 @@ from ..cache_utils import MobilintEagle3Cache
 from ..modeling_utils import MobilintEagle3ModelMixin
 
 logger = logging.get_logger(__name__)
+
+
+# "auto" (default) polls only while the host is mostly idle; "1" always; "0" never. See infer_keep_cpu_awake.
+_KEEP_CPU_AWAKE_MODE = os.environ.get("MBLT_EAGLE3_KEEP_CPU_AWAKE", "auto").strip().lower()
+if _KEEP_CPU_AWAKE_MODE not in ("auto", "0", "false", "off", "1", "true", "on"):
+    logger.warning("Unknown MBLT_EAGLE3_KEEP_CPU_AWAKE=%r; using 'auto'.", _KEEP_CPU_AWAKE_MODE)
+    _KEEP_CPU_AWAKE_MODE = "auto"
+_IDLE_LOAD_FRACTION = 0.25  # 1-minute load average below this share of the CPUs counts as mostly idle
+_LOAD_RECHECK_SECONDS = 1.0
+_host_idle_cache = (0.0, False)
+# One worker per calling thread, so generations running in parallel threads keep their NPU calls concurrent.
+_infer_workers = threading.local()
+
+
+def _infer_worker_loop(jobs: "queue.SimpleQueue[Any]", owner: threading.Thread) -> None:
+    while True:
+        try:
+            mxq_model, args, box = jobs.get(timeout=5.0)
+        except queue.Empty:
+            if not owner.is_alive():  # the calling thread is gone; nothing can queue to this worker any more
+                return
+            continue
+        start_time = time.perf_counter()
+        try:
+            box.append((True, mxq_model.infer(*args), time.perf_counter() - start_time))
+        except BaseException as error:  # handed back to the caller
+            box.append((False, error, time.perf_counter() - start_time))
+        # Drop the references while idle, so a released model and its inputs and outputs can be freed.
+        del mxq_model, args, box
+
+
+def _infer_jobs_for_this_thread() -> "queue.SimpleQueue[Any]":
+    jobs = getattr(_infer_workers, "jobs", None)
+    worker = getattr(_infer_workers, "worker", None)
+    if jobs is None or worker is None or not worker.is_alive():
+        jobs = queue.SimpleQueue()
+        worker = threading.Thread(
+            target=_infer_worker_loop,
+            args=(jobs, threading.current_thread()),
+            name="mblt-eagle3-infer",
+            daemon=True,
+        )
+        worker.start()
+        _infer_workers.jobs, _infer_workers.worker = jobs, worker
+    return jobs
+
+
+def _should_keep_cpu_awake() -> bool:
+    global _host_idle_cache
+    if _KEEP_CPU_AWAKE_MODE in ("0", "false", "off"):
+        return False
+    if _KEEP_CPU_AWAKE_MODE in ("1", "true", "on"):
+        return True
+    now = time.monotonic()
+    checked_at, idle = _host_idle_cache
+    if now - checked_at > _LOAD_RECHECK_SECONDS:
+        getloadavg = getattr(os, "getloadavg", None)  # absent on Windows: no load signal, so stay off
+        try:
+            idle = getloadavg is not None and getloadavg()[0] < _IDLE_LOAD_FRACTION * (os.cpu_count() or 1)
+        except OSError:
+            idle = False
+        _host_idle_cache = (now, idle)
+    return idle
+
+
+def infer_keep_cpu_awake(
+    mxq_model: Any,
+    *args: Any,
+    record_npu_time: Optional[Callable[[float], None]] = None,
+) -> Any:
+    """Run ``mxq_model.infer(*args)`` while this thread polls instead of sleeping.
+
+    A blocking infer leaves the host core idle for the whole NPU call (~80 ms for the body), so the frequency
+    governor lowers its clock and the core can enter a deep C-state; the host work between NPU calls then runs
+    about 3x slower. qbruntime releases the GIL during infer, so a worker thread blocks on it while the caller
+    yields in a loop, keeping its core busy for the host work that follows. This costs one busy core while
+    generating, and on a saturated host the thread hand-off makes each call slower, so the default ``auto`` mode
+    polls only while the host is mostly idle (never on a platform without ``os.getloadavg``).
+    ``MBLT_EAGLE3_KEEP_CPU_AWAKE=1`` forces it on, ``0`` off.
+
+    ``record_npu_time`` receives the duration of the ``infer`` call itself, without the thread hand-off.
+    """
+    # A thread started outside ``threading`` reports alive forever, so its worker could never exit.
+    if not _should_keep_cpu_awake() or isinstance(threading.current_thread(), threading._DummyThread):
+        start_time = time.perf_counter()
+        result = mxq_model.infer(*args)
+        if record_npu_time is not None:
+            record_npu_time(time.perf_counter() - start_time)
+        return result
+    box: list = []
+    _infer_jobs_for_this_thread().put((mxq_model, args, box))
+    try:
+        while not box:
+            time.sleep(0)
+    except BaseException:
+        # A running infer cannot be cancelled; wait for it so the caller never outlives its NPU call, as with a
+        # direct infer, then propagate the interrupt.
+        while not box:
+            time.sleep(0.001)
+        raise
+    ok, value, npu_seconds = box[0]
+    if not ok:
+        raise value
+    if record_npu_time is not None:
+        record_npu_time(npu_seconds)
+    return value
 
 
 class MobilintEagle3GenerationProtocol(Protocol):
@@ -149,6 +258,8 @@ class CachedRotaryEmbedding(nn.Module):
         super().__init__()
         self.dim = dim
         self.max_seq_len = max_position_embeddings
+        # Lower bound for a lazy (post meta-init) table build, so decode does not rebuild it every round.
+        self.max_position_embeddings = max_position_embeddings
         self.base = base
         # ``config`` and ``rope_type`` unlock the HF Transformers 5.x
         # ``PreTrainedModel._init_weights`` re-init branch, which fires when
@@ -236,7 +347,9 @@ class CachedRotaryEmbedding(nn.Module):
     def forward(self, x: torch.Tensor, position_ids: torch.LongTensor) -> np.ndarray:
         seq_len = int(torch.max(position_ids).item()) + 1
         if self.position_table is None or seq_len > self.max_seq_len:
-            self.max_seq_len = seq_len
+            # Build the whole configured range at once; growing to exactly ``seq_len`` rebuilt the
+            # table (full cos/sin) on every decode round. Rows depend only on their position.
+            self.max_seq_len = max(seq_len, self.max_position_embeddings)
             self._build_position_table(device=x.device, dtype=x.dtype)
         indices = position_ids.view(-1).cpu().numpy()
         assert self.position_table is not None
@@ -446,12 +559,11 @@ class MobilintEagle3FCProjector(MobilintEagle3ModelMixin, PreTrainedModel):
         hidden_states_numpy = hidden_states.detach().cpu().contiguous().float().numpy()
         if hidden_states_numpy.ndim == 3:
             hidden_states_numpy = np.expand_dims(hidden_states_numpy, 1)
-        if count_npu_time:
-            start_time = time.perf_counter()
-            result = self.get_mxq_model().infer([hidden_states_numpy])
-            self._record_npu_timing("decode", time.perf_counter() - start_time)
-        else:
-            result = self.get_mxq_model().infer([hidden_states_numpy])
+        result = infer_keep_cpu_awake(
+            self.get_mxq_model(),
+            [hidden_states_numpy],
+            record_npu_time=(lambda seconds: self._record_npu_timing("decode", seconds)) if count_npu_time else None,
+        )
         assert result is not None, "mxq infer result is None!"
         return torch.from_numpy(result[0]).to(device=hidden_states.device, dtype=hidden_states.dtype).squeeze(1)
 
@@ -627,12 +739,15 @@ class MobilintEagle3BaseModelMixin:
                 attention_mask_numpy[:, :, seq_start:seq_end, : current_cache_position + seq_end - seq_start],
                 position_embs_numpy[:, :, seq_start:seq_end, :],
             ]
-            if count_npu_time:
-                start_time = time.perf_counter()
-                result = self.get_mxq_model().infer(infer_inputs, None, current_cache_position)
-                self._record_npu_timing(timing_phase, time.perf_counter() - start_time)
-            else:
-                result = self.get_mxq_model().infer(infer_inputs, None, current_cache_position)
+            result = infer_keep_cpu_awake(
+                self.get_mxq_model(),
+                infer_inputs,
+                None,
+                current_cache_position,
+                record_npu_time=(
+                    (lambda seconds: self._record_npu_timing(timing_phase, seconds)) if count_npu_time else None
+                ),
+            )
             assert result is not None, "mxq infer result is None!"
             hidden1, hidden2, hidden3, logits = result
             hidden = torch.from_numpy(np.concatenate([hidden1, hidden2, hidden3], axis=-1)).to(
@@ -642,12 +757,12 @@ class MobilintEagle3BaseModelMixin:
             if hidden.ndim == 4 and hidden.shape[1] == 1:
                 hidden = hidden.squeeze(1)
             hidden_states_chunks.append(hidden)
+            # Logits stay float32 as the runtime returns them: casting the full [seq, vocab] block to the
+            # embedding dtype copied it every round, and only a few rows are ever read.
             if requires_all_features_logits:
-                logits_chunks.append(torch.from_numpy(logits).to(device=inputs_embeds.device, dtype=inputs_embeds.dtype).squeeze(1))
+                logits_chunks.append(torch.from_numpy(logits).to(device=inputs_embeds.device).squeeze(1))
             elif seq_end == seq_length:
-                logits_chunks.append(
-                    torch.from_numpy(logits[:, :, -1]).to(device=inputs_embeds.device, dtype=inputs_embeds.dtype).squeeze(1)
-                )
+                logits_chunks.append(torch.from_numpy(logits[:, :, -1]).to(device=inputs_embeds.device).squeeze(1))
 
         hidden_states = torch.cat(hidden_states_chunks, dim=-2) if len(hidden_states_chunks) > 1 else hidden_states_chunks[0]
         logits_tensor = torch.cat(logits_chunks, dim=-2) if len(logits_chunks) > 1 else logits_chunks[0]
@@ -971,12 +1086,15 @@ class MobilintEagle3DraftModelMixin:
                 attention_mask_numpy[:, :, seq_start:seq_end, : current_cache_position + seq_end - seq_start],
                 position_embs_numpy[:, :, seq_start:seq_end, :],
             ]
-            if count_npu_time:
-                start_time = time.perf_counter()
-                result = self.get_mxq_model().infer(infer_inputs, None, current_cache_position)
-                self._record_npu_timing(timing_phase, time.perf_counter() - start_time)
-            else:
-                result = self.get_mxq_model().infer(infer_inputs, None, current_cache_position)
+            result = infer_keep_cpu_awake(
+                self.get_mxq_model(),
+                infer_inputs,
+                None,
+                current_cache_position,
+                record_npu_time=(
+                    (lambda seconds: self._record_npu_timing(timing_phase, seconds)) if count_npu_time else None
+                ),
+            )
             assert result is not None, "mxq infer result is None!"
             layer_outputs, last_hidden_logits = result
             if requires_all_features:

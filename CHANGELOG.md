@@ -2,8 +2,28 @@
 
 ## 0.7.3
 
+### Changed
+
+- EAGLE-3 sampling computes the softmax and the next-token draw over the `TopKLogitsWarper` support instead of the
+  whole vocabulary. NPU logits are coarse, so the k-th logit is tied on most steps and the `auto` softmax top-k path
+  used to fall back to the full vocabulary; it now widens the slice to every entry at or above the k-th value, the
+  support HF's `TopKLogitsWarper` keeps. The random stream differs, so a seeded run draws different tokens. Applies
+  when the processor list is Temperature, TopK and optionally TopP, in HF order. With TopP, equal logits that
+  straddle the cutoff follow the fused top-k/top-p rule (higher token ids survive) instead of the order of the
+  unstable full-vocabulary sort, in both the draw and the draft acceptance probabilities, so which of those tokens
+  can be drawn or accepted may differ from upstream.
+- EAGLE-3 NPU calls run on a per-thread worker while the calling thread polls, so its core is not clocked down or
+  parked during the call and the host work between NPU calls runs at full speed. `MBLT_EAGLE3_KEEP_CPU_AWAKE`
+  selects `auto` (default: only while the 1-minute load average is below a quarter of the CPUs, never on Windows),
+  `1` or `0`. The recorded NPU time covers the `infer` call only, not the thread hand-off.
+  EAGLE3-Qwen3-4B on ARIES (default tree, 3 prompts x 256 tokens, idle host): sampling 22.1 to 26.6 tok/s, greedy
+  26.5 to 26.7 tok/s with identical tokens.
+
 ### Fixed
 
+- The EAGLE-3 draft RoPE table, built on first use after meta init, was sized to the current position and rebuilt on
+  every decode round; it is now built once for `max_position_embeddings`.
+- EAGLE-3 base logits stay float32 as the runtime returns them instead of being cast to the embedding dtype.
 - `tps measure` for VLMs reports LLM prefill and decode energy, and the TPS/W and J/token derived from them, for the
   measured TTFT and decode window, as text `measure` does since 0.7.2. The prefill tracker ran around the whole prefill
   step (input embedding build plus a `generate` that also produces one decode token), and the decode tracker around a
