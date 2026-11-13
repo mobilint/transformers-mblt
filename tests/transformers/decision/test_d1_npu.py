@@ -3,11 +3,18 @@
 The model folder comes from ``MBLT_D1_MODEL`` (a local directory or Hub id, such as ``mobilint/d1-3B``); the suite
 is skipped when the variable is unset. D1 MXQs compiled with inference scheme ``all`` run in every core mode, so the
 suite takes the repository's core-mode sweep (``--core-mode all`` for ``single``, ``global4`` and ``global8``).
+
+``MBLT_D1_IMAGE_CASES`` names a JSONL of picture decisions with reference probabilities from the same MXQ build on
+the NPU (such as mblt-rag's ``d1_engine``; GPU references differ by the quantization error), one per line:
+``{"id": str, "image": path, "state": ..., "question": {...}, "probs": [float, ...]}`` (a path is relative to the
+file). The pictures are not part of the repository; the cases test is skipped without the variable.
 """
 
 from __future__ import annotations
 
+import json
 import os
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -93,12 +100,69 @@ def test_shared_state_matches_one_question_at_a_time(model) -> None:
         assert a == pytest.approx(b, abs=1e-3)
 
 
-def test_batch_and_images(model) -> None:
+def test_batch(model) -> None:
     tickets = ["Where is my parcel? It was due Monday.", "The app crashes when I open settings."]
     out = model.system_one_batch([(t, {"team": QUESTIONS["team"]}) for t in tickets])
     assert [r["answers"]["team"]["choice"] for r in out][1] == "technical"
-    with pytest.raises(NotImplementedError, match="text-only"):
-        model.system_one(None, {"team": QUESTIONS["team"]}, images=[object()])
+
+
+def _picture(colour: tuple[int, int, int]):
+    from PIL import Image, ImageDraw
+
+    image = Image.new("RGB", (640, 480), (255, 255, 255))
+    ImageDraw.Draw(image).ellipse((200, 120, 440, 360), fill=colour)
+    return image
+
+
+def test_pictures_share_the_state_prefill(model, monkeypatch) -> None:
+    if not model.has_vision:
+        with pytest.raises(NotImplementedError, match="text-only"):
+            model.system_one(None, {"team": QUESTIONS["team"]}, images=[_picture((255, 0, 0))])
+        pytest.skip("the model folder has no vision MXQ")
+    questions = [
+        {"type": "noul", "instructions": "Is there a red circle in the picture?"},
+        {"type": "choice", "instructions": "What colour is the circle?", "criteria": {"red": None, "blue": None}},
+    ]
+    red, blue = _picture((255, 0, 0)), _picture((0, 0, 255))
+    model.reset_context()
+    together = model.probabilities("A camera frame.", questions, images=[red])
+    assert together[1][0] > 0.5
+    recorder = _RecordingMxq(model.get_mxq_model())
+    monkeypatch.setattr(model, "get_mxq_model", lambda: recorder)
+    # The same state and picture reuse the held trunk; only the questions are prefilled.
+    assert model.probabilities("A camera frame.", questions, images=[red]) == together
+    assert sum(recorder.lengths) < 300
+    model.reset_context()
+    alone = [model.probabilities("A camera frame.", [q], images=[red])[0] for q in questions]
+    for a, b in zip(together, alone):
+        assert a == pytest.approx(b, abs=1e-3)
+    assert model.probabilities("A camera frame.", questions, images=[blue])[1][1] > 0.5
+
+
+def _image_cases() -> list[dict]:
+    path = os.environ.get("MBLT_D1_IMAGE_CASES")
+    if not path:
+        return []
+    cases = [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()]
+    for case in cases:
+        case["image"] = str(Path(path).parent / case["image"])
+    return cases
+
+
+def test_image_cases_match_the_reference(model) -> None:
+    cases = _image_cases()
+    if not cases:
+        pytest.skip("set MBLT_D1_IMAGE_CASES to a JSONL of picture decisions with reference probabilities")
+    if not model.has_vision:
+        pytest.skip("the model folder has no vision MXQ")
+    worst = 0.0
+    for case in cases:
+        probs = model.probabilities(case["state"], [case["question"]], images=[case["image"]])[0]
+        want = case["probs"]
+        assert max(range(len(probs)), key=probs.__getitem__) == max(range(len(want)), key=want.__getitem__), case["id"]
+        worst = max(worst, max(abs(p - w) for p, w in zip(probs, want)))
+    print(f"{model.npu_backend.core_mode}: {len(cases)} picture cases, max |dp| {worst:.2e}")
+    assert worst < 1e-4
 
 
 @pytest.mark.parametrize("residue", [0, 63])

@@ -131,27 +131,31 @@ class D1Prompter:
             raise ValueError(f"a {kind} question needs criteria")
         return self.module.as_question(spec)
 
-    def prefix(self, state: Any) -> str:
-        return self.module.prefix_text(self.tokenizer, state, self.bos, self.state_style, self.system)
+    def prefix(self, state: Any, images: str = "") -> str:
+        """Everything before the question; ``images`` is the pictures' markup, at the head of the user turn."""
+        return self.module.prefix_text(self.tokenizer, state, self.bos, self.state_style, self.system, images)
 
     def suffix(self, q: Any) -> str:
         return self.module.suffix_text(self.tokenizer, q, self.lead, self.option_style)
 
-    def render(self, state: Any, q: Any) -> str:
+    def render(self, state: Any, q: Any, images: str = "") -> str:
         """The whole prompt of one question, as the checkpoint renders it."""
         return self.module.render(
-            self.tokenizer, state, q, self.bos, self.lead, self.state_style, self.system, self.option_style
+            self.tokenizer, state, q, self.bos, self.lead, self.state_style, self.system, self.option_style, images
         )
 
-    def request_rows(self, state: Any, questions: Sequence[Any]) -> tuple[list[list[int]], int, int]:
+    def request_rows(
+        self, state: Any, questions: Sequence[Any], images: str = ""
+    ) -> tuple[list[list[int]], int, int]:
         """Token rows of one request, the length of their shared state prefix, and the tokens the request reads.
 
         As the checkpoint's runner does, one question is tokenized as one prompt, several as the state prefix
-        followed by each question's own tokens. Each row ends at its question's answer slot.
+        followed by each question's own tokens. Each row ends at its question's answer slot. ``images`` is the
+        pictures' expanded markup (their image tokens), which opens the user turn.
         """
-        trunk = self.encode(self.prefix(state))
+        trunk = self.encode(self.prefix(state, images))
         if len(questions) == 1:
-            row = self.encode(self.render(state, questions[0]))
+            row = self.encode(self.render(state, questions[0], images))
             shared = next((i for i, (a, b) in enumerate(zip(row, trunk)) if a != b), min(len(row), len(trunk)))
             return [row], shared, len(row)
         branches = [self.encode(self.suffix(q)) for q in questions]

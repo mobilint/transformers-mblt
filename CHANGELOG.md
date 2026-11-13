@@ -4,15 +4,20 @@
 
 ### Added
 
-- D1 (`mobilint-d1`): `MobilintD1Model` runs LiquidAI's d1-3B decision model with its LFM2 text graph on the NPU and
-  the embedding lookup and option readout on the host. It provides the upstream System One API (`system_one`,
+- D1 (`mobilint-d1`): `MobilintD1Model` runs LiquidAI's d1-3B decision model with its LFM2 text graph and its vision
+  graph (vision tower and projector) on the NPU, and the embedding lookup, picture preprocessing and option readout on
+  the host. It provides the upstream System One API (`system_one`,
   `system_one_batch`, `probabilities`, `probabilities_batch`) with the same answer shapes, plus `render`, `tokens` and
   the `calibration` hook. The prompt is the checkpoint's own `prompt.py`, loaded from the model folder or Hub snapshot
   at runtime. Several questions on one state share one state prefill, and a later call on the same state reuses it.
   A lock serializes requests. Prompts may fill the 16,384-token KV capacity; prefill calls stay at most 2,048 tokens
   (2,046 in `global4`/`global8`, which avoid call lengths of 0 or 63 modulo 64). The Aries build runs in `global8`
-  (default), `global4` and `single`. Builds are text-only. `scripts/build_d1_hf_package.py` assembles the Hub folder,
-  model card included, from a compiled D1 package. `list_tasks()` adds `image-text-classification`.
+  (default), `global4` and `single`. `images=` takes pictures, as upstream: each is letterboxed into one 512x512 input
+  and read as 256 image tokens at the head of the user turn, and the vision MXQ runs in the text MXQ's core mode. A
+  model folder without a vision MXQ is text-only and raises `NotImplementedError` for pictures.
+  `scripts/build_d1_hf_package.py` assembles the Hub folder (`d1-3B.mxq`, `d1-3B-vision.mxq`), model card included,
+  from a compiled D1 package and its vision MXQ. D1 is listed under `image-text-to-text`, upstream's Hub task. The VLM benchmarks leave D1 out of their default
+  model lists, since it does not generate.
 
 ### Fixed
 

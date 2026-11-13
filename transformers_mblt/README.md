@@ -517,10 +517,12 @@ processor for such a clip concatenates the windows' embeddings into one sequence
 ### D1 decision model
 
 `mobilint-d1` runs LiquidAI's [d1-3B](https://huggingface.co/LiquidAI/d1-3B) decision model. A decision reads a state
-and named questions and returns calibrated, typed answers in one forward pass with no generated tokens. The LFM2 text
-graph runs on the NPU and maps input embeddings to the final hidden state. The token embedding lookup and the answer
-readout run on the host: each option is scored with the tied head rows of its tokens, and the answer is a softmax over
-the options. The model folder holds the `.mxq`, `model.safetensors` with the embedding table, the tokenizer, and the
+(text, JSON, pictures, or pictures alone) and named questions and returns calibrated, typed answers in one forward pass
+with no generated tokens. The LFM2 text graph runs on the NPU and maps input embeddings to the final hidden state; the
+vision graph (vision tower and projector) runs on the NPU too and turns each picture into image-token features. The
+token embedding lookup, the picture preprocessing and the answer readout run on the host: each option is scored with
+the tied head rows of its tokens, and the answer is a softmax over the options. The model folder holds the two `.mxq`
+files (`d1-3B.mxq`, `d1-3B-vision.mxq`), `model.safetensors` with the embedding table, the tokenizer, and the
 checkpoint's unmodified `prompt.py` and `LICENSE`.
 
 The prompt format, the question classes, and the option readout are the checkpoint's own `prompt.py`. The model
@@ -529,17 +531,16 @@ on first use; `transformers-mblt` holds only the glue that calls it, so the prom
 
 `MobilintD1Model` has the upstream System One API and returns the same shapes:
 
-- `system_one(state, questions, images=None)` takes named questions and returns
+- `system_one(state, questions, images=None)` takes named questions (and a list of pictures) and returns
   `{"answers": {name: answer}, "usage": {"input_tokens": n, "output_tokens": 0}}`.
 - `system_one_batch([(state, questions[, images]), ...])` returns one such response per request.
-- `probabilities(state, questions)` and `probabilities_batch(requests)` return each question's distribution over its
-  options, in question order (`[P(yes), P(no)]` for a `noul`).
+- `probabilities(state, questions, images=None)` and `probabilities_batch(requests)` return each question's
+  distribution over its options, in question order (`[P(yes), P(no)]` for a `noul`).
 - `render(state, question)` returns the prompt text, and `tokens(state, questions)` the longest prompt in tokens.
 - `model.calibration = obj` applies upstream's calibration hook (`obj.apply(question, scores)` on the options'
   log-probabilities), as upstream's `calibration=` argument does.
 
-Not provided: pictures (see below), and upstream's `plan_batches` / `token_budget` and `compile` options, which tune its
-GPU batching.
+Not provided: upstream's `plan_batches` / `token_budget` and `compile` options, which tune its GPU batching.
 
 A state is a string, any JSON value, or `None`. Questions follow the Decision Index schema: `noul` (yes or no),
 `choice` (`criteria` maps names to descriptions), and `score` (2 to 10 levels, lowest first).
@@ -560,23 +561,33 @@ questions = {
     "urgency": {"type": "score", "instructions": "How urgent is this?", "criteria": ["Can wait", "Today", "Now"]},
 }
 print(model.system_one("I was charged twice this month, please refund one of them.", questions))
+print(model.system_one(None, {"person": {"type": "noul", "instructions": "Is there a person in the picture?"}},
+                       images=["photo.jpg"]))
 model.dispose()
 ```
 
+Pictures are `PIL.Image` objects, file paths, or uint8 arrays. Each is letterboxed on the host into one 512x512 square
+(bicubic, aspect kept, centred on black, normalized to [-1, 1]) and read as 256 image tokens, which open the user turn
+as the checkpoint's chat template places them. For a 512x512 picture the pixels and tokens equal upstream's processor;
+a larger picture is not split into tiles as upstream's processor does, so it is read at 512x512. The vision MXQ runs in
+the text MXQ's core mode. A model folder without a vision MXQ (no `vision_mxq_path` in its config) is text-only and
+raises `NotImplementedError` for pictures.
+
 Several questions on one state share one prefill of the state; each question then continues from it. The last state
-stays on the device, so a later call on the same state prefills only its questions; `reset_context()`, `launch()`,
+stays on the device, so a later call on the same state (and the same pictures) prefills only its questions; `reset_context()`, `launch()`,
 `dispose()`, and a plain `forward()` forget it. The device holds one state at a time, so a lock serializes requests:
 calls from several threads are safe and run one after another.
 
-Mobilint D1 builds are text-only. Passing `images` raises `NotImplementedError`. A prompt (state and question) may use
+A prompt (state, pictures and question) may use
 the MXQ's whole KV capacity (16,384 tokens for the Aries build); a longer prompt raises `ValueError`. Prefill runs in
 infer calls of at most `npu_prefill_chunk_size` tokens (2,048), except that in `global4` and `global8` no call has a
 length of 0 or 63 modulo 64, because LFM2 hybrid graphs hang the NPU there: those modes prefill in calls of at most
-2,046 tokens. The Aries build is compiled with inference scheme `all`: its config selects `global8`, and
-`core_mode="global4"` or `core_mode="single"` (with `target_clusters` / `target_cores`) load the same MXQ.
+2,046 tokens. The Aries build's two MXQs are compiled with inference scheme `all`: its config selects `global8`, and
+`core_mode="global4"` or `core_mode="single"` (with `target_clusters` / `target_cores`) load the same MXQs.
 
 `scripts/build_d1_hf_package.py` assembles the model folder from a compiled D1 package (`model.yaml` with
-`kind: decision`, `model.mxq`, `token_table.npy`, the tokenizer, and `prompt.py`). It writes the whole model card;
+`kind: decision`, `model.mxq`, `token_table.npy`, the tokenizer, and `prompt.py`) and the vision MXQ with its layout
+(`--vision-mxq`, `--vision-layout`). It writes the whole model card;
 the measured sections (quantization, calibration sources, fidelity) come from a JSON file passed as `--card-facts`.
 
 The base model is licensed under the LFM Open License v1.0, which limits commercial use by organizations with annual

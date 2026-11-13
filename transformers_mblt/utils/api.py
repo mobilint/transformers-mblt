@@ -4,14 +4,19 @@ from typing import Dict, List, Optional, Union
 
 from ..models.d1 import D1_TASK
 
-TASKS = [
-    "text-generation",
-    "image-text-to-text",
-    "automatic-speech-recognition",
-    "image-to-text",
-    "fill-mask",
-    D1_TASK,
-]
+# D1 shares a Hub task with the VLMs; the list keeps each task once.
+TASKS = list(
+    dict.fromkeys(
+        [
+            "text-generation",
+            "image-text-to-text",
+            "automatic-speech-recognition",
+            "image-to-text",
+            "fill-mask",
+            D1_TASK,
+        ]
+    )
+)
 
 
 def list_tasks():

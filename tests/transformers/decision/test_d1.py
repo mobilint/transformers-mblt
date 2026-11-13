@@ -3,7 +3,8 @@
 The runtime tests drive :class:`MobilintD1Model` with a fake MXQ that behaves like a causal hybrid graph: each
 position attends to the KV of every earlier position and also reads the previous token's embedding, which it keeps
 in a ``FixedTailCache``. A wrong KV position, a missed tail-cache restore or a mis-planned chunk changes the hidden
-state, so the trunk/branch results must equal one plain pass over each prompt.
+state, so the trunk/branch results must equal one plain pass over each prompt. A fake vision MXQ maps a picture's
+patches to feature rows, so a feature in the wrong image slot changes the answer as well.
 
 The runtime tests read prompts through ``fixtures/prompt.py``, a stand-in with the checkpoint file's call signatures
 and a simple format of its own; the package ships no prompt code. The upstream parity tests load the checkpoint's own
@@ -32,6 +33,7 @@ import torch.nn as nn
 import transformers_mblt
 from transformers_mblt.models.d1 import D1_TASK
 from transformers_mblt.models.d1.configuration_d1 import MobilintD1Config
+from transformers_mblt.models.d1.image_processing_d1 import letterbox, load_image, patchify
 from transformers_mblt.models.d1.modeling_d1 import Chunk, MobilintD1Model, is_unsafe_length, plan_chunks
 from transformers_mblt.models.d1.prompt_d1 import D1Prompter, answer, load_prompt_module, resolve_prompt_file
 
@@ -80,7 +82,18 @@ STATES: list[Any] = [
 class FakeTokenizer:
     """Greedy longest-match tokenizer: known words and special tokens are one token, anything else one per char."""
 
-    WORDS = ("<|startoftext|>", "<|im_start|>", "<|im_end|>", "yes", "Yes", "no", "No")
+    WORDS = (
+        "<|startoftext|>",
+        "<|im_start|>",
+        "<|im_end|>",
+        "<|image_start|>",
+        "<|image_end|>",
+        "<image>",
+        "yes",
+        "Yes",
+        "no",
+        "No",
+    )
 
     def __init__(self) -> None:
         self.vocab: dict[str, int] = {}
@@ -158,8 +171,35 @@ class FakeHybridMxq:
         return [out.astype(np.float32)[None]]
 
 
-def reference_hidden(table: np.ndarray, row: list[int]) -> np.ndarray:
-    e = table[row].astype(np.float64)
+# A tiny picture layout: 32x32 pictures in 8x8 patches (a 4x4 grid), four image tokens per picture.
+IMAGE = {"image_size": 32, "patch_size": 8, "image_tokens": 4}
+
+
+class FakeVisionMxq:
+    """Maps a picture's patches to feature rows: each run of four row-major patches times a fixed projection."""
+
+    def __init__(self, hidden: int) -> None:
+        grid = IMAGE["image_size"] // IMAGE["patch_size"]
+        self.patches, self.width = grid * grid, IMAGE["patch_size"] ** 2 * 3
+        group = self.patches * self.width // IMAGE["image_tokens"]
+        self.projection = np.random.default_rng(1).standard_normal((group, hidden)) / math.sqrt(group)
+        self.hidden, self.calls = hidden, 0
+
+    def get_model_input_shape(self):
+        return [(1, self.patches, self.width)]
+
+    def features(self, pixels: np.ndarray) -> np.ndarray:
+        return pixels.reshape(IMAGE["image_tokens"], -1).astype(np.float64) @ self.projection
+
+    def infer(self, inputs):
+        x = np.asarray(inputs[0])
+        assert x.shape == (1, self.patches, self.width)
+        self.calls += 1
+        return [self.features(x).reshape(1, 2, 2, self.hidden).astype(np.float32)]
+
+
+def reference_hidden(table: np.ndarray, row: list[int], embeds: Optional[np.ndarray] = None) -> np.ndarray:
+    e = (table[row] if embeds is None else embeds).astype(np.float64)
     previous = e[-2] if len(row) > 1 else np.zeros_like(e[-1])
     return e.mean(0) + 0.5 * previous
 
@@ -172,10 +212,17 @@ def make_model(
     max_width: int = 64,
     capacity: int = 4096,
     delay: float = 0.0,
+    vision: bool = False,
 ) -> tuple[MobilintD1Model, FakeHybridMxq, np.ndarray]:
     model = object.__new__(MobilintD1Model)
     nn.Module.__init__(model)
-    model.config = MobilintD1Config(vocab_size=vocab, hidden_size=hidden)
+    model.config = MobilintD1Config(
+        vocab_size=vocab,
+        hidden_size=hidden,
+        image_token_id=tokenizer.vocab["<image>"] if hasattr(tokenizer, "vocab") else 124907,
+        vision_mxq_path="d1-vision.mxq" if vision else None,
+        **IMAGE,
+    )
     generator = torch.Generator().manual_seed(0)
     model.embed_tokens = nn.Embedding(vocab, hidden)
     with torch.no_grad():
@@ -191,6 +238,8 @@ def make_model(
     )
     model._tokenizer, model._prompter, model._context, model._tail_cache_names = tokenizer, None, None, None
     model._prompt_module, model.calibration = load_prompt_module(FIXTURE_PROMPT), None
+    if vision:
+        model.vision_npu_backend = SimpleNamespace(mxq_model=FakeVisionMxq(hidden))
     return model, mxq, model.embed_tokens.weight.detach().numpy().copy()
 
 
@@ -264,8 +313,9 @@ def test_answer_shapes_match_the_system_one_schema() -> None:
 def test_task_tag_is_one_constant() -> None:
     from transformers_mblt.utils.api import TASKS
 
-    assert D1_TASK in TASKS
-    assert f"| `{D1_TASK}` | D1" in (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    assert D1_TASK in TASKS and len(TASKS) == len(set(TASKS))
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8").splitlines()
+    assert any(line.startswith(f"| `{D1_TASK}` |") and "D1" in line for line in readme)
     assert f"`{D1_TASK}`" in (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
     script = (REPO_ROOT / "scripts" / "build_d1_hf_package.py").read_text(encoding="utf-8")
     assert "pipeline_tag: {D1_TASK}" in script
@@ -422,12 +472,246 @@ def test_calibration_sees_log_probabilities() -> None:
     assert shifted[0] / shifted[1] == pytest.approx(math.exp(2.0) * plain[0] / plain[1], rel=1e-4)
 
 
-def test_images_and_overlong_prompts_are_rejected() -> None:
+def test_text_only_folders_reject_pictures_and_overlong_prompts() -> None:
     model, _, _ = make_model(FakeTokenizer(), vocab=4096, capacity=256)
+    assert not model.has_vision
     with pytest.raises(NotImplementedError, match="text-only"):
-        model.system_one(None, {"cats": QUESTIONS["letters"]}, images=[object()])
+        model.system_one(None, {"cats": QUESTIONS["letters"]}, images=[picture(0)])
     with pytest.raises(ValueError, match="this MXQ holds 256"):
         model.system_one("x" * 400, {"refund": QUESTIONS["refund"]})
+    # Launching a text-only folder starts no vision backend.
+    model.launch()
+    assert "vision_npu_backend" not in model.__dict__
+    assert model.probabilities(STATES[0], [QUESTIONS["refund"]])[0]
+
+
+# --------------------------------------------------------------------------- #
+# pictures
+# --------------------------------------------------------------------------- #
+
+
+def picture(seed: int, size: tuple[int, int] = (40, 20)):
+    from PIL import Image
+
+    pixels = np.random.default_rng(seed).integers(0, 256, (size[1], size[0], 3), dtype=np.uint8)
+    return Image.fromarray(pixels)
+
+
+def expected_image_probs(
+    model: MobilintD1Model, table: np.ndarray, row: list[int], q: Any, pictures: list[Any]
+) -> list[float]:
+    """The option distribution of ``row`` with the pictures' fake features in its image slots."""
+    fake = model.get_vision_mxq_model()
+    features = np.concatenate([fake.features(patchify(p, IMAGE["image_size"], IMAGE["patch_size"])) for p in pictures])
+    embeds = table[row].astype(np.float64)
+    mask = np.asarray(row) == model.config.image_token_id
+    assert mask.sum() == len(features)
+    embeds[mask] = features
+    hidden = reference_hidden(table, row, embeds)
+    scores = [max(float(table[t] @ hidden) for t in g) for g in model.prompter.readout_ids(model.prompter.question(q))]
+    top = max(scores)
+    exps = [math.exp(s - top) for s in scores]
+    return [e / sum(exps) for e in exps]
+
+
+def test_patchify_letterboxes_a_picture_into_patches(tmp_path: Path) -> None:
+    from PIL import Image
+
+    red = Image.new("RGB", (40, 20), (255, 0, 0))
+    x = patchify(red, 32, 8)
+    assert x.shape == (1, 16, 192) and x.dtype == np.float32
+    # Undo the patch order: (grid row, grid column, patch row, patch column, channel) -> (row, column, channel).
+    rgb = x.reshape(4, 4, 8, 8, 3).transpose(0, 2, 1, 3, 4).reshape(32, 32, 3)
+    # 40x20 fits as 32x16, centred: black bars of 8 rows above and below.
+    assert (rgb[:8] == -1).all() and (rgb[24:] == -1).all()
+    assert (rgb[8:24, :, 0] == 1).all() and (rgb[8:24, :, 1:] == -1).all()
+    assert letterbox(red, 32).size == (32, 32)
+
+    noisy = picture(3)
+    path = tmp_path / "noisy.png"
+    noisy.save(path)
+    array = np.asarray(noisy)
+    assert np.array_equal(patchify(path, 32, 8), patchify(noisy, 32, 8))
+    assert np.array_equal(patchify(array, 32, 8), patchify(noisy, 32, 8))
+    assert load_image(noisy.convert("L")).mode == "RGB"
+    with pytest.raises(TypeError, match="PIL.Image"):
+        patchify(3, 32, 8)
+    with pytest.raises(TypeError, match="uint8"):
+        patchify(array.astype(np.float32), 32, 8)
+    with pytest.raises(ValueError, match="multiple of the patch size"):
+        patchify(noisy, 30, 8)
+
+
+@pytest.mark.parametrize("state", [None, "Which picture is this?", {"camera": 2}], ids=range(3))
+@pytest.mark.parametrize("names", [["refund"], ["refund", "team", "urgency"]])
+@pytest.mark.parametrize("count", [1, 2])
+def test_pictures_fill_the_image_slots(state: Any, names: list[str], count: int) -> None:
+    model, _, table = make_model(FakeTokenizer(), vocab=4096, max_width=48, vision=True)
+    pictures = [picture(i, size=(40 + 7 * i, 20 + 13 * i)) for i in range(count)]
+    questions = [QUESTIONS[n] for n in names]
+    got = model.probabilities(state, questions, images=pictures)
+    prompter = model.prompter
+    markup = model.image_markup(count)
+    assert markup.count("<image>") == count * IMAGE["image_tokens"]
+    for probs, q in zip(got, questions):
+        qq = prompter.question(q)
+        row = prompter.encode(prompter.render(state, qq, markup))
+        assert probs == pytest.approx(expected_image_probs(model, table, row, q, pictures), rel=1e-4, abs=1e-6)
+    assert model.get_vision_mxq_model().calls == count
+    # Other pictures give other answers: the features are read.
+    others = model.probabilities(state, questions, images=[picture(9 + i) for i in range(count)])
+    assert any(o != pytest.approx(g, rel=1e-3) for o, g in zip(others, got))
+
+
+def test_one_picture_counts_as_a_list_of_one() -> None:
+    model, _, _ = make_model(FakeTokenizer(), vocab=4096, vision=True)
+    one = picture(5)
+    expected = model.system_one(None, {"r": QUESTIONS["refund"]}, images=[one])
+    assert model.system_one(None, {"r": QUESTIONS["refund"]}, images=one) == expected
+    array = np.asarray(one)
+    assert model.system_one(None, {"r": QUESTIONS["refund"]}, images=array) == expected
+    assert model.probabilities(None, [QUESTIONS["refund"]], images=array) == model.probabilities(
+        None, [QUESTIONS["refund"]], images=[one]
+    )
+    assert model.probabilities_batch([(None, [QUESTIONS["refund"]], array)]) == [
+        model.probabilities(None, [QUESTIONS["refund"]], images=[one])
+    ]
+
+
+def test_the_held_trunk_follows_the_pictures() -> None:
+    model, mxq, table = make_model(FakeTokenizer(), vocab=4096, max_width=48, vision=True)
+    vision = model.get_vision_mxq_model()
+    questions = [QUESTIONS["refund"], QUESTIONS["urgency"]]
+    first = model.probabilities("door camera", questions, images=[picture(1)])
+    prefix = len(model.prompter.encode(model.prompter.prefix("door camera", model.image_markup(1))))
+
+    # The same state and picture: neither the picture nor the state is read again.
+    mxq.calls.clear()
+    again = model.probabilities("door camera", questions, images=[picture(1)])
+    assert again == first and min(position for position, _ in mxq.calls) == prefix and vision.calls == 1
+
+    # Another picture with the same text and token ids: the trunk is prefilled again, with the new features.
+    mxq.calls.clear()
+    other = model.probabilities("door camera", questions, images=[picture(2)])
+    assert mxq.calls[0][0] == 0 and vision.calls == 2
+    for probs, q in zip(other, questions):
+        row = model.prompter.encode(model.prompter.prefix("door camera", model.image_markup(1)))
+        row += model.prompter.encode(model.prompter.suffix(model.prompter.question(q)))
+        assert probs == pytest.approx(expected_image_probs(model, table, row, q, [picture(2)]), rel=1e-4, abs=1e-6)
+
+
+def test_image_token_text_in_a_question_is_rejected() -> None:
+    model, _, _ = make_model(FakeTokenizer(), vocab=4096, vision=True)
+    question = {"type": "noul", "instructions": "Is <image> a cat?"}
+    with pytest.raises(ValueError, match="image token text"):
+        model.probabilities(None, [question], images=[picture(0)])
+
+
+def test_launch_and_dispose_manage_the_vision_backend() -> None:
+    model, _, _ = make_model(FakeTokenizer(), vocab=4096, vision=True)
+    del model.vision_npu_backend
+    events: list[str] = []
+    backend = SimpleNamespace(
+        mxq_model=FakeVisionMxq(8),
+        create=lambda: events.append("create"),
+        launch=lambda: events.append("launch"),
+        dispose=lambda: events.append("dispose"),
+    )
+    model._vision_backend = lambda: backend
+    with pytest.raises(RuntimeError, match="not launched"):
+        model.get_vision_mxq_model()
+    model.launch()
+    assert model.get_vision_mxq_model() is backend.mxq_model and events == ["create", "launch"]
+    model.dispose()
+    assert events == ["create", "launch", "dispose"] and "vision_npu_backend" not in model.__dict__
+    assert model.npu_backend.launches == ["launch", "dispose"]
+
+
+def test_a_failed_vision_launch_releases_the_text_mxq() -> None:
+    model, _, _ = make_model(FakeTokenizer(), vocab=4096, vision=True)
+    del model.vision_npu_backend
+    events: list[str] = []
+
+    def fail() -> None:
+        raise RuntimeError("no memory for the vision MXQ")
+
+    model._vision_backend = lambda: SimpleNamespace(
+        create=lambda: events.append("create"), launch=fail, dispose=lambda: events.append("dispose")
+    )
+    with pytest.raises(RuntimeError, match="no memory"):
+        model.launch()
+    assert events == ["create", "dispose"] and model.npu_backend.launches == ["launch", "dispose"]
+    assert "vision_npu_backend" not in model.__dict__
+
+
+def test_construction_launches_both_mxqs_and_relaunches_after_dispose(monkeypatch, tmp_path: Path) -> None:
+    events: list[tuple[str, str]] = []
+
+    def create(self) -> None:
+        events.append(("create", self.mxq_path))
+        self.mxq_models = [object()]
+
+    def launch(self) -> None:
+        if not self.mxq_models:
+            raise RuntimeError("MobilintNPUBackend.launch() requires create() to succeed first.")
+        events.append(("launch", self.mxq_path))
+
+    def dispose(self) -> None:
+        events.append(("dispose", self.mxq_path))
+        self.mxq_models = []
+
+    for name, fn in (("create", create), ("launch", launch), ("dispose", dispose)):
+        monkeypatch.setattr(type(MobilintD1Config().npu_backend), name, fn)
+    from safetensors.torch import save_file
+
+    config = MobilintD1Config(
+        vocab_size=16,
+        hidden_size=8,
+        image_token_id=5,
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
+        mxq_path="d1.mxq",
+        vision_mxq_path="d1-vision.mxq",
+        core_mode="global4",
+        target_clusters=[0],
+    )
+    config.save_pretrained(tmp_path)
+    save_file({"embed_tokens.weight": torch.zeros(16, 8)}, str(tmp_path / "model.safetensors"))
+    model = MobilintD1Model.from_pretrained(str(tmp_path))
+    assert events == [
+        ("create", "d1.mxq"),
+        ("launch", "d1.mxq"),
+        ("create", "d1-vision.mxq"),
+        ("launch", "d1-vision.mxq"),
+    ]
+    assert model.__dict__["vision_npu_backend"].core_mode == "global4" and model._context is None
+    events.clear()
+    model.dispose()
+    model.launch()
+    assert events == [
+        ("dispose", "d1-vision.mxq"),
+        ("dispose", "d1.mxq"),
+        ("create", "d1.mxq"),
+        ("launch", "d1.mxq"),
+        ("create", "d1-vision.mxq"),
+        ("launch", "d1-vision.mxq"),
+    ]
+
+
+def test_the_vision_backend_follows_the_text_backend() -> None:
+    config = MobilintD1Config(
+        mxq_path="d1.mxq", vision_mxq_path="d1-vision.mxq", core_mode="global4", target_clusters=[1], dev_no=0
+    )
+    model = object.__new__(MobilintD1Model)
+    nn.Module.__init__(model)
+    model.config = config
+    model.npu_backend = config.npu_backend
+    model.npu_backend.name_or_path = "/models/d1"
+    vision = model._vision_backend()
+    assert vision.mxq_path == "d1-vision.mxq" and vision.name_or_path == "/models/d1"
+    assert vision.core_mode == "global4" and vision.to_dict()["target_clusters"] == ["0:1"]
+    assert vision.target_device == config.npu_backend.target_device and vision.max_batch_size == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -568,6 +852,49 @@ def test_readout_and_many_options_match_upstream(upstream: SimpleNamespace) -> N
         assert probs == pytest.approx(upstream.prompt.readout(tokenizer, up_q, logz), rel=1e-9)
 
 
+@pytest.mark.parametrize("count", [1, 2])
+@pytest.mark.parametrize("names", [["refund"], ["refund", "team", "urgency"]])
+def test_pictures_match_the_upstream_processor(upstream: SimpleNamespace, names: list[str], count: int) -> None:
+    """512x512 pictures: the same pixels and the same image tokens as upstream's processor and runner."""
+    try:
+        from transformers import AutoProcessor
+
+        processor = AutoProcessor.from_pretrained(str(_upstream_snapshot()))
+    except (ImportError, OSError, ValueError) as exc:
+        pytest.skip(f"the upstream processor does not load here: {exc}")
+    config = MobilintD1Config()
+    model = object.__new__(MobilintD1Model)
+    nn.Module.__init__(model)
+    model.config = config
+    images = [picture(7 + i, size=(512, 512)) for i in range(count)]
+    # Upstream writes the chat template's markup ("<image>" per picture) and the processor expands it.
+    state = {"camera": "dock 3"}
+    up_questions = [upstream.prompt.as_question(QUESTIONS[n]) for n in names]
+    markup = "<image>" * count
+    prefix = upstream.prompt.prefix_text(upstream.tokenizer, state, upstream.tokenizer.bos_token, images=markup)
+    processed = processor(text=[prefix], images=[images], return_tensors="np", add_special_tokens=False)
+    for i, image in enumerate(images):
+        pixels = patchify(image, config.image_size, config.patch_size)
+        assert np.array_equal(pixels[0], processed["pixel_values"][i][: pixels.shape[1]])
+
+    prompter = upstream.prompter
+    ours = [prompter.question(QUESTIONS[n]) for n in names]
+    rows, shared, _ = prompter.request_rows(state, ours, model.image_markup(count))
+    trunk = processed["input_ids"][0].tolist()
+    assert trunk.count(config.image_token_id) == count * config.image_tokens
+    if len(names) == 1:
+        whole = upstream.prompt.render(
+            upstream.tokenizer, state, up_questions[0], upstream.tokenizer.bos_token, images=markup
+        )
+        expected = processor(text=[whole], images=[images], return_tensors="np", add_special_tokens=False)
+        assert rows == [expected["input_ids"][0].tolist()]
+    else:
+        assert rows[0][:shared] == trunk
+        for row, q in zip(rows, up_questions):
+            suffix = upstream.prompt.suffix_text(upstream.tokenizer, q)
+            assert row == trunk + upstream.tokenizer.encode(suffix, add_special_tokens=False)
+
+
 def test_forward_returns_tied_head_logits_at_the_last_position() -> None:
     model, _, table = make_model(FakeTokenizer(), vocab=64, max_width=16)
     ids = list(range(1, 40))
@@ -576,3 +903,27 @@ def test_forward_returns_tied_head_logits_at_the_last_position() -> None:
     expected = table.astype(np.float64) @ reference_hidden(table, ids)
     assert logits[0, 0].numpy() == pytest.approx(expected, rel=1e-4, abs=1e-5)
     assert model._context is None
+
+
+def test_benchmarks_leave_out_decision_models(monkeypatch, tmp_path: Path) -> None:
+    """D1 shares the image-text-to-text tag with the VLMs but has no generate(), so VLM benchmarks skip it."""
+    import huggingface_hub
+
+    import transformers_mblt.utils as utils
+    from benchmark.transformers import benchmark_target_utils as targets
+
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"model_type": "mobilint-d1"}), encoding="utf-8")
+    ids = ["mobilint/Qwen3-VL-2B-Instruct", "mobilint/d1-3B", "mobilint/d1-2B"]
+    monkeypatch.setattr(utils, "list_models", lambda tasks, include_private=False: {D1_TASK: list(ids)})
+    monkeypatch.setattr(
+        huggingface_hub,
+        "try_to_load_from_cache",
+        lambda repo, name: str(config) if repo == "mobilint/d1-3B" else None,
+    )
+    monkeypatch.setattr(
+        huggingface_hub,
+        "HfApi",
+        lambda: SimpleNamespace(list_models=lambda **kw: [SimpleNamespace(id="mobilint/d1-2B")]),
+    )
+    assert targets.list_default_model_ids(D1_TASK) == ["mobilint/Qwen3-VL-2B-Instruct"]

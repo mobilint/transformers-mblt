@@ -37,12 +37,14 @@ def _fake_package(root: Path, table: np.ndarray, yaml_extra: str = "") -> tuple[
     (package / "model.yaml").write_text(
         "kind: decision\nmodel_id: LiquidAI/d1-3B\nrevision: abc\nrecipe: d1-test\ntarget_device: aries-rb\n"
         "mxq: model.mxq\ntoken_table: token_table.npy\ntokenizer: .\nprompt_source: prompt.py\nmax_tokens: 16384\n"
-        "default_core_mode: global8\nmax_data_length: 2048\n" + yaml_extra,
+        "default_core_mode: global8\nmax_data_length: 2048\nvision_mxq: vision/vision.mxq\n"
+        "vision_layout: vision/layout.json\n" + yaml_extra,
         encoding="utf-8",
     )
     (package / "model.mxq").write_bytes(b"mxq")
     np.save(package / "token_table.npy", table)
-    vocab = {"<|pad|>": 0, "<|startoftext|>": 1, "<|im_end|>": 2, "a": 3}
+    vocab = {"<|pad|>": 0, "<|startoftext|>": 1, "<|im_end|>": 2, "a": 3, "<|image_start|>": 4, "<image>": 5}
+    vocab["<|image_end|>"] = 6
     Tokenizer(WordLevel(vocab, unk_token="a")).save(str(package / "tokenizer.json"))
     (package / "tokenizer_config.json").write_text(
         json.dumps(
@@ -65,7 +67,23 @@ def _fake_package(root: Path, table: np.ndarray, yaml_extra: str = "") -> tuple[
     (upstream / "prompt.py").write_text("# upstream prompt\n", encoding="utf-8")
     (upstream / "tokenizer.json").write_bytes((package / "tokenizer.json").read_bytes())
     (package / "compile-provenance.json").write_text(json.dumps({"inference_scheme": "all"}), encoding="utf-8")
+    vision = package / "vision"
+    vision.mkdir()
+    (vision / "vision.mxq").write_bytes(b"vision mxq")
+    (vision / "resolved.json").write_text(json.dumps({"inferenceScheme": "all"}), encoding="utf-8")
+    (vision / "layout.json").write_text(json.dumps(LAYOUT), encoding="utf-8")
     return package, upstream
+
+
+LAYOUT = {
+    "image_size": 512,
+    "patch_size": 16,
+    "resize": "letterbox",
+    "image_tokens": 256,
+    "hidden_size": 8,
+    "image_token_id": 5,
+    "expanded_markup": "<|image_start|>" + "<image>" * 256 + "<|image_end|>",
+}
 
 
 FACTS = {
@@ -94,6 +112,7 @@ def test_build_writes_the_hub_layout(tmp_path: Path) -> None:
         [
             "config.json",
             "d1-3B.mxq",
+            "d1-3B-vision.mxq",
             "model.safetensors",
             "tokenizer.json",
             "tokenizer_config.json",
@@ -111,6 +130,14 @@ def test_build_writes_the_hub_layout(tmp_path: Path) -> None:
     assert (config["vocab_size"], config["hidden_size"], config["npu_prefill_chunk_size"]) == (4, 8, 2048)
     assert (config["bos_token_id"], config["eos_token_id"], config["pad_token_id"]) == (1, 2, 0)
     assert config["base_model_revision"] == "abc"
+    assert (out / "d1-3B-vision.mxq").read_bytes() == b"vision mxq"
+    assert config["vision_mxq_path"] == "d1-3B-vision.mxq"
+    assert (config["image_size"], config["patch_size"], config["image_tokens"], config["image_token_id"]) == (
+        512,
+        16,
+        256,
+        5,
+    )
 
     tokenizer_config = json.loads((out / "tokenizer_config.json").read_text())
     assert tokenizer_config["tokenizer_class"] == "PreTrainedTokenizerFast"
@@ -122,7 +149,10 @@ def test_build_writes_the_hub_layout(tmp_path: Path) -> None:
     assert (out / "proxy_d1.py").read_text() == (_REPO_ROOT / "transformers_mblt/models/d1/proxy_d1.py").read_text()
     card = (out / "README.md").read_text()
     assert "license_name: lfm1.0" in card and f"pipeline_tag: {build.D1_TASK}" in card
-    assert "Liquid AI, Inc." in card and "## Requirements" in card
+    assert "Liquid AI, Inc." in card and "## Requirements" in card and "## Pictures" in card
+    assert "text-only" not in card.lower() and "text only" not in card.lower()
+    assert "vision tower and projector" in card and "`d1-3B-vision.mxq`" in card
+    assert "images=[" in card and "letterboxed" in card
 
     from transformers import AutoConfig
 
@@ -131,6 +161,7 @@ def test_build_writes_the_hub_layout(tmp_path: Path) -> None:
     transformers_mblt.register()
     loaded = AutoConfig.from_pretrained(str(out))
     assert type(loaded).__name__ == "MobilintD1Config" and loaded.core_mode == "global8"
+    assert loaded.vision_mxq_path == "d1-3B-vision.mxq" and loaded.image_tokens == 256
 
 
 def test_the_card_is_generated_whole(tmp_path: Path) -> None:
@@ -170,10 +201,101 @@ def test_inexact_tables_stay_float32(tmp_path: Path) -> None:
         build.embedding_tensor(package / "token_table.npy", "bfloat16")
 
 
-def test_build_refuses_vision_packages_and_changed_prompts(tmp_path: Path) -> None:
-    package, upstream = _fake_package(tmp_path, np.zeros((4, 8), np.float32), "vision_mxq: vision.mxq\n")
-    with pytest.raises(SystemExit, match="vision MXQ"):
+def test_vision_files_come_from_the_command_line(tmp_path: Path) -> None:
+    package, upstream = _fake_package(tmp_path, np.zeros((4, 8), np.float32))
+    other = tmp_path / "other-vision"
+    other.mkdir()
+    (other / "v5.mxq").write_bytes(b"v5")
+    other_markup = "<|image_start|>" + "<image>" * 144 + "<|image_end|>"
+    (other / "layout.json").write_text(
+        json.dumps(dict(LAYOUT, image_size=384, image_tokens=144, expanded_markup=other_markup)), encoding="utf-8"
+    )
+    out = build.build(
+        package,
+        tmp_path / "hub",
+        upstream,
+        vision_mxq=other / "v5.mxq",
+        vision_layout=other / "layout.json",
+        vision_mxq_name="v.mxq",
+    )
+    config = json.loads((out / "config.json").read_text())
+    assert (out / "v.mxq").read_bytes() == b"v5" and config["vision_mxq_path"] == "v.mxq"
+    assert (config["image_size"], config["image_tokens"]) == (384, 144)
+    assert "384x384" in (out / "README.md").read_text()
+
+
+def test_core_modes_are_the_ones_both_mxqs_run_in(tmp_path: Path) -> None:
+    package, upstream = _fake_package(tmp_path, np.zeros((4, 8), np.float32))
+    resolved = package / "vision" / "resolved.json"
+    resolved.write_text(json.dumps({"inferenceScheme": "global8"}), encoding="utf-8")
+    out = build.build(package, tmp_path / "hub", upstream)
+    assert json.loads((out / "config.json").read_text())["core_mode"] == "global8"
+    card = (out / "README.md").read_text()
+    assert "`global8` by default." in card and "`single` also run" not in card
+
+    resolved.write_text(json.dumps({"inferenceScheme": "single"}), encoding="utf-8")
+    with pytest.raises(SystemExit, match="default core mode global8"):
+        build.build(package, tmp_path / "hub2", upstream)
+    resolved.write_text(json.dumps({"inferenceScheme": "multi9"}), encoding="utf-8")
+    with pytest.raises(SystemExit, match="no known core modes"):
+        build.build(package, tmp_path / "hub3", upstream)
+    # A layout that names its scheme wins over the folder's files.
+    layout = package / "vision" / "layout.json"
+    layout.write_text(json.dumps(dict(LAYOUT, inference_scheme="all")), encoding="utf-8")
+    build.build(package, tmp_path / "hub4", upstream)
+
+    # A vision MXQ beside the text MXQ does not borrow the text MXQ's compile record.
+    (package / "vision.mxq").write_bytes(b"v")
+    (package / "layout.json").write_text(json.dumps(LAYOUT), encoding="utf-8")
+    (package / "compile-provenance.json").write_text(json.dumps({"inference_scheme": "all"}), encoding="utf-8")
+    assert build.read_package(package, package / "vision.mxq", package / "layout.json")["vision_provenance"] == {}
+
+
+def test_build_refuses_missing_or_text_only_vision(tmp_path: Path) -> None:
+    package, upstream = _fake_package(tmp_path, np.zeros((4, 8), np.float32))
+    yaml_text = (package / "model.yaml").read_text().replace("vision_mxq: vision/vision.mxq\n", "")
+    (package / "model.yaml").write_text(yaml_text)
+    with pytest.raises(SystemExit, match="--vision-mxq"):
         build.build(package, tmp_path / "hub", upstream)
+    with pytest.raises(SystemExit, match="together"):
+        build.build(package, tmp_path / "hub", upstream, vision_mxq=package / "vision" / "vision.mxq")
+
+    layout = package / "vision" / "layout.json"
+    text_only = {"text_only": True, "hidden_size": 8, "image_tokens": 0, "expanded_markup": ""}
+    layout.write_text(json.dumps(text_only))
+    with pytest.raises(SystemExit, match="text-only layout"):
+        build.build(
+            package,
+            tmp_path / "hub",
+            upstream,
+            vision_mxq=package / "vision" / "vision.mxq",
+            vision_layout=layout,
+        )
+    for bad, match in (
+        ({"resize": "stretch"}, "letterboxes"),
+        ({"hidden_size": 16}, "hidden size"),
+        ({"image_tokens": 255}, "image tokens"),
+        ({"expanded_markup": "<image>" * 256}, "expanded markup"),
+        ({"image_token_id": 4}, "not the tokenizer's"),
+    ):
+        layout.write_text(json.dumps(dict(LAYOUT, **bad)))
+        with pytest.raises(SystemExit, match=match):
+            build.build(
+                package, tmp_path / "hub", upstream, vision_mxq=package / "vision" / "vision.mxq", vision_layout=layout
+            )
+    layout.write_text(json.dumps(LAYOUT))
+    with pytest.raises(SystemExit, match="different names"):
+        build.build(
+            package,
+            tmp_path / "hub",
+            upstream,
+            vision_mxq=package / "vision" / "vision.mxq",
+            vision_layout=layout,
+            vision_mxq_name="d1-3B.mxq",
+        )
+
+
+def test_build_refuses_changed_prompts(tmp_path: Path) -> None:
 
     package, upstream = _fake_package(tmp_path / "second", np.zeros((4, 8), np.float32))
     (upstream / "prompt.py").write_text("# another revision\n", encoding="utf-8")

@@ -37,7 +37,35 @@ def list_default_model_ids(task: str, *, include_private: bool = False) -> list[
     """
     from transformers_mblt.utils import list_models
 
-    return list_models(tasks=task, include_private=include_private).get(task, [])
+    ids = list_models(tasks=task, include_private=include_private).get(task, [])
+    decision = _decision_model_ids(ids)
+    return [model_id for model_id in ids if model_id not in decision]
+
+
+def _decision_model_ids(ids: Sequence[str]) -> set[str]:
+    """The D1 decision models among ``ids``: they share ``image-text-to-text`` with the VLMs but never generate.
+
+    A model counts when its cached ``config.json`` has ``model_type: mobilint-d1`` or its Hub card carries the
+    ``decision`` tag.
+    """
+    import json
+
+    from huggingface_hub import HfApi, try_to_load_from_cache
+
+    found: set[str] = set()
+    for model_id in ids:
+        path = try_to_load_from_cache(model_id, "config.json")
+        if isinstance(path, str):
+            try:
+                if json.loads(Path(path).read_text(encoding="utf-8")).get("model_type") == "mobilint-d1":
+                    found.add(model_id)
+            except (OSError, ValueError):
+                pass
+    try:
+        found.update(m.id for m in HfApi().list_models(author="mobilint", tags="decision") if m.id in ids)
+    except (HfHubHTTPError, OSError, ValueError):
+        pass
+    return found
 
 
 def normalize_repo_id(value: str) -> str:
