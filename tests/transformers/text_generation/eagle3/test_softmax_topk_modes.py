@@ -297,14 +297,14 @@ def test_softmax_topk_respects_custom_max_return_k(sample_logits, restore_softma
     assert indices.shape == (5,)
 
 
-def test_auto_falls_back_to_full_vocab_on_boundary_tie(monkeypatch, restore_softmax_topk_mode):
-    """Boundary ties push part of the TopK support outside the slice; auto must fall back.
+def test_auto_widens_slice_on_boundary_tie(monkeypatch, restore_softmax_topk_mode):
+    """Boundary ties push part of the TopK support outside the slice; auto must keep all of it.
 
     HF's ``TopKLogitsWarper`` uses a strict-less-than filter, so every logit equal to the
     k-th threshold survives. ``torch.topk`` picks a fixed count and arbitrarily drops tied
     entries at the boundary. When the tie extends past the slice, the sliced softmax
-    denominator would exclude real active mass — the auto path must detect this and route
-    through the full-vocab helper.
+    denominator would exclude real active mass — the auto path must detect this and widen the
+    slice to every entry at or above the threshold, without a full-vocab pass.
     """
     # Top-3 is 5.0, 4.0, 3.0, and *three more* entries also carry 3.0 → four entries share
     # the k-th threshold value. slice_size == max(top_k=3, max_return_k=3) == 3, so only
@@ -334,9 +334,9 @@ def test_auto_falls_back_to_full_vocab_on_boundary_tie(monkeypatch, restore_soft
     set_softmax_topk_mode("auto")
     auto_probs, auto_idx = softmax_topk_cpu_torch(logits, max_return_k=3, logits_processor=processor)
 
-    # The sliced entry runs, detects the boundary tie, and delegates to full-vocab.
+    # The sliced entry runs, detects the boundary tie, and widens the slice instead of a full-vocab pass.
     assert call_counts["sliced"] == 1
-    assert call_counts["full_vocab"] == 1
+    assert call_counts["full_vocab"] == 0
 
     reference_processor = prepare_logits_processor(temperature=1.0, top_k=3)
     ref_probs, ref_idx = _hf_full_vocab_reference(logits, reference_processor, 3)
