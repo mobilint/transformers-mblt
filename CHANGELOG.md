@@ -18,6 +18,16 @@
   `scripts/build_d1_hf_package.py` assembles the Hub folder (`d1-3B.mxq`, `d1-3B-vision.mxq`), model card included,
   from a compiled D1 package and its vision MXQ. D1 is listed under `image-text-to-text`, upstream's Hub task. The VLM benchmarks leave D1 out of their default
   model lists, since it does not generate.
+- Encoder models for retrieval: `MobilintBertEmbeddingModel` (`mobilint-bert-embedding`, `AutoModel`,
+  `feature-extraction`) for BERT sentence embedders such as multilingual E5, and
+  `MobilintXLMRobertaForSequenceClassification` (`mobilint-xlm-roberta`, `AutoModelForSequenceClassification`,
+  `text-classification`) for XLM-RoBERTa cross-encoders such as the BGE rerankers. The embedding lookup runs on the
+  host and the encoder body (and the reranker's classification head) on the NPU; each sequence of a batch runs on its
+  own without its padding, so position ids restart per sequence as upstream's do. The embedder returns
+  `last_hidden_state` with zeros at padded positions for mask-weighted pooling. New Hub repositories carry their own
+  proxies (`proxy_bert_embedding.py`, `proxy_xlm_roberta.py`), so the `mobilint/bert-*` repositories keep theirs.
+  `scripts/build_encoder_hf_package.py` assembles either Hub folder, model card included, from the compiled MXQ and
+  the upstream snapshot.
 - EXAONE 3.5 EAGLE-3 speculative decoding: `MobilintExaoneEagle3Config` / `MobilintExaoneEagle3ForCausalLM`
   (`model_type` `mobilint-exaone-eagle3`, `transformers_mblt/models/exaone_eagle3/`) wire the EXAONE 3.5 base body,
   the Llama-family one-block draft, and the FC projector on the shared EAGLE-3 mixins, for the

@@ -600,6 +600,38 @@ the measured sections (quantization, calibration sources, fidelity) come from a 
 The base model is licensed under the LFM Open License v1.0, which limits commercial use by organizations with annual
 revenue of USD 10 million or more. The model repository ships that license.
 
+### Embedders and rerankers
+
+`MobilintBertEmbeddingModel` (`model_type` `mobilint-bert-embedding`, `AutoModel`) runs BERT sentence embedders such
+as multilingual E5, and `MobilintXLMRobertaForSequenceClassification` (`mobilint-xlm-roberta`,
+`AutoModelForSequenceClassification`) runs XLM-RoBERTa cross-encoders such as the BGE rerankers. Their MXQs hold the
+encoder body (and the reranker's classification head) and take the embedding-layer output of one sequence with a
+dynamic length and no attention mask. The embedding lookup runs on the host, and each sequence of a batch runs on its
+own without its padding, so position ids restart per sequence as upstream's do and padding on either side never
+reaches the attention.
+
+```python
+import torch
+import transformers_mblt
+from transformers import AutoModel, AutoTokenizer
+
+transformers_mblt.register()
+tokenizer = AutoTokenizer.from_pretrained("mobilint/multilingual-e5-small-ko-v2")
+model = AutoModel.from_pretrained("mobilint/multilingual-e5-small-ko-v2")
+batch = tokenizer(["query: ...", "passage: ..."], padding=True, return_tensors="pt")
+hidden = model(**batch).last_hidden_state  # zeros at padded positions
+mask = batch["attention_mask"].unsqueeze(-1).float()
+embeddings = torch.nn.functional.normalize((hidden * mask).sum(1) / mask.sum(1), dim=-1)
+```
+
+The reranker returns `logits` of shape `(batch, num_labels)`; for a BGE reranker, `sigmoid(logits[:, 0])` is the
+relevance of each (query, passage) pair. A sequence may hold up to `model.max_length` tokens: the position table,
+capped by the MXQ's input width. `labels`, `inputs_embeds` and `position_ids` are not supported.
+
+`scripts/build_encoder_hf_package.py --kind embedder|reranker` assembles the Hub folder from the compiled MXQ (with
+its `<mxq>.config.json` compile record) and a local snapshot of the base model: the config, the embedding-layer
+weights, the tokenizer files, the proxy and the model card (measured sections from `--card-facts`).
+
 ## Host-Side Sampling
 
 With `do_sample=True` and both `top_k` and `top_p` set (Qwen3 ships `temperature=0.6, top_k=20, top_p=0.95`),

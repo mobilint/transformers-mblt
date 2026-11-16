@@ -20,6 +20,7 @@ _ARCHITECTURES: tuple[str, ...] = (
     "exaone4",
     "cohere2",
     "bert",
+    "xlm_roberta",
     "siglip",
     "blip",
     "aya_vision",

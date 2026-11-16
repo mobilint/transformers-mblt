@@ -1,8 +1,10 @@
 from typing import Union, cast
 
+import numpy as np
 import torch
 from torch.nn import CrossEntropyLoss
 from transformers.modeling_outputs import (
+    BaseModelOutput,
     BaseModelOutputWithPoolingAndCrossAttentions,
     MaskedLMOutput,
 )
@@ -18,7 +20,8 @@ from transformers.utils.generic import TransformersKwargs, logging
 
 from ...utils.base_utils import PretrainedOnlyMixin
 from ...utils.modeling_utils import MobilintModelMixin
-from .configuration_bert import MobilintBertConfig
+from ...utils.encoder_utils import infer_sequence, mxq_max_length, unpadded_positions
+from .configuration_bert import MobilintBertConfig, MobilintBertEmbeddingConfig
 
 logger = logging.get_logger(__name__)
 
@@ -196,5 +199,50 @@ class MobilintBertForMaskedLM(PretrainedOnlyMixin, MobilintBertPreTrainedModel):
     def dispose(self):
         self.bert.dispose()
         
+class MobilintBertEmbeddingModel(MobilintBertModel):
+    """A BERT encoder for sentence embeddings (such as multilingual E5) on the NPU.
+
+    The token, position and type embeddings run on the host and the encoder body on the NPU, one sequence at a time
+    without its padding. ``last_hidden_state`` is ``(batch, length, hidden)`` with zeros at padded positions, so the
+    usual mask-weighted mean pooling gives each sequence's embedding. The MXQ takes up to ``max_length`` tokens.
+    """
+
+    config_class = MobilintBertEmbeddingConfig
+
+    def __init__(self, config: MobilintBertEmbeddingConfig, **kwargs):
+        kwargs.pop("add_pooling_layer", None)
+        super().__init__(config, add_pooling_layer=False, **kwargs)
+
+    @property
+    def max_length(self) -> int:
+        """The longest sequence: the position table, capped by the MXQ's input width."""
+        return mxq_max_length(self.npu_backend.mxq_models[0], int(self.config.max_position_embeddings))
+
+    @torch.inference_mode()
+    def forward(
+        self,
+        input_ids: Union[torch.Tensor, None] = None,
+        attention_mask: Union[torch.Tensor, None] = None,
+        token_type_ids: Union[torch.Tensor, None] = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> BaseModelOutput:
+        if input_ids is None:
+            raise ValueError("Mobilint BERT embedding models take input_ids")
+        if kwargs.get("inputs_embeds") is not None or kwargs.get("position_ids") is not None:
+            raise ValueError("inputs_embeds and position_ids are not supported: positions restart in every sequence")
+        mxq_model = self.npu_backend.mxq_models[0]
+        limit = self.max_length
+        hidden = torch.zeros(*input_ids.shape, self.config.hidden_size, dtype=torch.float32)
+        for row, positions in enumerate(unpadded_positions(input_ids, attention_mask)):
+            if len(positions) > limit:
+                raise ValueError(f"a sequence has {len(positions)} tokens; this model takes at most {limit}")
+            types = None if token_type_ids is None else token_type_ids[row, positions][None]
+            x = self.embeddings(input_ids=input_ids[row, positions][None], token_type_ids=types)
+            out = infer_sequence(mxq_model, x)
+            hidden[row, positions.cpu()] = torch.from_numpy(out.reshape(len(positions), self.config.hidden_size))
+        return BaseModelOutput(last_hidden_state=cast(torch.FloatTensor, hidden))
+
+
 AutoModel.register(MobilintBertConfig, MobilintBertForMaskedLM)
+AutoModel.register(MobilintBertEmbeddingConfig, MobilintBertEmbeddingModel)
 AutoModelForMaskedLM.register(MobilintBertConfig, MobilintBertForMaskedLM)
