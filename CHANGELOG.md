@@ -10,7 +10,7 @@
   `system_one_batch`, `probabilities`, `probabilities_batch`) with the same answer shapes, plus `render`, `tokens` and
   the `calibration` hook. The prompt is the checkpoint's own `prompt.py`, loaded from the model folder or Hub snapshot
   at runtime. Several questions on one state share one state prefill, and a later call on the same state reuses it.
-  A lock serializes requests. Prompts may fill the KV capacity the MXQ reports (16,382 tokens for the 16K Aries build); prefill calls stay at most 2,048 tokens
+  A lock serializes requests. Prompts may fill the KV capacity the MXQ reports (16,382 tokens for the 16K Aries build; past about 8K tokens `single` and `global4` need `QBRUNTIME_NPU_TIMEOUT_MS` above the default 10 s); prefill calls stay at most 2,048 tokens
   (2,046 in `global4`/`global8`, which avoid call lengths of 0 or 63 modulo 64). The Aries build runs in `global8`
   (default), `global4` and `single`. `images=` takes pictures, as upstream: each is letterboxed into one 512x512 input
   and read as 256 image tokens at the head of the user turn, and the vision MXQ runs in the text MXQ's core mode. A

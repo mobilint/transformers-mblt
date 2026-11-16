@@ -336,7 +336,9 @@ def _requirements(package: dict[str, Any]) -> str:
 - Core modes: {scheme_text}{mode_text}. Pass `core_mode=` (with `target_clusters=` or `target_cores=`) to
   `from_pretrained` to pick one.
 - KV capacity: {capacity:,} tokens. A prompt (state and question) of up to {capacity:,} tokens is accepted; a longer
-  one raises `ValueError`.
+  one raises `ValueError`. A prefill call takes longer the deeper it starts in the KV: in `single` and `global4`, a
+  prompt past about 8K tokens needs a longer NPU watchdog than qbruntime's default 10 s, such as
+  `QBRUNTIME_NPU_TIMEOUT_MS=30000` in the environment. `global8` stays within the default.
 - Prefill runs in infer calls of {" and ".join(calls)}.
 - The vision MXQ runs in the same core mode as the text MXQ, one picture per infer call.
 - Several questions on one state share its prefill, and a later call on the same state and pictures reuses it.

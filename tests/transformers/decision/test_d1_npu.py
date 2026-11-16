@@ -203,7 +203,15 @@ def test_long_state_and_residue_lengths(model, monkeypatch, residue: int) -> Non
 
 
 def test_prompts_fill_the_kv_capacity_the_mxq_reports(model, monkeypatch) -> None:
-    """A prompt of up to the MXQ's KV capacity runs; one token more raises before any infer call."""
+    """A prompt of up to the MXQ's KV capacity runs; one token more raises before any infer call.
+
+    A 2K prefill call takes longer the deeper it starts in the KV: on Aries, past about 8K tokens in ``single`` and
+    10K in ``global4`` it outlasts qbruntime's default 10 s watchdog. Those modes need ``QBRUNTIME_NPU_TIMEOUT_MS``
+    (30000 or more) for this test.
+    """
+    core_mode = str(model.npu_backend.core_mode)
+    if core_mode != "global8" and int(os.environ.get("QBRUNTIME_NPU_TIMEOUT_MS", "10000")) < 30000:
+        pytest.skip(f"a 16K prompt in {core_mode} needs QBRUNTIME_NPU_TIMEOUT_MS=30000 or more")
     capacity = model.kv_capacity
     assert capacity == model.config.max_position_embeddings
     prompter = model.prompter

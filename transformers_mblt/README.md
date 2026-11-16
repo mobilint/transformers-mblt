@@ -582,7 +582,10 @@ stays on the device, so a later call on the same state (and the same pictures) p
 calls from several threads are safe and run one after another.
 
 A prompt (state, pictures and question) may use
-the KV capacity the MXQ reports (16,382 tokens for the 16K Aries build); a longer prompt raises `ValueError`. Prefill runs in
+the KV capacity the MXQ reports (16,382 tokens for the 16K Aries build); a longer prompt raises `ValueError`.
+A prefill call takes longer the deeper it starts in the KV. On Aries a 2K call starting at 12K tokens takes about
+13.6 s in `single`, 11.6 s in `global4` and 5.9 s in `global8`, so in `single` and `global4` a prompt past about 8K
+tokens needs a longer watchdog than qbruntime's default 10 s (`QBRUNTIME_NPU_TIMEOUT_MS=30000`). Prefill runs in
 infer calls of at most `npu_prefill_chunk_size` tokens (2,048), except that in `global4` and `global8` no call has a
 length of 0 or 63 modulo 64, because LFM2 hybrid graphs hang the NPU there: those modes prefill in calls of at most
 2,046 tokens. The Aries build's two MXQs are compiled with inference scheme `all`: its config selects `global8`, and
