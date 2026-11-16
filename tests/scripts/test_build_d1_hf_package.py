@@ -100,7 +100,7 @@ LAYOUT = {
 
 
 FACTS = {
-    "quantization": {"weights": "4 bit", "activations": "16 bit", "method": "Qronos", "compiler": "qbcompiler 1.4.1"},
+    "quantization": {"weights": "4 bit", "activations": "16 bit", "method": "PTQ", "compiler": "qbcompiler 1.4.1"},
     "calibration": {
         "prompts": 497,
         "tokens": 318755,
