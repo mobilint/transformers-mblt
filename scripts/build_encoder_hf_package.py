@@ -325,13 +325,19 @@ def build(
     return out
 
 
+DEFAULT_MXQ_LENGTH = 4096
+
+
 def _mxq_length(mxq: Path) -> int:
-    """The longest input the compile record allows (``maxSequenceLength``)."""
+    """The longest input the compile record allows (``maxSequenceLength``). qbcompiler builds the sequence axis
+    from the ``llm`` attributes only when ``llm.apply`` is true; otherwise it keeps its default of 4,096 whatever
+    the record says."""
     record = json.loads(mxq.with_name(mxq.name + ".config.json").read_text(encoding="utf-8"))
-    length = int(record.get("llm", {}).get("attributes", {}).get("maxSequenceLength") or 0)
+    llm = record.get("llm", {})
+    length = int(llm.get("attributes", {}).get("maxSequenceLength") or 0)
     if length <= 0:
         raise SystemExit(f"[error] the compile record of {mxq} has no maxSequenceLength")
-    return length
+    return length if llm.get("apply") else min(length, DEFAULT_MXQ_LENGTH)
 
 
 def main(argv: Optional[list[str]] = None) -> int:

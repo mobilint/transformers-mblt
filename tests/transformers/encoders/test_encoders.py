@@ -245,6 +245,17 @@ def test_build_writes_the_hub_folder(tmp_path: Path, kind: str) -> None:
     assert AutoConfig.from_pretrained(str(out)).model_type == spec["model_type"]
 
 
+@pytest.mark.parametrize("apply, length", [(True, 8192), (False, 4096)])
+def test_build_takes_the_length_the_compiler_applied(tmp_path: Path, apply: bool, length: int) -> None:
+    build = _load_build()
+    upstream, mxq = _fake_upstream(tmp_path, "reranker")
+    record = {"inferenceScheme": "all", "llm": {"apply": apply, "attributes": {"maxSequenceLength": 8192}}}
+    mxq.with_name(mxq.name + ".config.json").write_text(json.dumps(record), encoding="utf-8")
+    out = build.build("reranker", mxq, upstream, tmp_path / "hub", "mobilint/rr", "org/base", "abc")
+    assert f"Sequences of up to {length:,} tokens" in (out / "README.md").read_text()
+    assert json.loads((out / "tokenizer_config.json").read_text())["model_max_length"] == length
+
+
 def test_build_refuses_the_wrong_checkpoint(tmp_path: Path) -> None:
     build = _load_build()
     upstream, mxq = _fake_upstream(tmp_path, "embedder")
