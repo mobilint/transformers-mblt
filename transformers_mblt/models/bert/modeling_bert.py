@@ -20,7 +20,7 @@ from transformers.utils.generic import TransformersKwargs, logging
 
 from ...utils.base_utils import PretrainedOnlyMixin
 from ...utils.modeling_utils import MobilintModelMixin
-from ...utils.encoder_utils import infer_sequence, mxq_max_length, unpadded_positions
+from ...utils.encoder_utils import encode_rows, mxq_max_length
 from .configuration_bert import MobilintBertConfig, MobilintBertEmbeddingConfig
 
 logger = logging.get_logger(__name__)
@@ -205,6 +205,8 @@ class MobilintBertEmbeddingModel(MobilintBertModel):
     The token, position and type embeddings run on the host and the encoder body on the NPU, one sequence at a time
     without its padding. ``last_hidden_state`` is ``(batch, length, hidden)`` with zeros at padded positions, so the
     usual mask-weighted mean pooling gives each sequence's embedding. The MXQ takes up to ``max_length`` tokens.
+    With several launched slots, the rows of a batch spread over them. ``config.pad_token_id`` (0, from upstream E5)
+    only sets the embedding's ``padding_idx``; padding is read from ``attention_mask``.
     """
 
     config_class = MobilintBertEmbeddingConfig
@@ -230,15 +232,11 @@ class MobilintBertEmbeddingModel(MobilintBertModel):
             raise ValueError("Mobilint BERT embedding models take input_ids")
         if kwargs.get("inputs_embeds") is not None or kwargs.get("position_ids") is not None:
             raise ValueError("inputs_embeds and position_ids are not supported: positions restart in every sequence")
-        mxq_model = self.npu_backend.mxq_models[0]
-        limit = self.max_length
         hidden = torch.zeros(*input_ids.shape, self.config.hidden_size, dtype=torch.float32)
-        for row, positions in enumerate(unpadded_positions(input_ids, attention_mask)):
-            if len(positions) > limit:
-                raise ValueError(f"a sequence has {len(positions)} tokens; this model takes at most {limit}")
-            types = None if token_type_ids is None else token_type_ids[row, positions][None]
-            x = self.embeddings(input_ids=input_ids[row, positions][None], token_type_ids=types)
-            out = infer_sequence(mxq_model, x)
+        rows = encode_rows(
+            self.npu_backend.mxq_models, input_ids, attention_mask, token_type_ids, self.embeddings, self.max_length
+        )
+        for row, (positions, out) in enumerate(rows):
             hidden[row, positions.cpu()] = torch.from_numpy(out.reshape(len(positions), self.config.hidden_size))
         return BaseModelOutput(last_hidden_state=cast(torch.FloatTensor, hidden))
 

@@ -184,7 +184,8 @@ def _fake_upstream(root: Path, kind: str) -> tuple[Path, Path]:
     upstream.mkdir()
     if kind == "embedder":
         config = {"model_type": "bert", "architectures": ["BertModel"], "hidden_size": 8,
-                  "max_position_embeddings": 512, "vocab_size": 10, "torch_dtype": "float32"}
+                  "max_position_embeddings": 512, "vocab_size": 10, "torch_dtype": "float32",
+                  "transformers_version": "4.52.4"}
         prefix = "embeddings."
     else:
         config = {"model_type": "xlm-roberta", "architectures": ["XLMRobertaForSequenceClassification"],
@@ -195,8 +196,10 @@ def _fake_upstream(root: Path, kind: str) -> tuple[Path, Path]:
     tensors = {f"{prefix}word_embeddings.weight": torch.randn(10, 8), f"{prefix}LayerNorm.weight": torch.ones(8),
                "encoder.layer.0.attention.self.query.weight": torch.randn(8, 8)}
     save_file(tensors, str(upstream / "model.safetensors"))
-    for name in ("tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"):
+    for name in ("tokenizer.json", "special_tokens_map.json"):
         (upstream / name).write_text("{}", encoding="utf-8")
+    limit = 512 if kind == "embedder" else 8192
+    (upstream / "tokenizer_config.json").write_text(json.dumps({"model_max_length": limit}), encoding="utf-8")
     mxq = root / "model.mxq"
     mxq.write_bytes(b"mxq")
     record = {"inferenceScheme": "all", "llm": {"attributes": {"maxSequenceLength": 4096}}}
@@ -227,6 +230,14 @@ def test_build_writes_the_hub_folder(tmp_path: Path, kind: str) -> None:
     assert f"Sequences of up to {limit} tokens" in card
     assert (out / spec["proxy"].name).read_bytes() == spec["proxy"].read_bytes()
     assert "qronos" not in card.lower()
+    # Kept: Transformers 5 warns of a broken tokenizer regex for local folders without it.
+    assert config.get("transformers_version") == json.loads((upstream / "config.json").read_text()).get(
+        "transformers_version"
+    )
+    tokenizer_config = json.loads((out / "tokenizer_config.json").read_text())
+    # Truncation without max_length must stop at what the MXQ takes.
+    assert tokenizer_config["model_max_length"] == (4096 if kind == "reranker" else 512)
+    assert ("`model_max_length`" in card) == (kind == "reranker")
 
     from transformers import AutoConfig
 
@@ -239,3 +250,59 @@ def test_build_refuses_the_wrong_checkpoint(tmp_path: Path) -> None:
     upstream, mxq = _fake_upstream(tmp_path, "embedder")
     with pytest.raises(SystemExit, match="xlm-roberta"):
         build.build("reranker", mxq, upstream, tmp_path / "hub", "mobilint/rr", "org/base", "abc")
+
+
+def test_rows_spread_over_launched_slots() -> None:
+    model, first = make_embedder()
+    second = FakeEncoderMxq()
+    model.npu_backend = SimpleNamespace(mxq_models=[first, second])
+    ids = torch.tensor([[5, 6, 7, 8], [9, 10, 0, 0], [11, 12, 13, 0]])
+    mask = (ids != 0).long()
+    hidden = model(input_ids=ids, attention_mask=mask).last_hidden_state
+    assert first.lengths == [4, 3] and second.lengths == [2]
+    model.npu_backend = SimpleNamespace(mxq_models=[first])
+    assert torch.allclose(hidden, model(input_ids=ids, attention_mask=mask).last_hidden_state)
+
+
+@pytest.mark.parametrize("kind", ["embedder", "reranker"])
+def test_from_pretrained_loads_the_embedding_only_folder(tmp_path: Path, monkeypatch, kind: str) -> None:
+    """The real loading path: config, Auto dispatch, embedding-only safetensors under the upstream names."""
+    from safetensors.torch import save_file
+    from transformers import AutoModel, AutoModelForSequenceClassification
+
+    from transformers_mblt._npu import MobilintNPUBackend
+
+    fake = FakeEncoderMxq(head=kind == "reranker")
+    monkeypatch.setattr(MobilintNPUBackend, "create", lambda self: setattr(self, "mxq_models", [fake]))
+    monkeypatch.setattr(MobilintNPUBackend, "launch", lambda self: None)
+    monkeypatch.setattr(MobilintNPUBackend, "dispose", lambda self: None)
+    transformers_mblt.register()
+    if kind == "embedder":
+        config = MobilintBertEmbeddingConfig(vocab_size=30, hidden_size=8, max_position_embeddings=32,
+                                             type_vocab_size=2, pad_token_id=0, num_hidden_layers=1,
+                                             num_attention_heads=2, intermediate_size=16, mxq_path="m.mxq",
+                                             core_mode="global8")
+        prefix, auto = "embeddings.", AutoModel
+    else:
+        config = MobilintXLMRobertaConfig(vocab_size=30, hidden_size=8, max_position_embeddings=40, type_vocab_size=1,
+                                          pad_token_id=1, num_hidden_layers=1, num_attention_heads=2,
+                                          intermediate_size=16, num_labels=1, mxq_path="m.mxq", core_mode="global8")
+        prefix, auto = "roberta.embeddings.", AutoModelForSequenceClassification
+    config.save_pretrained(tmp_path)
+    torch.manual_seed(1)
+    tensors = {
+        f"{prefix}word_embeddings.weight": torch.randn(30, 8),
+        f"{prefix}position_embeddings.weight": torch.randn(config.max_position_embeddings, 8),
+        f"{prefix}token_type_embeddings.weight": torch.randn(config.type_vocab_size, 8),
+        f"{prefix}LayerNorm.weight": torch.rand(8) + 0.5,
+        f"{prefix}LayerNorm.bias": torch.randn(8),
+    }
+    save_file(tensors, str(tmp_path / "model.safetensors"))
+    model, info = auto.from_pretrained(str(tmp_path), output_loading_info=True)
+    assert not info["missing_keys"] and not info["unexpected_keys"]
+    state = model.state_dict()
+    for key, value in tensors.items():
+        assert torch.equal(state[key], value), key
+    out = model(input_ids=torch.tensor([[3, 4, 5, 6]]), attention_mask=torch.tensor([[1, 1, 1, 1]]))
+    assert fake.lengths == [4]
+    assert (out.last_hidden_state if kind == "embedder" else out.logits).shape[0] == 1

@@ -76,7 +76,8 @@ KINDS: dict[str, dict[str, Any]] = {
         "pipeline_tag": "text-classification",
     },
 }
-_CONFIG_DROP = ("_name_or_path", "architectures", "auto_map", "torch_dtype", "dtype", "transformers_version")
+# transformers_version stays: Transformers 5 warns of a broken (Mistral) regex for local folders without it.
+_CONFIG_DROP = ("_name_or_path", "architectures", "auto_map", "torch_dtype", "dtype")
 
 
 def core_modes(mxq: Path) -> list[str]:
@@ -176,8 +177,15 @@ As the base model, the relevance score of a (query, document) pair is the sigmoi
 def model_card(
     kind: str, repo_id: str, base_model: str, revision: str, mxq_name: str, modes: list[str], max_length: int,
     facts: dict[str, Any],
+    tokenizer_changes: Optional[list[str]] = None,
 ) -> str:
     spec = KINDS[kind]
+    changed = "; ".join(tokenizer_changes or [])
+    tokenizer_note = (
+        f"The tokenizer files are the base model's, except {changed}, so that truncation stops at what the MXQ takes."
+        if changed
+        else "The tokenizer files ({files}, where present) are the base model's, unchanged."
+    ).format(files=", ".join(f"`{n}`" for n in TOKENIZER_FILES))
     what = "sentence embedding model" if kind == "embedder" else "reranker (cross-encoder)"
     runs = (
         "The embedding lookup runs on the host and the encoder on the NPU; the host then pools the last hidden state."
@@ -208,7 +216,6 @@ def model_card(
             parts += [note, ""]
         sections.append("\n".join(parts))
     body = "\n".join(sections)
-    tokenizer_files = ", ".join(f"`{n}`" for n in TOKENIZER_FILES)
     return f"""---
 library_name: transformers
 license: apache-2.0
@@ -252,7 +259,8 @@ environment.
   `{spec['proxy'].name}`). The tokenizer is the base model's own.
 - Core modes: {mode_text}. Pass `core_mode=` (with `target_clusters=` or `target_cores=`) to `from_pretrained` to
   pick one.
-- Sequences of up to {max_length:,} tokens. Each sequence of a batch runs on its own, without its padding.
+- Sequences of up to {max_length:,} tokens. Each sequence of a batch runs on its own, without its padding; with
+  several launched slots (`max_batch_size=`), the sequences spread over them.
 
 {body}
 ## Licence
@@ -260,8 +268,7 @@ environment.
 The base model, [{base_model}](https://huggingface.co/{base_model}), is licensed under the Apache License 2.0. This
 repository is a derivative work under the same licence. Changes: the encoder is quantized and compiled into
 `{mxq_name}`; `model.safetensors` holds the base model's embedding-layer weights only, unchanged; `config.json` and
-`{spec['proxy'].name}` are new files for `transformers-mblt`. The tokenizer files ({tokenizer_files}, where present)
-are the base model's, unchanged.
+`{spec['proxy'].name}` are new files for `transformers-mblt`. {tokenizer_note}
 """
 
 
@@ -294,16 +301,26 @@ def build(
     save_file(embedding_weights(upstream, KINDS[kind]["prefix"]), str(out / "model.safetensors"),
               metadata={"format": "pt"})
     os.chmod(out / "model.safetensors", 0o644)
-    for name in TOKENIZER_FILES:
-        if (upstream / name).is_file():
-            shutil.copyfile(upstream / name, out / name)
-    shutil.copyfile(KINDS[kind]["proxy"], out / KINDS[kind]["proxy"].name)
-    shutil.copyfile(mxq, out / mxq_name)
     positions = int(upstream_config["max_position_embeddings"])
     if kind == "reranker":
         positions -= int(upstream_config.get("pad_token_id", 1)) + 1
     max_length = min(positions, _mxq_length(mxq))
-    card = model_card(kind, repo_id, base_model, revision, mxq_name, modes, max_length, facts)
+    tokenizer_changes = []
+    for name in TOKENIZER_FILES:
+        if (upstream / name).is_file():
+            shutil.copyfile(upstream / name, out / name)
+    # Truncation without max_length stops at model_max_length, which must not exceed what the MXQ takes.
+    tokenizer_config = json.loads((out / "tokenizer_config.json").read_text(encoding="utf-8"))
+    original = tokenizer_config.get("model_max_length")
+    if not isinstance(original, (int, float)) or original > max_length:
+        tokenizer_config["model_max_length"] = max_length
+        (out / "tokenizer_config.json").write_text(
+            json.dumps(tokenizer_config, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+        tokenizer_changes.append(f"`tokenizer_config.json`: `model_max_length` {original} -> {max_length}")
+    shutil.copyfile(KINDS[kind]["proxy"], out / KINDS[kind]["proxy"].name)
+    shutil.copyfile(mxq, out / mxq_name)
+    card = model_card(kind, repo_id, base_model, revision, mxq_name, modes, max_length, facts, tokenizer_changes)
     (out / "README.md").write_text(card, encoding="utf-8")
     return out
 

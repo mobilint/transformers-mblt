@@ -13,7 +13,7 @@ from transformers.models.xlm_roberta.modeling_xlm_roberta import XLMRobertaEmbed
 from transformers.processing_utils import Unpack
 from transformers.utils.generic import TransformersKwargs
 
-from ...utils.encoder_utils import infer_sequence, mxq_max_length, unpadded_positions
+from ...utils.encoder_utils import encode_rows, mxq_max_length
 from ...utils.modeling_utils import MobilintModelMixin
 from .configuration_xlm_roberta import MobilintXLMRobertaConfig
 
@@ -41,7 +41,8 @@ class MobilintXLMRobertaForSequenceClassification(MobilintModelMixin, MobilintXL
     """``logits`` ``(batch, num_labels)``; for a BGE reranker, ``sigmoid(logit)`` is the relevance score.
 
     Each sequence runs without its padding, so its positions start at ``pad_token_id + 1`` as upstream's do. The MXQ
-    takes up to :attr:`max_length` tokens. No loss is computed: ``labels`` is not supported.
+    takes up to :attr:`max_length` tokens; with several launched slots, the rows of a batch spread over them. No loss
+    is computed: ``labels`` is not supported.
     """
 
     def __init__(self, config: MobilintXLMRobertaConfig, *args, **kwargs) -> None:
@@ -77,15 +78,17 @@ class MobilintXLMRobertaForSequenceClassification(MobilintModelMixin, MobilintXL
             raise ValueError("labels are not supported: the NPU model runs inference only")
         if kwargs.get("inputs_embeds") is not None or kwargs.get("position_ids") is not None:
             raise ValueError("inputs_embeds and position_ids are not supported: positions restart in every sequence")
-        mxq_model = self.npu_backend.mxq_models[0]
-        limit = self.max_length
+        rows = encode_rows(
+            self.npu_backend.mxq_models,
+            input_ids,
+            attention_mask,
+            token_type_ids,
+            self.roberta.embeddings,
+            self.max_length,
+        )
         logits = torch.empty(input_ids.shape[0], self.num_labels, dtype=torch.float32)
-        for row, positions in enumerate(unpadded_positions(input_ids, attention_mask)):
-            if len(positions) > limit:
-                raise ValueError(f"a sequence has {len(positions)} tokens; this model takes at most {limit}")
-            types = None if token_type_ids is None else token_type_ids[row, positions][None]
-            x = self.roberta.embeddings(input_ids=input_ids[row, positions][None], token_type_ids=types)
-            out = infer_sequence(mxq_model, x).reshape(-1)
+        for row, (_, out) in enumerate(rows):
+            out = out.reshape(-1)
             if out.size != self.num_labels:
                 raise RuntimeError(f"the MXQ returned {out.size} values for {self.num_labels} labels")
             logits[row] = torch.from_numpy(out)
