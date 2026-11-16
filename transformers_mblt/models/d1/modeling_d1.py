@@ -64,6 +64,17 @@ def is_unsafe_length(length: int, core_mode: str) -> bool:
     return core_mode not in _SAFE_CORE_MODES and length % 64 in _UNSAFE_RESIDUES
 
 
+_HUB_KWARGS = ("cache_dir", "token", "local_files_only", "force_download")
+_VOCAB_BLOCK = 8192
+
+
+def _vocab_logits(weight: torch.Tensor, hidden: np.ndarray) -> torch.Tensor:
+    """``weight @ hidden`` over the whole vocabulary in float32, a block of rows at a time: no float32 copy of the
+    (bf16) table is made, only of one block."""
+    h = torch.from_numpy(np.ascontiguousarray(hidden, dtype=np.float32))
+    return torch.cat([weight[i : i + _VOCAB_BLOCK].float() @ h for i in range(0, weight.shape[0], _VOCAB_BLOCK)])
+
+
 @dataclass(frozen=True)
 class Chunk:
     """One infer call: ``real`` tokens from ``offset``, followed by ``pad`` zero rows."""
@@ -197,7 +208,21 @@ class MobilintD1Model(MobilintModelMixin, MobilintD1PreTrainedModel):
 
     @property
     def dtype(self) -> torch.dtype:
-        return torch.float32
+        """The dtype of the host embedding table (bf16 with Transformers 5's ``dtype="auto"``); the NPU takes float32
+        embeddings and the readout runs in float32 either way."""
+        return self.embed_tokens.weight.dtype
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path: Any, *model_args: Any, **kwargs: Any) -> "MobilintD1Model":
+        """As every Mobilint model; the Hub arguments (``cache_dir``, ``token``, ``local_files_only``, ...) also reach
+        the tokenizer and ``prompt.py``, which the model loads on first use."""
+        hub = {key: kwargs[key] for key in _HUB_KWARGS if kwargs.get(key) is not None}
+        model = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
+        model._hub_kwargs = hub
+        return model
+
+    def _hub(self) -> dict[str, Any]:
+        return dict(self.__dict__.get("_hub_kwargs") or {})
 
     # -- tokenizer and prompt ---------------------------------------------------------------------------
 
@@ -210,7 +235,9 @@ class MobilintD1Model(MobilintModelMixin, MobilintD1PreTrainedModel):
         if self._tokenizer is None:
             from transformers import AutoTokenizer
 
-            self._tokenizer = AutoTokenizer.from_pretrained(self.config.name_or_path, revision=self._revision())
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                self.config.name_or_path, **{**self._hub(), "revision": self._revision()}
+            )
         return self._tokenizer
 
     @tokenizer.setter
@@ -222,7 +249,8 @@ class MobilintD1Model(MobilintModelMixin, MobilintD1PreTrainedModel):
     def prompt_module(self) -> Any:
         """The checkpoint's ``prompt.py``, imported from the model folder or the repository snapshot on first use."""
         if self._prompt_module is None:
-            self._prompt_module = load_prompt_module(resolve_prompt_file(self.config.name_or_path, self._revision()))
+            path = resolve_prompt_file(self.config.name_or_path, self._revision(), **self._hub())
+            self._prompt_module = load_prompt_module(path)
         return self._prompt_module
 
     @prompt_module.setter
@@ -348,8 +376,7 @@ class MobilintD1Model(MobilintModelMixin, MobilintD1PreTrainedModel):
         calibration = getattr(self, "calibration", None)
         if calibration is not None:
             # A calibration hook sees log-probabilities, as upstream; the softmax alone is shift-invariant.
-            logits = torch.from_numpy(weight.float().cpu().numpy() @ hidden)
-            values = values - float(torch.logsumexp(logits, dim=0))
+            values = values - float(torch.logsumexp(_vocab_logits(weight, hidden), dim=0))
         return self.prompter.probabilities(q, dict(zip(selected, values.tolist())), calibration)
 
     # -- NPU ----------------------------------------------------------------------------------------------
@@ -572,7 +599,7 @@ class MobilintD1Model(MobilintModelMixin, MobilintD1PreTrainedModel):
             self._context = None
             self.get_mxq_model().reset_fixed_tail_cache_memory()
             hidden = torch.from_numpy(self._infer(self._embed(ids), 0, final=True))
-        logits = self.embed_tokens.weight.detach().float() @ hidden
+        logits = _vocab_logits(self.embed_tokens.weight.detach(), hidden.numpy())
         return CausalLMOutputWithPast(logits=cast(torch.FloatTensor, logits.view(1, 1, -1)))
 
 

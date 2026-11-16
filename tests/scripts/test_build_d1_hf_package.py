@@ -164,7 +164,9 @@ def test_build_writes_the_hub_layout(tmp_path: Path) -> None:
     assert (out / "proxy_d1.py").read_text() == (_REPO_ROOT / "transformers_mblt/models/d1/proxy_d1.py").read_text()
     card = (out / "README.md").read_text()
     assert "license_name: lfm1.0" in card and f"pipeline_tag: {build.D1_TASK}" in card
-    assert "base_model_relation: quantized" in card and "- custom_code" in card
+    assert "base_model_relation: quantized" in card and "- custom_code" in card and "- transformers" in card
+    # The Mobilint header and About section every mobilint/* card opens with.
+    assert card.index("Mobilint_Logo_Primary.png") < card.index("# About") < card.index("# d1-3B for Mobilint NPUs")
     assert f'pip install "transformers-mblt>={build.MIN_TRANSFORMERS_MBLT}"' in card
     assert "Liquid AI, Inc." in card and "## Requirements" in card and "## Pictures" in card
     assert "text-only" not in card.lower() and "text only" not in card.lower()

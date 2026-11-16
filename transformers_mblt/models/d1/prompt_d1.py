@@ -26,8 +26,11 @@ _LOADED: dict[str, ModuleType] = {}
 _LOAD_LOCK = threading.Lock()
 
 
-def resolve_prompt_file(name_or_path: str | os.PathLike, revision: Optional[str] = None) -> Path:
-    """The ``prompt.py`` of a local model folder, or of a Hub repository's snapshot (downloaded on first use)."""
+def resolve_prompt_file(name_or_path: str | os.PathLike, revision: Optional[str] = None, **hub: Any) -> Path:
+    """The ``prompt.py`` of a local model folder, or of a Hub repository's snapshot (downloaded on first use).
+
+    ``hub`` holds ``hf_hub_download`` arguments such as ``cache_dir``, ``token`` and ``local_files_only``.
+    """
     folder = Path(name_or_path)
     if folder.is_dir():
         path = folder / PROMPT_FILE
@@ -39,7 +42,7 @@ def resolve_prompt_file(name_or_path: str | os.PathLike, revision: Optional[str]
         return path
     from huggingface_hub import hf_hub_download
 
-    return Path(hf_hub_download(str(name_or_path), PROMPT_FILE, revision=revision))
+    return Path(hf_hub_download(str(name_or_path), PROMPT_FILE, revision=revision, **hub))
 
 
 def load_prompt_module(path: str | os.PathLike) -> ModuleType:

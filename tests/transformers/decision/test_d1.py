@@ -273,6 +273,52 @@ def test_prompt_py_is_loaded_from_the_model_folder(tmp_path: Path) -> None:
         load_prompt_module(tmp_path / "other.py")
 
 
+def test_hub_arguments_reach_the_tokenizer_and_prompt_py(monkeypatch, tmp_path: Path) -> None:
+    import huggingface_hub
+    import transformers
+
+    from transformers_mblt.utils.modeling_utils import MobilintModelMixin
+
+    model, _, _ = make_model(FakeTokenizer(), vocab=64)
+    model.config.name_or_path = "mobilint/d1-3B"
+    monkeypatch.setattr(
+        MobilintModelMixin, "from_pretrained", classmethod(lambda cls, name, *a, **kw: model), raising=False
+    )
+    hub = {"cache_dir": str(tmp_path), "token": "t", "local_files_only": True}
+    assert MobilintD1Model.from_pretrained("mobilint/d1-3B", core_mode="global8", **hub) is model
+
+    seen: dict[str, dict] = {}
+
+    def download(repo, filename, revision=None, **kw):
+        seen["prompt"] = kw
+        return str(FIXTURE_PROMPT)
+
+    def tokenizer(name, **kw):
+        seen["tokenizer"] = kw
+        return FakeTokenizer()
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", download)
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", tokenizer)
+    model.tokenizer, model.prompt_module = None, None
+    assert model.prompter is not None
+    assert seen["prompt"] == hub
+    assert {k: seen["tokenizer"][k] for k in hub} == hub
+
+
+def test_full_vocabulary_logits_are_blocked_float32(monkeypatch) -> None:
+    from transformers_mblt.models.d1 import modeling_d1
+
+    monkeypatch.setattr(modeling_d1, "_VOCAB_BLOCK", 7)
+    weight = torch.randn(50, 8).to(torch.bfloat16)
+    hidden = np.random.default_rng(0).standard_normal(8).astype(np.float32)
+    logits = modeling_d1._vocab_logits(weight, hidden)
+    assert logits.dtype == torch.float32 and logits.shape == (50,)
+    assert torch.allclose(logits, weight.float() @ torch.from_numpy(hidden), atol=1e-5)
+    model, _, _ = make_model(FakeTokenizer(), vocab=64)
+    model.embed_tokens.to(torch.bfloat16)
+    assert model.dtype == torch.bfloat16
+
+
 def test_loading_prompt_py_writes_no_bytecode(tmp_path: Path) -> None:
     # A model folder or Hub snapshot stays as downloaded: no __pycache__ appears beside prompt.py.
     source = FIXTURE_PROMPT.read_bytes() + b"\nLOADED_FROM_TMP = True\n"
@@ -818,9 +864,13 @@ def upstream() -> SimpleNamespace:
         runner = importlib.import_module(f"{package}.runner")
     except ImportError as exc:
         pytest.skip(f"the upstream runner does not import here: {exc}")
-    from transformers import AutoTokenizer
+    from transformers import PreTrainedTokenizerFast
 
-    tokenizer = AutoTokenizer.from_pretrained(str(snapshot))
+    # The snapshot names TokenizersBackend, a Transformers 5 class; its tokenizer.json loads as the fast class anywhere.
+    try:
+        tokenizer = PreTrainedTokenizerFast.from_pretrained(str(snapshot))
+    except Exception as exc:  # noqa: BLE001 - any loader failure means the parity check cannot run here
+        pytest.skip(f"the upstream tokenizer does not load here: {exc}")
     # What the model loads at runtime: the checkpoint's prompt.py, imported on its own.
     loaded = load_prompt_module(snapshot / "prompt.py")
     prompter = D1Prompter(loaded, tokenizer, "json_only", "none", "desc", "")
