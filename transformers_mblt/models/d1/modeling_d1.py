@@ -1,0 +1,606 @@
+"""Mobilint D1: LiquidAI's d1 decision model with its LFM2 text graph and its vision graph on the NPU.
+
+A decision reads a state (text, JSON, pictures, or pictures alone) and a set of questions and returns calibrated, typed
+answers in one forward pass with no generated tokens. The text graph maps ``inputs_embeds`` to the final hidden state;
+the host looks the tokens up in the embedding table and scores each option with the tied LM head rows of its tokens, so
+no full-vocabulary head runs.
+
+A picture is letterboxed on the host (:mod:`.image_processing_d1`) and encoded by the vision graph (vision tower and
+projector) into one feature row per image token; those rows replace the embeddings of the picture's image tokens in
+``inputs_embeds``. The pictures' markup opens the user turn, as the checkpoint's chat template writes it, so the
+pictures are part of the state prefix. Both graphs run in the same core mode. A model folder without a vision MXQ is
+text-only and rejects pictures.
+
+Several questions on one state are a tree: the state prefix (the trunk) is prefilled once, and each question (a
+branch) continues from it. The LFM2 short-convolution layers keep their state in qbruntime ``FixedTailCache``
+buffers, which are snapshotted after the trunk and restored before every branch. A branch only writes KV at positions
+past the trunk, so the trunk's attention KV is reused as it is. The last trunk stays on the device, so a later request
+on the same state skips its prefill.
+
+LFM2 hybrid graphs hang the NPU in the global core modes for infer calls whose length is ``0`` or ``63`` modulo 64.
+Calls are planned so no call has such a length: a prefill of real tokens is split into safe calls, and only a
+branch's final call may get trailing zeros instead. Zeros land in KV slots
+past the branch's end, which the causal graph never reads and the next branch overwrites. ``single`` core mode has no
+such restriction, so its calls use the full chunk width.
+
+The prompt format and the option readout are the checkpoint's own ``prompt.py``, loaded from the model folder (or the
+Hub snapshot) at runtime; :mod:`.prompt_d1` only arranges its calls.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import threading
+from collections.abc import Mapping, Sequence
+from copy import deepcopy
+from dataclasses import dataclass
+from typing import Any, Optional, cast
+
+import numpy as np
+import qbruntime
+import torch
+import torch.nn as nn
+from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.modeling_utils import PreTrainedModel
+from transformers.models.auto.modeling_auto import AutoModel
+from transformers.utils.generic import logging
+
+from ..._npu import MobilintNPUBackend
+from ...utils.modeling_utils import MobilintModelMixin
+from .configuration_d1 import MobilintD1Config
+from .image_processing_d1 import patchify
+from .prompt_d1 import D1Prompter, answer, load_prompt_module, resolve_prompt_file
+
+logger = logging.get_logger(__name__)
+
+# Infer-call lengths that hang LFM2 hybrid graphs in the global core modes (length % 64).
+_UNSAFE_RESIDUES = (0, 63)
+_SAFE_CORE_MODES = ("single",)
+
+
+def is_unsafe_length(length: int, core_mode: str) -> bool:
+    """Whether an infer call of ``length`` tokens may hang an LFM2 graph in ``core_mode``."""
+    return core_mode not in _SAFE_CORE_MODES and length % 64 in _UNSAFE_RESIDUES
+
+
+_HUB_KWARGS = ("cache_dir", "token", "local_files_only", "force_download")
+_VOCAB_BLOCK = 8192
+
+
+def _vocab_logits(weight: torch.Tensor, hidden: np.ndarray) -> torch.Tensor:
+    """``weight @ hidden`` over the whole vocabulary in float32, a block of rows at a time: no float32 copy of the
+    (bf16) table is made, only of one block."""
+    h = torch.from_numpy(np.ascontiguousarray(hidden, dtype=np.float32))
+    return torch.cat([weight[i : i + _VOCAB_BLOCK].float() @ h for i in range(0, weight.shape[0], _VOCAB_BLOCK)])
+
+
+@dataclass(frozen=True)
+class Chunk:
+    """One infer call: ``real`` tokens from ``offset``, followed by ``pad`` zero rows."""
+
+    offset: int
+    real: int
+    pad: int = 0
+
+
+def plan_chunks(
+    length: int, max_chunk: int, core_mode: str, pad_last: bool = False, pad_budget: int = 2
+) -> list[Chunk]:
+    """Split ``length`` tokens into infer calls of at most ``max_chunk`` tokens, none of an unsafe length.
+
+    Real tokens are never separated by padding. Only a final branch (``pad_last``) may be padded, within
+    ``pad_budget`` KV slots; otherwise an unsafe remainder is split into two safe calls of real tokens. A trunk is
+    never padded, since the next branch starts right after it.
+    """
+    chunks: list[Chunk] = []
+    offset = 0
+    while offset < length:
+        remaining = length - offset
+        if pad_last:
+            pad = 0
+            while is_unsafe_length(remaining + pad, core_mode):
+                pad += 1
+            if pad <= pad_budget and remaining + pad <= max_chunk:
+                chunks.append(Chunk(offset, remaining, pad))
+                break
+        take = min(remaining, max_chunk)
+        while take and is_unsafe_length(take, core_mode):
+            take -= 1
+        if not take:
+            raise ValueError(f"an infer call of at most {max_chunk} tokens cannot have a safe nonempty length")
+        chunks.append(Chunk(offset, take))
+        offset += take
+    return chunks
+
+
+@dataclass
+class _DeviceContext:
+    """The trunk whose KV the device holds: its token ids, its pictures and the short-convolution state after it."""
+
+    ids: tuple[int, ...]
+    snapshot: Optional[dict[str, Any]]
+    pictures: tuple[str, ...] = ()
+
+
+@dataclass
+class _Pictures:
+    """One request's pictures: their vision MXQ inputs, a digest of each, and their features once encoded."""
+
+    pixels: list[np.ndarray]
+    digests: tuple[str, ...]
+    features: Optional[np.ndarray] = None
+
+    @classmethod
+    def of(cls, pixels: list[np.ndarray]) -> "_Pictures":
+        return cls(pixels, tuple(hashlib.sha256(p.tobytes()).hexdigest() for p in pixels))
+
+
+def _image_list(images: Any) -> list:
+    """A request's pictures as a list; one picture (an image, a path or an array) counts as a list of one."""
+    if images is None:
+        return []
+    if isinstance(images, (str, os.PathLike, np.ndarray)) or hasattr(images, "convert"):
+        return [images]
+    return list(images)
+
+
+class MobilintD1PreTrainedModel(PreTrainedModel):
+    config: MobilintD1Config
+    config_class = MobilintD1Config
+    base_model_prefix = "model"
+    main_input_name = "input_ids"
+    input_modalities = ("image", "text")
+    supports_gradient_checkpointing = False
+    _no_split_modules = []
+    _supports_flash_attn = False
+    _supports_sdpa = False
+    _can_compile_fullgraph = False
+    _supports_attention_backend = False
+    _can_record_outputs = {}
+
+    def _init_weights(self, module: nn.Module) -> None:
+        """The embedding is read from the checkpoint; nothing is initialized randomly."""
+
+
+class MobilintD1Model(MobilintModelMixin, MobilintD1PreTrainedModel):
+    """D1 decisions on the NPU, with the System One API of ``LiquidAI/d1-3B``.
+
+    - :meth:`system_one` and :meth:`system_one_batch` return typed answers per named question.
+    - :meth:`probabilities` and :meth:`probabilities_batch` return each question's distribution over its options
+      (``yes``, ``no`` for a noul), in the question order.
+    - :meth:`run` is the primitive under them: each ``(state, questions, images)`` request's probabilities and the
+      number of tokens it read.
+
+    ``images`` is a list of pictures (``PIL.Image``, file paths or uint8 arrays). Each is letterboxed into one
+    ``image_size`` square and read as ``image_tokens`` image tokens at the head of the user turn; upstream's
+    processor instead tiles large pictures. A folder without a vision MXQ (``config.vision_mxq_path``) is text-only
+    and raises ``NotImplementedError`` for pictures.
+
+    Requests run one after another on one MXQ, so ``max_batch_size`` stays 1. The device holds one request's state at
+    a time, so a lock serializes requests: calls from several threads are safe and run one by one.
+
+    The checkpoint's tokenizer and its ``prompt.py`` are loaded from the model folder (or the Hub snapshot) on first
+    use; assign :attr:`tokenizer` or :attr:`prompt_module` to supply them. Set :attr:`calibration` to an object with
+    the upstream ``apply(question, scores)`` hook to calibrate the option scores, as upstream's ``calibration=``.
+    Not provided: upstream's ``plan_batches`` / ``token_budget`` and ``compile`` options, which concern its GPU
+    batching.
+    """
+
+    config: MobilintD1Config
+    config_class = MobilintD1Config
+
+    def __init__(self, config: MobilintD1Config, *args: Any, **kwargs: Any) -> None:
+        super().__init__(config, *args, **kwargs)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self._tokenizer: Any = None
+        self._prompt_module: Any = None
+        self._prompter: Optional[D1Prompter] = None
+        self.calibration: Any = None
+        self._context: Optional[_DeviceContext] = None
+        self._tail_cache_names: Optional[list[str]] = None
+
+    def get_input_embeddings(self) -> nn.Module:
+        return self.embed_tokens
+
+    def set_input_embeddings(self, value: nn.Module) -> None:
+        self.embed_tokens = value
+
+    @property
+    def dtype(self) -> torch.dtype:
+        """The dtype of the host embedding table (bf16 with Transformers 5's ``dtype="auto"``); the NPU takes float32
+        embeddings and the readout runs in float32 either way."""
+        return self.embed_tokens.weight.dtype
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path: Any, *model_args: Any, **kwargs: Any) -> "MobilintD1Model":
+        """As every Mobilint model; the Hub arguments (``cache_dir``, ``token``, ``local_files_only``, ...) also reach
+        the tokenizer and ``prompt.py``, which the model loads on first use."""
+        hub = {key: kwargs[key] for key in _HUB_KWARGS if kwargs.get(key) is not None}
+        model = super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
+        model._hub_kwargs = hub
+        return model
+
+    def _hub(self) -> dict[str, Any]:
+        return dict(self.__dict__.get("_hub_kwargs") or {})
+
+    # -- tokenizer and prompt ---------------------------------------------------------------------------
+
+    def _revision(self) -> Optional[str]:
+        return getattr(self.config, "revision", None) or getattr(self.config, "_commit_hash", None)
+
+    @property
+    def tokenizer(self) -> Any:
+        """The checkpoint's tokenizer, loaded from the model folder or repository on first use."""
+        if self._tokenizer is None:
+            from transformers import AutoTokenizer
+
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                self.config.name_or_path, **{**self._hub(), "revision": self._revision()}
+            )
+        return self._tokenizer
+
+    @tokenizer.setter
+    def tokenizer(self, value: Any) -> None:
+        self._tokenizer = value
+        self._prompter = None
+
+    @property
+    def prompt_module(self) -> Any:
+        """The checkpoint's ``prompt.py``, imported from the model folder or the repository snapshot on first use."""
+        if self._prompt_module is None:
+            path = resolve_prompt_file(self.config.name_or_path, self._revision(), **self._hub())
+            self._prompt_module = load_prompt_module(path)
+        return self._prompt_module
+
+    @prompt_module.setter
+    def prompt_module(self, value: Any) -> None:
+        self._prompt_module = value
+        self._prompter = None
+
+    @property
+    def prompter(self) -> D1Prompter:
+        """Calls :attr:`prompt_module` with :attr:`tokenizer` and the config's prompt settings."""
+        if self._prompter is None:
+            self._prompter = D1Prompter(
+                self.prompt_module,
+                self.tokenizer,
+                state_style=self.config.state_style,
+                system=self.config.system,
+                option_style=self.config.option_style,
+                lead=self.config.lead,
+            )
+        return self._prompter
+
+    def _lock(self) -> threading.RLock:
+        # Created on first use: MobilintModelMixin.__init__ launches the backend before this class's __init__ runs.
+        return self.__dict__.setdefault("_request_lock", threading.RLock())
+
+    def render(self, state: Any, question: Any) -> str:
+        """The whole prompt of one question over a text ``state``, as the checkpoint's ``prompt.py`` renders it."""
+        return self.prompter.render(state, self.prompter.question(question))
+
+    def image_markup(self, count: int) -> str:
+        """The expanded markup of ``count`` pictures: each picture's image tokens between its start and end tokens."""
+        config = self.config
+        return (config.image_start_token + config.image_token * config.image_tokens + config.image_end_token) * count
+
+    @property
+    def has_vision(self) -> bool:
+        """Whether the model folder has a vision MXQ, so that requests may hold pictures."""
+        return bool(getattr(self.config, "vision_mxq_path", None))
+
+    def tokens(self, state: Any, questions: Sequence[Any]) -> int:
+        """The longest prompt one of ``questions`` makes over a text ``state``: its state's tokens and its own.
+
+        As upstream, pictures are not counted: each adds ``image_tokens + 2`` tokens to the prompt.
+        """
+        return self.prompter.tokens(state, [self.prompter.question(q) for q in questions])
+
+    # -- System One API ---------------------------------------------------------------------------------
+
+    def probabilities(
+        self, state: Any, questions: Sequence[Any], images: Optional[Sequence] = None
+    ) -> list[list[float]]:
+        """Each question's distribution over its options (``yes``, ``no`` for a noul), in one pass."""
+        return self.run([(state, list(questions), images)])[0][0]
+
+    def probabilities_batch(self, requests: Sequence[tuple]) -> list[list[list[float]]]:
+        """:meth:`probabilities` for many ``(state, questions[, images])`` requests."""
+        reqs = [(r[0], list(r[1]), r[2] if len(r) > 2 else None) for r in requests]
+        return [probs for probs, _ in self.run(reqs)]
+
+    def system_one(self, state: Any, questions: Mapping[str, Any], images: Optional[Sequence] = None) -> dict:
+        """Named questions over one state and its pictures: ``{"answers": {name: answer}, "usage": {...}}``.
+
+        A state is a string, any JSON value, or ``None`` (with pictures alone, or nothing).
+        """
+        return self.system_one_batch([(state, questions, images)])[0]
+
+    def system_one_batch(self, requests: Sequence[tuple]) -> list[dict]:
+        """Many ``(state, questions)`` or ``(state, questions, images)`` requests, one response each."""
+        named = [
+            (r[0], {name: self.prompter.question(q) for name, q in r[1].items()}, r[2] if len(r) > 2 else None)
+            for r in requests
+        ]
+        done = self.run([(state, list(qs.values()), images) for state, qs, images in named])
+        return [
+            {
+                "answers": {name: answer(q, p) for (name, q), p in zip(qs.items(), probs)},
+                "usage": {"input_tokens": read, "output_tokens": 0},
+            }
+            for (_, qs, _), (probs, read) in zip(named, done)
+        ]
+
+    @torch.inference_mode()
+    def run(self, requests: Sequence[tuple[Any, Sequence[Any], Sequence]]) -> list[tuple[list[list[float]], int]]:
+        """Each ``(state, questions, images)`` request's probabilities, in its questions' order, and the tokens it read.
+
+        Requests run in order; consecutive requests on the same state and pictures reuse its prefill. Pictures are
+        preprocessed before the request takes the model's lock, which it holds from the vision encoding (or its
+        prefill) to its last readout.
+        """
+        reqs = [(state, list(questions), _image_list(images)) for state, questions, images in requests]
+        for _, questions, images in reqs:
+            if images and not self.has_vision:
+                raise NotImplementedError(
+                    "this D1 model folder is text-only: its config has no vision_mxq_path, so pictures cannot be "
+                    "part of the state. Load an image+text D1 folder, or describe the picture in the text state."
+                )
+        out = []
+        for state, questions, images in reqs:
+            qs = [self.prompter.question(q) for q in questions]
+            pictures = self._preprocess(images) if images else None
+            rows, shared, read = self.prompter.request_rows(state, qs, self.image_markup(len(images)))
+            if not qs:
+                # As upstream: no question reads nothing on the device and answers nothing.
+                out.append(([], read))
+                continue
+            with self._lock():
+                hidden = self._decide(rows, shared, pictures)
+            out.append(([self._readout(q, h) for q, h in zip(qs, hidden)], read))
+        return out
+
+    def _preprocess(self, images: Sequence[Any]) -> _Pictures:
+        config = self.config
+        return _Pictures.of([patchify(image, config.image_size, config.patch_size) for image in images])
+
+    def _readout(self, q: Any, hidden: np.ndarray) -> list[float]:
+        """The checkpoint's readout over the answer slot's scores of the option tokens."""
+        groups = self.prompter.readout_ids(q)
+        selected = sorted({t for g in groups for t in g})
+        weight = self.embed_tokens.weight.detach()
+        values = weight[torch.tensor(selected)].float().cpu().numpy() @ hidden
+        if not np.isfinite(values).all():
+            raise RuntimeError("the option readout is not finite")
+        calibration = getattr(self, "calibration", None)
+        if calibration is not None:
+            # A calibration hook sees log-probabilities, as upstream; the softmax alone is shift-invariant.
+            values = values - float(torch.logsumexp(_vocab_logits(weight, hidden), dim=0))
+        return self.prompter.probabilities(q, dict(zip(selected, values.tolist())), calibration)
+
+    # -- NPU ----------------------------------------------------------------------------------------------
+
+    @property
+    def kv_capacity(self) -> int:
+        """KV positions the MXQ holds (the longest prompt a decision can read)."""
+        capacity = getattr(self.get_mxq_model().get_input_buffer_info()[0], "max_cache_size", 0)
+        return int(capacity) or int(self.config.max_position_embeddings)
+
+    def _max_chunk(self) -> int:
+        width = int(getattr(self.get_mxq_model().get_input_buffer_info()[0], "max_width", 0))
+        configured = self._coerce_positive_int(self._get_config_npu_prefill_chunk_size())
+        if configured is None:
+            return width
+        return min(configured, width) if width else configured
+
+    def _tail_names(self) -> list[str]:
+        if self._tail_cache_names is None:
+            names = [
+                info.name
+                for info in self.get_mxq_model().get_cache_infos()
+                if info.cache_type == qbruntime.CacheType.FixedTailCache
+            ]
+            if not names:
+                raise RuntimeError("the D1 MXQ exposes no FixedTailCache; it was not compiled with a KV cache graph")
+            self._tail_cache_names = names
+        return self._tail_cache_names
+
+    def get_vision_mxq_model(self) -> Any:
+        """The launched vision MXQ (``qbruntime.Model``)."""
+        backend = self.__dict__.get("vision_npu_backend")
+        if backend is None:
+            raise RuntimeError("the D1 vision MXQ is not launched; call launch() first")
+        return backend.mxq_model
+
+    def _vision_backend(self) -> MobilintNPUBackend:
+        """A backend for the vision MXQ on the text backend's device, core mode and targets."""
+        data = self.npu_backend.to_dict()
+        data.update(mxq_path=self.config.vision_mxq_path, max_batch_size=1)
+        return MobilintNPUBackend.from_dict(data)
+
+    def _features(self, pictures: _Pictures) -> np.ndarray:
+        """The vision MXQ's features of every picture, ``image_tokens`` rows each, encoded once per request."""
+        if pictures.features is None:
+            config = self.config
+            mxq_model = self.get_vision_mxq_model()
+            shape = tuple(mxq_model.get_model_input_shape()[0])
+            rows = []
+            for pixels in pictures.pixels:
+                if pixels.size != int(np.prod(shape)):
+                    raise ValueError(
+                        f"the vision MXQ takes {shape}; image_size {config.image_size} and patch_size "
+                        f"{config.patch_size} give {pixels.shape[1:]}. The config does not match the vision MXQ."
+                    )
+                raw = np.asarray(mxq_model.infer([pixels.reshape(shape)])[0])
+                if not np.issubdtype(raw.dtype, np.floating):
+                    raise RuntimeError("the D1 vision MXQ must return dequantized floating-point features")
+                if raw.size != config.image_tokens * config.hidden_size:
+                    raise RuntimeError(
+                        f"the D1 vision MXQ returned {raw.shape}; the config expects {config.image_tokens} image "
+                        f"tokens of width {config.hidden_size}"
+                    )
+                features = raw.astype(np.float32, copy=False).reshape(config.image_tokens, config.hidden_size)
+                if not np.all(np.isfinite(features)):
+                    raise RuntimeError("the D1 vision MXQ returned non-finite features")
+                rows.append(features)
+            pictures.features = np.concatenate(rows)
+        return pictures.features
+
+    def _embed(self, ids: Sequence[int], pictures: Optional[_Pictures] = None, offset: int = 0) -> np.ndarray:
+        """``inputs_embeds`` of ``ids``; image tokens take the pictures' features, from feature row ``offset`` on."""
+        weight = self.embed_tokens.weight.detach()
+        x = np.array(weight[torch.tensor(list(ids), dtype=torch.long)].float().cpu().numpy(), dtype=np.float32)
+        if pictures is not None:
+            mask = np.asarray(ids, dtype=np.int64) == self.config.image_token_id
+            count = int(mask.sum())
+            if count:
+                x[mask] = self._features(pictures)[offset : offset + count]
+        return np.ascontiguousarray(x)
+
+    def _infer(self, x: np.ndarray, position: int, final: bool) -> np.ndarray:
+        """Prefill embeddings ``x`` from KV ``position`` in safe chunks; a final call returns its last hidden state."""
+        if final and not len(x):
+            raise ValueError("a branch needs at least one token")
+        capacity = self.kv_capacity
+        if position + len(x) > capacity:
+            raise ValueError(f"the prompt is {position + len(x)} tokens; this MXQ holds {capacity}. Shorten the state.")
+        core_mode = str(self.npu_backend.core_mode)
+        chunks = plan_chunks(
+            len(x), self._max_chunk(), core_mode, pad_last=final, pad_budget=capacity - position - len(x)
+        )
+        mxq_model = self.get_mxq_model()
+        output = None
+        for chunk in chunks:
+            segment = x[chunk.offset : chunk.offset + chunk.real]
+            if chunk.pad:
+                segment = np.pad(segment, ((0, chunk.pad), (0, 0)))
+            output = mxq_model.infer([np.ascontiguousarray(segment)[None]], cache_size=position + chunk.offset)
+        if not final:
+            return np.empty((0,), dtype=np.float32)
+        raw = np.asarray(cast(list, output)[0])
+        if not np.issubdtype(raw.dtype, np.floating):
+            raise RuntimeError("the D1 MXQ must return dequantized floating-point hidden states")
+        hidden = raw.astype(np.float32, copy=False).reshape(-1, self.config.hidden_size)[chunks[-1].real - 1]
+        if not np.all(np.isfinite(hidden)):
+            raise RuntimeError("the D1 MXQ returned non-finite hidden states")
+        return hidden.copy()
+
+    def _restore(self, context: _DeviceContext) -> None:
+        mxq_model = self.get_mxq_model()
+        if context.snapshot is None:
+            mxq_model.reset_fixed_tail_cache_memory()
+            return
+        for name, buffer in context.snapshot.items():
+            mxq_model.load_cache_memory_by_name(buffer, name)
+
+    def _snapshot(self) -> dict[str, Any]:
+        mxq_model = self.get_mxq_model()
+        return {name: deepcopy(mxq_model.dump_cache_memory_by_name(name)) for name in self._tail_names()}
+
+    def _set_trunk(self, ids: Sequence[int], pictures: Optional[_Pictures] = None) -> _DeviceContext:
+        """Make ``ids`` (with ``pictures``) the device trunk; the trunk already there is kept when it is the same."""
+        ids = tuple(ids)
+        digests = pictures.digests if pictures is not None else ()
+        if self._context is not None and self._context.ids == ids and self._context.pictures == digests:
+            return self._context
+        # A prefill that fails half way has already overwritten the device KV.
+        self._context = None
+        self.get_mxq_model().reset_fixed_tail_cache_memory()
+        snapshot = None
+        if ids:
+            self._infer(self._embed(ids, pictures), 0, final=False)
+            snapshot = self._snapshot()
+        self._context = _DeviceContext(ids, snapshot, digests)
+        return self._context
+
+    def _decide(
+        self, rows: Sequence[Sequence[int]], shared: int, pictures: Optional[_Pictures] = None
+    ) -> list[np.ndarray]:
+        """Final hidden state of every row, which share their first ``shared`` tokens (and hold ``pictures``)."""
+        longest = max(map(len, rows))
+        if longest > self.kv_capacity:
+            raise ValueError(f"the prompt is {longest} tokens; this MXQ holds {self.kv_capacity}. Shorten the state.")
+        image_id = self.config.image_token_id
+        if pictures is not None:
+            expected = len(pictures.pixels) * self.config.image_tokens
+            for row in rows:
+                if list(row).count(image_id) != expected:
+                    raise ValueError(
+                        f"the prompt holds {list(row).count(image_id)} image tokens for {len(pictures.pixels)} "
+                        f"pictures of {self.config.image_tokens} tokens each; the state or a question contains the "
+                        f"image token text {self.config.image_token!r}"
+                    )
+        # The trunk is the shared prefix; every branch keeps at least its last token, which is read out.
+        trunk = max(0, min(shared, min(map(len, rows)) - 1))
+        context = self._set_trunk(rows[0][:trunk], pictures)
+        hidden = []
+        for row in rows:
+            self._restore(context)
+            offset = list(row[:trunk]).count(image_id) if pictures is not None else 0
+            hidden.append(self._infer(self._embed(row[trunk:], pictures, offset), trunk, final=True))
+        return hidden
+
+    def reset_context(self) -> None:
+        """Forget the trunk held on the device; the next request prefills its state from scratch."""
+        with self._lock():
+            self._context = None
+
+    def launch(self) -> None:
+        """Launch the text MXQ and, when the folder has one, the vision MXQ in the same core mode."""
+        with self._lock():
+            self._context = None
+            if not getattr(self.npu_backend, "mxq_models", True):
+                # dispose() released the text MXQ's slots; load them again before launching.
+                self.npu_backend.create()
+            super().launch()
+            if not self.has_vision:
+                return
+            backend = self.__dict__.get("vision_npu_backend")
+            try:
+                if backend is None:
+                    backend = self._vision_backend()
+                    backend.create()
+                    self.vision_npu_backend = backend
+                backend.launch()
+            except BaseException:
+                # A model that failed to launch holds no NPU: during __init__ the caller has nothing to dispose.
+                self.__dict__.pop("vision_npu_backend", None)
+                if backend is not None:
+                    backend.dispose()
+                super().dispose()
+                raise
+
+    def dispose(self) -> None:
+        with self._lock():
+            self._context = None
+            backend = self.__dict__.pop("vision_npu_backend", None)
+            if backend is not None:
+                backend.dispose()
+            super().dispose()
+
+    # -- plain forward ------------------------------------------------------------------------------------
+
+    @torch.inference_mode()
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        **kwargs: Any,
+    ) -> CausalLMOutputWithPast:
+        """Next-token logits ``(1, 1, vocab_size)`` at the last position of one sequence ``(1, length)``.
+
+        The head is the tied embedding. Decisions should use :meth:`system_one`, which scores only the option tokens.
+        """
+        if input_ids is None or input_ids.ndim != 2 or input_ids.shape[0] != 1:
+            raise ValueError("Mobilint D1 forward takes input_ids of shape (1, length)")
+        ids = input_ids[0].tolist()
+        with self._lock():
+            self._context = None
+            self.get_mxq_model().reset_fixed_tail_cache_memory()
+            hidden = torch.from_numpy(self._infer(self._embed(ids), 0, final=True))
+        logits = _vocab_logits(self.embed_tokens.weight.detach(), hidden.numpy())
+        return CausalLMOutputWithPast(logits=cast(torch.FloatTensor, logits.view(1, 1, -1)))
+
+
+AutoModel.register(MobilintD1Config, MobilintD1Model)

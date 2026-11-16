@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import sys
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any, Callable
@@ -37,7 +38,45 @@ def list_default_model_ids(task: str, *, include_private: bool = False) -> list[
     """
     from transformers_mblt.utils import list_models
 
-    return list_models(tasks=task, include_private=include_private).get(task, [])
+    ids = list_models(tasks=task, include_private=include_private).get(task, [])
+    decision = _decision_model_ids(ids)
+    return [model_id for model_id in ids if model_id not in decision]
+
+
+def _decision_model_ids(ids: Sequence[str]) -> set[str]:
+    """The D1 decision models among ``ids``: they share ``image-text-to-text`` with the VLMs but never generate.
+
+    A model counts when its cached ``config.json`` has ``model_type: mobilint-d1`` or its Hub card carries the
+    ``decision`` tag.
+    """
+    import json
+
+    from huggingface_hub import HfApi, try_to_load_from_cache
+
+    found: set[str] = set()
+    cached: set[str] = set()
+    for model_id in ids:
+        path = try_to_load_from_cache(model_id, "config.json")
+        if isinstance(path, str):
+            cached.add(model_id)
+            try:
+                if json.loads(Path(path).read_text(encoding="utf-8")).get("model_type") == "mobilint-d1":
+                    found.add(model_id)
+            except (OSError, ValueError):
+                pass
+    try:
+        found.update(m.id for m in HfApi().list_models(author="mobilint", filter="decision") if m.id in ids)
+    except (HfHubHTTPError, OSError, ValueError) as exc:
+        # Offline, the ids come from the local cache, where a D1 model's config.json is found above. Online, a failed
+        # tag query leaves only the cached configs, so say which models stay unchecked.
+        unchecked = sorted(set(ids) - found - cached)
+        if unchecked:
+            print(
+                f"[warn] could not query the Hub for decision models ({exc}); {', '.join(unchecked)} have no cached "
+                "config.json and stay in the list. Pass --model to choose models explicitly.",
+                file=sys.stderr,
+            )
+    return found
 
 
 def normalize_repo_id(value: str) -> str:

@@ -514,6 +514,92 @@ the end-of-audio code. When `generate()` receives only `input_features` (the pip
 than the encoder window (10 s) is transcribed window by window and the tokens are joined; a prompt built by the
 processor for such a clip concatenates the windows' embeddings into one sequence instead.
 
+### D1 decision model
+
+`mobilint-d1` runs LiquidAI's [d1-3B](https://huggingface.co/LiquidAI/d1-3B) decision model. A decision reads a state
+(text, JSON, pictures, or pictures alone) and named questions and returns calibrated, typed answers in one forward pass
+with no generated tokens. The LFM2 text graph runs on the NPU and maps input embeddings to the final hidden state; the
+vision graph (vision tower and projector) runs on the NPU too and turns each picture into image-token features. The
+token embedding lookup, the picture preprocessing and the answer readout run on the host: each option is scored with
+the tied head rows of its tokens, and the answer is a softmax over the options. The model folder holds the two `.mxq`
+files (`d1-3B.mxq`, `d1-3B-vision.mxq`), `model.safetensors` with the embedding table, the tokenizer, and the
+checkpoint's unmodified `prompt.py` and `LICENSE`.
+
+The prompt format, the question classes, and the option readout are the checkpoint's own `prompt.py`. The model
+imports it from the model folder (or, for a Hub id, from the repository snapshot, also under `trust_remote_code=True`)
+on first use; `transformers-mblt` holds only the glue that calls it, so the prompt matches upstream token for token.
+
+`MobilintD1Model` has the upstream System One API and returns the same shapes:
+
+- `system_one(state, questions, images=None)` takes named questions (and a list of pictures) and returns
+  `{"answers": {name: answer}, "usage": {"input_tokens": n, "output_tokens": 0}}`.
+- `system_one_batch([(state, questions[, images]), ...])` returns one such response per request.
+- `probabilities(state, questions, images=None)` and `probabilities_batch(requests)` return each question's
+  distribution over its options, in question order (`[P(yes), P(no)]` for a `noul`).
+- `render(state, question)` returns the prompt text, and `tokens(state, questions)` the longest prompt in tokens.
+- `model.calibration = obj` applies upstream's calibration hook (`obj.apply(question, scores)` on the options'
+  log-probabilities), as upstream's `calibration=` argument does.
+
+Not provided: upstream's `plan_batches` / `token_budget` and `compile` options, which tune its GPU batching.
+
+A state is a string, any JSON value, or `None`. Questions follow the Decision Index schema: `noul` (yes or no),
+`choice` (`criteria` maps names to descriptions), and `score` (2 to 10 levels, lowest first).
+
+```python
+import transformers_mblt
+from transformers import AutoModel
+
+transformers_mblt.register()
+model = AutoModel.from_pretrained("mobilint/d1-3B")
+questions = {
+    "refund": {"type": "noul", "instructions": "Is the customer asking for a refund?"},
+    "team": {
+        "type": "choice",
+        "instructions": "Which team should handle this?",
+        "criteria": {"billing": "Charges, refunds, invoices", "technical": "App or site faults"},
+    },
+    "urgency": {"type": "score", "instructions": "How urgent is this?", "criteria": ["Can wait", "Today", "Now"]},
+}
+print(model.system_one("I was charged twice this month, please refund one of them.", questions))
+print(model.system_one(None, {"person": {"type": "noul", "instructions": "Is there a person in the picture?"}},
+                       images=["photo.jpg"]))
+model.dispose()
+```
+
+Pictures are `PIL.Image` objects, file paths, or uint8 arrays. Each is letterboxed on the host into one 512x512 square
+(bicubic, aspect kept, centred on black, normalized to [-1, 1]) and read as 256 image tokens, which open the user turn
+as the checkpoint's chat template places them. For a 512x512 picture the pixels and tokens equal upstream's processor;
+a larger picture is not split into tiles as upstream's processor does, so it is read at 512x512. The vision MXQ runs in
+the text MXQ's core mode. A model folder without a vision MXQ (no `vision_mxq_path` in its config) is text-only and
+raises `NotImplementedError` for pictures.
+
+Questions take upstream's Decision Index form: a missing or unknown `type` is a `choice` question, and a request
+without questions answers nothing and runs nothing on the NPU (its usage still counts the state's tokens), as upstream.
+
+Several questions on one state share one prefill of the state; each question then continues from it. The last state
+stays on the device, so a later call on the same state (and the same pictures) prefills only its questions; `reset_context()`, `launch()`,
+`dispose()`, and a plain `forward()` forget it. The device holds one state at a time, so a lock serializes requests:
+calls from several threads are safe and run one after another.
+
+A prompt (state, pictures and question) may use
+the KV capacity the MXQ reports (16,382 tokens for the 16K Aries build); a longer prompt raises `ValueError`.
+A prefill call takes longer the deeper it starts in the KV. On Aries a 2K call starting at 12K tokens takes about
+13.6 s in `single`, 11.6 s in `global4` and 5.9 s in `global8`, so in `single` and `global4` a prompt past about 8K
+tokens needs a longer watchdog than qbruntime's default 10 s (`QBRUNTIME_NPU_TIMEOUT_MS=30000`). Prefill runs in
+infer calls of at most `npu_prefill_chunk_size` tokens (2,048), except that in `global4` and `global8` no call has a
+length of 0 or 63 modulo 64, because LFM2 hybrid graphs hang the NPU there: those modes prefill in calls of at most
+2,046 tokens. The Aries build's two MXQs are compiled with inference scheme `all`: its config selects `global8`, and
+`core_mode="global4"` or `core_mode="single"` (with `target_clusters` / `target_cores`) load the same MXQs.
+
+`scripts/build_d1_hf_package.py` assembles the model folder from a compiled D1 package (`model.yaml` with
+`kind: decision`, `model.mxq`, `token_table.npy`, the tokenizer, and `prompt.py`) and the vision MXQ with its layout
+(`--vision-mxq`, `--vision-layout`). It reads the KV capacity from the text MXQ through qbruntime (without
+launching it) and writes the whole model card;
+the measured sections (quantization, calibration sources, fidelity) come from a JSON file passed as `--card-facts`.
+
+The base model is licensed under the LFM Open License v1.0, which limits commercial use by organizations with annual
+revenue of USD 10 million or more. The model repository ships that license.
+
 ## Host-Side Sampling
 
 With `do_sample=True` and both `top_k` and `top_p` set (Qwen3 ships `temperature=0.6, top_k=20, top_p=0.95`),

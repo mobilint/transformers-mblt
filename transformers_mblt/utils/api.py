@@ -2,6 +2,7 @@ import os
 import sys
 from typing import Dict, List, Optional, Union
 
+# D1 (models/d1, D1_TASK) is listed under "image-text-to-text", upstream's Hub task, with the VLMs.
 TASKS = [
     "text-generation",
     "image-text-to-text",
