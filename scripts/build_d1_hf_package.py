@@ -488,7 +488,8 @@ tags:
 # About
 
 This repository provides a model compiled and optimized for Mobilint NPU hardware.
-The model is packaged for deployment on Mobilint's acceleration stack and is intended to be used within that environment.
+The model is packaged for deployment on Mobilint's acceleration stack and is intended to be used within that
+environment.
 
 # d1-3B for Mobilint NPUs
 
