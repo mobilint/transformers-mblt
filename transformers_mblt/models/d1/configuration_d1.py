@@ -45,7 +45,7 @@ class MobilintD1Config(MobilintConfigMixin, PretrainedConfig):
         self,
         vocab_size: int = 128000,
         hidden_size: int = 2048,
-        max_position_embeddings: int = 16384,
+        max_position_embeddings: int = 16382,
         image_token_id: int = 124907,
         vision_mxq_path: Optional[str] = None,
         image_size: int = 512,

@@ -62,7 +62,7 @@ def _decision_model_ids(ids: Sequence[str]) -> set[str]:
             except (OSError, ValueError):
                 pass
     try:
-        found.update(m.id for m in HfApi().list_models(author="mobilint", tags="decision") if m.id in ids)
+        found.update(m.id for m in HfApi().list_models(author="mobilint", filter="decision") if m.id in ids)
     except (HfHubHTTPError, OSError, ValueError):
         pass
     return found

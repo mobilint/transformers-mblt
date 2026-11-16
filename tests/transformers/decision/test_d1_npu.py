@@ -200,3 +200,32 @@ def test_long_state_and_residue_lengths(model, monkeypatch, residue: int) -> Non
     for a, b in zip(together, alone):
         assert sum(a) == pytest.approx(1.0)
         assert a == pytest.approx(b, abs=2e-2)
+
+
+def test_prompts_fill_the_kv_capacity_the_mxq_reports(model, monkeypatch) -> None:
+    """A prompt of up to the MXQ's KV capacity runs; one token more raises before any infer call."""
+    capacity = model.kv_capacity
+    assert capacity == model.config.max_position_embeddings
+    prompter = model.prompter
+    question = QUESTIONS["refund"]
+    text = " ".join(f"line {i}: robot {i % 5} at bay {i % 11}." for i in range(4000))
+
+    def tokens(n: int) -> int:
+        return len(prompter.encode(prompter.render(text[:n], prompter.question(question))))
+
+    lo, hi = 0, len(text)
+    assert tokens(hi) > capacity
+    while hi - lo > 1:  # the longest state whose prompt fits
+        mid = (lo + hi) // 2
+        lo, hi = (mid, hi) if tokens(mid) <= capacity else (lo, mid)
+    assert capacity - 16 <= tokens(lo) <= capacity < tokens(hi)
+
+    recorder = _RecordingMxq(model.get_mxq_model())
+    monkeypatch.setattr(model, "get_mxq_model", lambda: recorder)
+    model.reset_context()
+    with pytest.raises(ValueError, match=f"holds {capacity}"):
+        model.probabilities(text[:hi], [question])
+    assert recorder.lengths == []
+    probs = model.probabilities(text[:lo], [question])[0]
+    assert sum(probs) == pytest.approx(1.0)
+    print(f"{model.npu_backend.core_mode}: KV capacity {capacity}, a {tokens(lo)}-token prompt ran")

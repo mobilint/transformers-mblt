@@ -314,8 +314,6 @@ class MobilintD1Model(MobilintModelMixin, MobilintD1PreTrainedModel):
         """
         reqs = [(state, list(questions), _image_list(images)) for state, questions, images in requests]
         for _, questions, images in reqs:
-            if not questions:
-                raise ValueError("a request needs at least one question")
             if images and not self.has_vision:
                 raise NotImplementedError(
                     "this D1 model folder is text-only: its config has no vision_mxq_path, so pictures cannot be "
@@ -326,6 +324,10 @@ class MobilintD1Model(MobilintModelMixin, MobilintD1PreTrainedModel):
             qs = [self.prompter.question(q) for q in questions]
             pictures = self._preprocess(images) if images else None
             rows, shared, read = self.prompter.request_rows(state, qs, self.image_markup(len(images)))
+            if not qs:
+                # As upstream: no question reads nothing on the device and answers nothing.
+                out.append(([], read))
+                continue
             with self._lock():
                 hidden = self._decide(rows, shared, pictures)
             out.append(([self._readout(q, h) for q, h in zip(qs, hidden)], read))

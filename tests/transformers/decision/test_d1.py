@@ -15,6 +15,7 @@ Hugging Face cache) and are skipped without one.
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import json
 import math
 import os
@@ -272,6 +273,26 @@ def test_prompt_py_is_loaded_from_the_model_folder(tmp_path: Path) -> None:
         load_prompt_module(tmp_path / "other.py")
 
 
+def test_loading_prompt_py_writes_no_bytecode(tmp_path: Path) -> None:
+    # A model folder or Hub snapshot stays as downloaded: no __pycache__ appears beside prompt.py.
+    source = FIXTURE_PROMPT.read_bytes() + b"\nLOADED_FROM_TMP = True\n"
+    (tmp_path / "prompt.py").write_bytes(source)
+    module = load_prompt_module(tmp_path / "prompt.py")
+    assert module.LOADED_FROM_TMP and module.__file__ == str(tmp_path / "prompt.py")
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["prompt.py"]
+
+
+def test_a_request_without_questions_answers_nothing() -> None:
+    model, mxq, _ = make_model(FakeTokenizer(), vocab=4096, max_width=48)
+    state = STATES[1]
+    out = model.system_one(state, {})
+    assert out == {
+        "answers": {},
+        "usage": {"input_tokens": len(model.prompter.encode(model.prompter.prefix(state))), "output_tokens": 0},
+    }
+    assert mxq.calls == []
+
+
 def test_the_package_ships_no_prompt_code() -> None:
     package = REPO_ROOT / "transformers_mblt" / "models" / "d1"
     text = "\n".join(p.read_text(encoding="utf-8") for p in package.glob("*.py"))
@@ -287,7 +308,11 @@ def test_questions_accept_dicts_module_classes_and_lookalikes() -> None:
     assert prompter.question(noul) is noul
     lookalike = SimpleNamespace(type="score", instructions="s", criteria=("lo", "hi"))
     assert prompter.question(lookalike) == module.Score("s", ["lo", "hi"])
-    with pytest.raises(ValueError, match="question type"):
+    # As upstream's as_question, an unknown type is a choice question.
+    assert prompter.question({"type": "rank", "instructions": "x", "criteria": {"a": None}}) == module.Choice(
+        "x", {"a": None}
+    )
+    with pytest.raises(ValueError, match="needs criteria"):
         prompter.question({"type": "rank", "instructions": "x"})
     with pytest.raises(ValueError, match="needs criteria"):
         prompter.question({"type": "choice", "instructions": "x"})
@@ -734,6 +759,30 @@ def test_registration_and_proxy_exports() -> None:
     assert module.MobilintD1Model is MobilintD1Model and module.MobilintD1Config is MobilintD1Config
 
 
+def test_proxy_asks_for_an_upgrade_on_a_release_without_d1(monkeypatch) -> None:
+    # transformers-mblt 0.7.2 has no models.d1; the Hub proxy names the release that adds it.
+    for name in list(sys.modules):
+        if name.startswith("transformers_mblt.models.d1"):
+            monkeypatch.delitem(sys.modules, name)
+    for name in list(sys.modules):
+        if name == "mblt_model_zoo" or name.startswith("mblt_model_zoo."):
+            monkeypatch.delitem(sys.modules, name)
+
+    class Missing:
+        @staticmethod
+        def find_spec(name, path=None, target=None):
+            if name in ("transformers_mblt.models.d1", "mblt_model_zoo"):
+                raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+            return None
+
+    monkeypatch.setattr(sys, "meta_path", [Missing(), *sys.meta_path])
+    proxy = Path(transformers_mblt.__file__).parent / "models" / "d1" / "proxy_d1.py"
+    spec = importlib.util.spec_from_file_location("proxy_d1_old_release", proxy)
+    module = importlib.util.module_from_spec(spec)
+    with pytest.raises(ImportError, match=r"transformers-mblt>=0\.7\.3"):
+        spec.loader.exec_module(module)
+
+
 # --------------------------------------------------------------------------- #
 # upstream parity (local LiquidAI/d1-3B snapshot only)
 # --------------------------------------------------------------------------- #
@@ -921,9 +970,13 @@ def test_benchmarks_leave_out_decision_models(monkeypatch, tmp_path: Path) -> No
         "try_to_load_from_cache",
         lambda repo, name: str(config) if repo == "mobilint/d1-3B" else None,
     )
-    monkeypatch.setattr(
-        huggingface_hub,
-        "HfApi",
-        lambda: SimpleNamespace(list_models=lambda **kw: [SimpleNamespace(id="mobilint/d1-2B")]),
-    )
+    real_list_models = inspect.signature(huggingface_hub.HfApi.list_models)
+
+    def list_models(**kw):
+        # The arguments must exist on the installed huggingface_hub, which has no ``tags=``.
+        real_list_models.bind(None, **kw)
+        assert kw.get("filter") == "decision"
+        return [SimpleNamespace(id="mobilint/d1-2B")]
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", lambda: SimpleNamespace(list_models=list_models))
     assert targets.list_default_model_ids(D1_TASK) == ["mobilint/Qwen3-VL-2B-Instruct"]

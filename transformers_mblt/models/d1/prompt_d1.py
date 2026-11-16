@@ -58,7 +58,8 @@ def load_prompt_module(path: str | os.PathLike) -> ModuleType:
         # dataclasses resolve string annotations through sys.modules while the module executes.
         sys.modules[name] = module
         try:
-            spec.loader.exec_module(module)
+            # Compile from the bytes read above and write no __pycache__ into the model folder or the Hub cache.
+            exec(compile(source, str(path), "exec"), module.__dict__)
             missing = [n for n in _REQUIRED if not hasattr(module, n)]
             if missing:
                 raise ImportError(f"{path} is not a D1 prompt.py: it has no {', '.join(missing)}")
@@ -105,7 +106,8 @@ class D1Prompter:
     def question(self, q: Any) -> Any:
         """``q`` as one of the module's question classes.
 
-        Accepts a Decision Index dict (``type``, ``instructions``, ``criteria``; no ``type`` means ``choice``), an
+        Accepts a Decision Index dict (``type``, ``instructions``, ``criteria``; a missing or unknown ``type`` means
+        ``choice``, as upstream), an
         instance of the module's classes, or any object with those attributes (such as the classes of another copy of
         ``prompt.py``).
         """
@@ -122,9 +124,10 @@ class D1Prompter:
             }
         else:
             raise TypeError(f"a question is a dict with type/instructions/criteria, got {type(q).__name__}")
+        # As upstream's as_question: any type other than noul or score is a choice question.
         kind = spec.get("type", "choice")
         if kind not in QUESTION_TYPES:
-            raise ValueError(f"question type must be one of {QUESTION_TYPES}, got {kind!r}")
+            kind = spec["type"] = "choice"
         if "instructions" not in spec:
             raise ValueError("a question needs instructions")
         if kind != "noul" and spec.get("criteria") is None:

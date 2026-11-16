@@ -28,7 +28,9 @@ def load_image(image: Any) -> Any:
             return opened.convert("RGB")
     if isinstance(image, np.ndarray):
         if image.dtype != np.uint8 or image.ndim not in (2, 3):
-            raise TypeError(f"an image array must be uint8 (height, width[, channels]), got {image.dtype} {image.shape}")
+            raise TypeError(
+                f"an image array must be uint8 (height, width[, channels]), got {image.dtype} {image.shape}"
+            )
         return Image.fromarray(image).convert("RGB")
     if isinstance(image, Image.Image):
         return image.convert("RGB")

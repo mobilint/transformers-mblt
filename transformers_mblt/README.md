@@ -573,13 +573,16 @@ a larger picture is not split into tiles as upstream's processor does, so it is 
 the text MXQ's core mode. A model folder without a vision MXQ (no `vision_mxq_path` in its config) is text-only and
 raises `NotImplementedError` for pictures.
 
+Questions take upstream's Decision Index form: a missing or unknown `type` is a `choice` question, and a request
+without questions answers nothing and runs nothing on the NPU (its usage still counts the state's tokens), as upstream.
+
 Several questions on one state share one prefill of the state; each question then continues from it. The last state
 stays on the device, so a later call on the same state (and the same pictures) prefills only its questions; `reset_context()`, `launch()`,
 `dispose()`, and a plain `forward()` forget it. The device holds one state at a time, so a lock serializes requests:
 calls from several threads are safe and run one after another.
 
 A prompt (state, pictures and question) may use
-the MXQ's whole KV capacity (16,384 tokens for the Aries build); a longer prompt raises `ValueError`. Prefill runs in
+the KV capacity the MXQ reports (16,382 tokens for the 16K Aries build); a longer prompt raises `ValueError`. Prefill runs in
 infer calls of at most `npu_prefill_chunk_size` tokens (2,048), except that in `global4` and `global8` no call has a
 length of 0 or 63 modulo 64, because LFM2 hybrid graphs hang the NPU there: those modes prefill in calls of at most
 2,046 tokens. The Aries build's two MXQs are compiled with inference scheme `all`: its config selects `global8`, and
@@ -587,7 +590,8 @@ length of 0 or 63 modulo 64, because LFM2 hybrid graphs hang the NPU there: thos
 
 `scripts/build_d1_hf_package.py` assembles the model folder from a compiled D1 package (`model.yaml` with
 `kind: decision`, `model.mxq`, `token_table.npy`, the tokenizer, and `prompt.py`) and the vision MXQ with its layout
-(`--vision-mxq`, `--vision-layout`). It writes the whole model card;
+(`--vision-mxq`, `--vision-layout`). It reads the KV capacity from the text MXQ through qbruntime (without
+launching it) and writes the whole model card;
 the measured sections (quantization, calibration sources, fidelity) come from a JSON file passed as `--card-facts`.
 
 The base model is licensed under the LFM Open License v1.0, which limits commercial use by organizations with annual

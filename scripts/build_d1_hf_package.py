@@ -61,6 +61,8 @@ from transformers_mblt.models.d1 import D1_TASK  # noqa: E402
 PROXY_SOURCE = _REPO_ROOT / "transformers_mblt" / "models" / "d1" / "proxy_d1.py"
 DEFAULT_MXQ_NAME = "d1-3B.mxq"
 DEFAULT_VISION_MXQ_NAME = "d1-3B-vision.mxq"
+MIN_TRANSFORMERS_MBLT = "0.7.3"
+TESTED_QBRUNTIME = "1.5.3"
 AUTO_MAP = {"AutoConfig": "proxy_d1.MobilintD1Config", "AutoModel": "proxy_d1.MobilintD1Model"}
 # Runtime noise that transformers writes into tokenizer_config.json and that must not pin a tokenizer backend.
 _TOKENIZER_CONFIG_DROP = ("backend", "is_local", "local_files_only", "processor_class", "auto_map")
@@ -157,6 +159,23 @@ def core_modes(package: dict[str, Any]) -> list[str]:
     return [default] + [m for m in modes if m != default]
 
 
+def mxq_kv_capacity(mxq: Path, core_mode: str) -> int:
+    """KV positions the text MXQ holds in ``core_mode``, as the runtime reports them (the compile's ``max_tokens`` is
+    not it: a 16K build holds 16,382). Constructs the model without launching it, so no NPU is taken."""
+    import qbruntime
+
+    config = qbruntime.ModelConfig()
+    if core_mode == "single":
+        config.set_single_core_mode(1)
+    else:
+        getattr(config, f"set_{core_mode}_core_mode")()
+    info = qbruntime.Model(str(mxq), config).get_input_buffer_info()[0]
+    capacity = int(getattr(info, "max_cache_size", 0))
+    if capacity <= 0:
+        raise SystemExit(f"[error] {mxq} reports no KV capacity")
+    return capacity
+
+
 def vision_settings(layout_path: Path, hidden_size: int, tokenizer_json: Optional[Path] = None) -> dict[str, Any]:
     """The config's picture settings from a vision layout, checked against the config's image token markup and,
     given ``tokenizer_json``, against the tokenizer's ids of the image tokens."""
@@ -245,7 +264,7 @@ def build_config(
         hidden_size=hidden_size,
         vision_mxq_path=vision_mxq_name,
         **vision_settings(package["vision_layout"], hidden_size, package["tokenizer_json"]),
-        max_position_embeddings=int(meta.get("max_tokens") or 16384),
+        max_position_embeddings=int(package["kv_capacity"]),
         base_model=meta.get("model_id") or "LiquidAI/d1-3B",
         base_model_revision=meta.get("revision"),
         mxq_path=mxq_name,
@@ -293,7 +312,7 @@ def _requirements(package: dict[str, Any]) -> str:
     meta, provenance = package["meta"], package["provenance"]
     modes = core_modes(package)
     scheme = provenance.get("inference_scheme")
-    capacity = int(meta.get("max_tokens") or provenance.get("context") or 16384)
+    capacity = int(package["kv_capacity"])
     width = int(meta.get("max_data_length") or 2048)
     global_modes = [m for m in modes if m != "single"]
     calls = []
@@ -309,8 +328,11 @@ def _requirements(package: dict[str, Any]) -> str:
     scheme_text = f"inference scheme `{scheme}`: " if scheme else ""
     return f"""## Requirements
 
-- A Mobilint ARIES (`{meta.get("target_device") or "aries-rb"}`) NPU with its driver, `mobilint-qb-runtime`, and
-  `transformers-mblt` with D1 support.
+- A Mobilint ARIES (`{meta.get("target_device") or "aries-rb"}`) NPU with its driver.
+- `pip install "transformers-mblt>={MIN_TRANSFORMERS_MBLT}"`: D1 support starts at {MIN_TRANSFORMERS_MBLT}. It installs
+  `mobilint-qb-runtime`; this build was tested with qbruntime {TESTED_QBRUNTIME}.
+- `AutoModel.from_pretrained` and `AutoTokenizer.from_pretrained` load this repository after
+  `transformers_mblt.register()`, or with `trust_remote_code=True` (which runs `proxy_d1.py`).
 - Core modes: {scheme_text}{mode_text}. Pass `core_mode=` (with `target_clusters=` or `target_cores=`) to
   `from_pretrained` to pick one.
 - KV capacity: {capacity:,} tokens. A prompt (state and question) of up to {capacity:,} tokens is accepted; a longer
@@ -326,12 +348,12 @@ def _pictures(settings: dict[str, Any]) -> str:
     size, tokens = settings["image_size"], settings["image_tokens"]
     return f"""## Pictures
 
-`images` takes a list of pictures (`PIL.Image`, file paths or uint8 arrays), as upstream's `images=` does. Each picture
-is letterboxed on the host into one {size}x{size} square: scaled with bicubic resampling to fit while keeping its aspect
-ratio, centred on black, and normalized to [-1, 1]. The vision MXQ turns it into {tokens} image tokens, which open the
-user turn before the state. Upstream's processor instead splits a large picture into up to ten 512x512 tiles plus a
-thumbnail; here every picture is one {size}x{size} input, so fine detail in a large picture is read at lower
-resolution.
+`images` takes a list of pictures: `PIL.Image` objects, as upstream's `images=` does, or file paths or uint8 arrays.
+Each picture is letterboxed on the host into one {size}x{size} square: scaled with bicubic resampling to fit while
+keeping its aspect ratio, centred on black, and normalized to [-1, 1]. The vision MXQ turns it into {tokens} image
+tokens, which open the user turn before the state. Upstream's processor instead splits a large picture into up to ten
+512x512 tiles plus a thumbnail; here every picture is one {size}x{size} input, so fine detail in a large picture is
+read at lower resolution.
 """
 
 
@@ -441,9 +463,11 @@ license: other
 license_name: lfm1.0
 license_link: LICENSE
 base_model: {base}
+base_model_relation: quantized
 pipeline_tag: {D1_TASK}
 tags:
 - mobilint
+- custom_code
 - npu
 - decision
 - system-one
@@ -524,6 +548,7 @@ def build(
             if (upstream / name).is_file() and (upstream / name).read_bytes() != package[key].read_bytes():
                 raise SystemExit(f"[error] the package {name} differs from the upstream revision's")
     facts = json.loads(card_facts.read_text(encoding="utf-8")) if card_facts is not None else {}
+    package["kv_capacity"] = mxq_kv_capacity(package["mxq"], core_modes(package)[0])
     license_path = find_license(upstream, package["meta"])
     out.mkdir(parents=True, exist_ok=True)
 

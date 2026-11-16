@@ -29,6 +29,19 @@ def _load_build_module() -> ModuleType:
 
 
 build = _load_build_module()
+KV_CALLS: list[tuple[str, str]] = []
+
+
+@pytest.fixture(autouse=True)
+def _kv_capacity_from_the_mxq(monkeypatch):
+    """The fake MXQ is not a model: answer as the runtime does for a 16K build, and record the core mode asked."""
+
+    def capacity(mxq: Path, core_mode: str) -> int:
+        KV_CALLS.append((Path(mxq).name, core_mode))
+        return 16382
+
+    KV_CALLS.clear()
+    monkeypatch.setattr(build, "mxq_kv_capacity", capacity)
 
 
 def _fake_package(root: Path, table: np.ndarray, yaml_extra: str = "") -> tuple[Path, Path]:
@@ -130,6 +143,8 @@ def test_build_writes_the_hub_layout(tmp_path: Path) -> None:
     assert (config["vocab_size"], config["hidden_size"], config["npu_prefill_chunk_size"]) == (4, 8, 2048)
     assert (config["bos_token_id"], config["eos_token_id"], config["pad_token_id"]) == (1, 2, 0)
     assert config["base_model_revision"] == "abc"
+    # The KV capacity is what the MXQ reports, not model.yaml's max_tokens (16384).
+    assert config["max_position_embeddings"] == 16382 and KV_CALLS == [("model.mxq", "global8")]
     assert (out / "d1-3B-vision.mxq").read_bytes() == b"vision mxq"
     assert config["vision_mxq_path"] == "d1-3B-vision.mxq"
     assert (config["image_size"], config["patch_size"], config["image_tokens"], config["image_token_id"]) == (
@@ -149,6 +164,8 @@ def test_build_writes_the_hub_layout(tmp_path: Path) -> None:
     assert (out / "proxy_d1.py").read_text() == (_REPO_ROOT / "transformers_mblt/models/d1/proxy_d1.py").read_text()
     card = (out / "README.md").read_text()
     assert "license_name: lfm1.0" in card and f"pipeline_tag: {build.D1_TASK}" in card
+    assert "base_model_relation: quantized" in card and "- custom_code" in card
+    assert f'pip install "transformers-mblt>={build.MIN_TRANSFORMERS_MBLT}"' in card
     assert "Liquid AI, Inc." in card and "## Requirements" in card and "## Pictures" in card
     assert "text-only" not in card.lower() and "text only" not in card.lower()
     assert "vision tower and projector" in card and "`d1-3B-vision.mxq`" in card
@@ -174,7 +191,7 @@ def test_the_card_is_generated_whole(tmp_path: Path) -> None:
     for heading in ("## Requirements", "## Quantization", "## Calibration", "## Fidelity", "## Licence"):
         assert heading in card
     assert "`global8` by default; `global4`, `single` also run" in card
-    assert "16,384 tokens" in card
+    assert "KV capacity: 16,382 tokens" in card and "16,384" not in card
     assert "at most 2,046 tokens in `global8` and `global4`" in card and "at most 2,048 tokens in `single`" in card
     assert "| FineWeb | 22.2% | ODC-By |" in card and "| 840 questions | 0.041 | 0.091 |" in card
     assert "497 prompts, 318,755 tokens, at most 7,945 tokens per prompt" in card
