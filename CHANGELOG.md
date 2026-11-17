@@ -28,6 +28,10 @@
   proxies (`proxy_bert_embedding.py`, `proxy_xlm_roberta.py`), so the `mobilint/bert-*` repositories keep theirs.
   `scripts/build_encoder_hf_package.py` assembles either Hub folder, model card included, from the compiled MXQ and
   the upstream snapshot, for `aries-rb` or, with `--target-device regulus-rb-usb`, a REGULUS USB board (single core).
+- Hub folder scripts follow the published cards: the card's `language` comes from the base model's card, and the
+  encoder folders ship the base licence as `LICENSE` (the snapshot's, `--license-file`, or the bundled Apache-2.0
+  text) with optional upstream attribution in the Licence section. The D1 config no longer carries the internal
+  `mblt_recipe` key.
 - EXAONE 3.5 EAGLE-3 speculative decoding: `MobilintExaoneEagle3Config` / `MobilintExaoneEagle3ForCausalLM`
   (`model_type` `mobilint-exaone-eagle3`, `transformers_mblt/models/exaone_eagle3/`) wire the EXAONE 3.5 base body,
   the Llama-family one-block draft, and the FC projector on the shared EAGLE-3 mixins, for the

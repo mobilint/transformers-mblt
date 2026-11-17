@@ -116,6 +116,15 @@ FACTS = {
 }
 
 
+def test_card_takes_the_base_languages_and_config_has_no_recipe(tmp_path: Path) -> None:
+    package, upstream = _fake_package(tmp_path, np.zeros((4, 8), np.float32))
+    (upstream / "README.md").write_text("---\nlicense: other\nlanguage:\n- en\n- ko\n---\n# d1\n", encoding="utf-8")
+    out = build.build(package, tmp_path / "hub", upstream)
+    card = (out / "README.md").read_text()
+    assert "language:\n- en\n- ko\nbase_model:" in card and "d1-test" not in card
+    assert "mblt_recipe" not in json.loads((out / "config.json").read_text())
+
+
 def test_build_writes_the_hub_layout(tmp_path: Path) -> None:
     table = torch.randn(4, 8).to(torch.bfloat16).float().numpy()
     package, upstream = _fake_package(tmp_path, table)

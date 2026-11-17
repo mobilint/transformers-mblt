@@ -345,11 +345,34 @@ def test_build_states_the_base_model_licence(tmp_path: Path) -> None:
     out = build.build("embedder", mxq, upstream, tmp_path / "a", "mobilint/e5", "org/base", REV)
     card = (out / "README.md").read_text()
     assert "license: apache-2.0" in card and "under the Apache License 2.0" in card and "license_link" not in card
-    out = build.build("embedder", mxq, upstream, tmp_path / "b", "mobilint/e5", "org/base", REV, license_id="mit")
-    assert "license: mit" in (out / "README.md").read_text()
+    assert "language:\n- ko\n" in card and "text is in [LICENSE](LICENSE)" in card
+    bundled = REPO_ROOT / "scripts" / "licenses" / "apache-2.0.txt"
+    assert (out / "LICENSE").read_bytes() == bundled.read_bytes()
+    # An MIT text names its copyright holder, so it must be given.
+    with pytest.raises(SystemExit, match="--license-file"):
+        build.build("embedder", mxq, upstream, tmp_path / "b", "mobilint/e5", "org/base", REV, license_id="mit")
+    mit = tmp_path / "MIT.txt"
+    mit.write_text("MIT License\n\nCopyright (c) Someone\n", encoding="utf-8")
+    out = build.build(
+        "embedder", mxq, upstream, tmp_path / "b2", "mobilint/e5", "org/base", REV, license_id="mit", license_file=mit
+    )
+    assert "license: mit" in (out / "README.md").read_text() and (out / "LICENSE").read_bytes() == mit.read_bytes()
     (upstream / "README.md").unlink()
     with pytest.raises(SystemExit, match="--license"):
         build.build("embedder", mxq, upstream, tmp_path / "c", "mobilint/e5", "org/base", REV)
+
+
+def test_build_adds_licence_notes_and_lists_only_shipped_tokenizer_files(tmp_path: Path) -> None:
+    build = _load_build()
+    upstream, mxq = _fake_upstream(tmp_path, "embedder")
+    facts = tmp_path / "facts.json"
+    facts.write_text(json.dumps({"licence": {"notes": ["Upstream X is MIT."]}}), encoding="utf-8")
+    out = build.build(
+        "embedder", mxq, upstream, tmp_path / "hub", "mobilint/e5", "org/base", REV, card_facts=facts, languages=["en"]
+    )
+    card = (out / "README.md").read_text()
+    assert card.rstrip().endswith("Upstream X is MIT.") and "language:\n- en\n" in card
+    assert "sentencepiece.bpe.model" not in card and "`tokenizer.json`" in card
 
 
 def test_build_refuses_a_folder_with_files(tmp_path: Path) -> None:

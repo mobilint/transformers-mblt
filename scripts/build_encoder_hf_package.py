@@ -12,14 +12,16 @@ weights), the tokenizer files and a config that names the Mobilint classes. It l
     model.safetensors      the embedding layer's weights, unchanged (float32)
     tokenizer files        tokenizer.json, tokenizer_config.json, special_tokens_map.json[, sentencepiece.bpe.model]
     proxy_*.py             Hub remote code, copied from transformers_mblt/models
-    README.md              model card, generated whole
+    LICENSE                the base model's licence text (the snapshot's, --license-file, or the bundled Apache-2.0)
+    README.md              model card, generated whole (licence and languages from the snapshot's card)
 
 The card's measured facts come from a JSON sidecar (``--card-facts``)::
 
     {"quantization": {"weights": str, "activations": str, "method": str, "compiler": str},
      "calibration": {"text": str, "sources": [{"source": str, "share": str, "licence": str}, ...]},
      "fidelity": {"intro": str, "columns": [str, ...], "rows": [{"set": str, "values": [str, ...]}, ...],
-                  "notes": [str, ...]}}
+                  "notes": [str, ...]},
+     "licence": {"notes": [str, ...]}}     # extra paragraphs for the Licence section, such as upstream attribution
 
 The core modes come from the MXQ's compile record (``<mxq>.config.json``: ``inferenceScheme``). ``--target-device``
 names the board the MXQ was compiled for (``aries-rb`` by default, or ``regulus-rb-usb``, which runs only ``single``).
@@ -40,7 +42,7 @@ import re
 import shutil
 import sys
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT))
@@ -69,6 +71,9 @@ DEVICES: dict[str, dict[str, Any]] = {
 DEFAULT_MXQ_LENGTH = 4096
 # Hub licence ids this script can state, with the name the card's Licence section uses.
 LICENCES = {"apache-2.0": "Apache License 2.0", "mit": "MIT License"}
+# Licence texts to ship when the snapshot has no LICENSE file. The MIT text names its copyright holder, so an MIT
+# base needs --license-file.
+LICENSE_TEXTS = {"apache-2.0": Path(__file__).resolve().parent / "licenses" / "apache-2.0.txt"}
 TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "sentencepiece.bpe.model")
 MIN_TRANSFORMERS_MBLT = "0.7.3"
 TESTED_QBRUNTIME = "1.5.3"
@@ -209,14 +214,16 @@ def model_card(
     tokenizer_changes: Optional[list[str]] = None,
     target_device: str = "aries-rb",
     license_id: str = "apache-2.0",
+    languages: Optional[list[str]] = None,
+    tokenizer_files: Sequence[str] = TOKENIZER_FILES,
 ) -> str:
     spec = KINDS[kind]
     changed = "; ".join(tokenizer_changes or [])
     tokenizer_note = (
         f"The tokenizer files are the base model's, except {changed}, so that truncation stops at what the MXQ takes."
         if changed
-        else "The tokenizer files ({files}, where present) are the base model's, unchanged."
-    ).format(files=", ".join(f"`{n}`" for n in TOKENIZER_FILES))
+        else "The tokenizer files ({files}) are the base model's, unchanged."
+    ).format(files=", ".join(f"`{n}`" for n in tokenizer_files))
     what = "sentence embedding model" if kind == "embedder" else "reranker (cross-encoder)"
     runs = (
         "The embedding lookup runs on the host and the encoder on the NPU; the host then pools the last hidden state."
@@ -267,10 +274,13 @@ def model_card(
             parts += [note, ""]
         sections.append("\n".join(parts))
     body = "\n".join(sections)
+    language = "".join(f"\n- {code}" for code in languages or [])
+    language = f"language:{language}\n" if language else ""
+    licence_notes = "".join(f"\n\n{note}" for note in facts.get("licence", {}).get("notes", []))
     return f"""---
 library_name: transformers
 license: {license_id}
-base_model: {base_model}
+{language}base_model: {base_model}
 base_model_relation: quantized
 pipeline_tag: {spec["pipeline_tag"]}
 tags:
@@ -313,10 +323,11 @@ environment.
 {body}
 ## Licence
 
-The base model, [{base_model}](https://huggingface.co/{base_model}), is licensed under the {LICENCES[license_id]}. This
-repository is a derivative work under the same licence. Changes: the encoder is quantized and compiled into
-`{mxq_name}`; `model.safetensors` holds the base model's embedding-layer weights only, unchanged; `config.json` and
-`{spec["proxy"].name}` are new files for `transformers-mblt`. {tokenizer_note}
+The base model, [{base_model}](https://huggingface.co/{base_model}), is licensed under the {LICENCES[license_id]}; its
+text is in [LICENSE](LICENSE). This repository is a derivative work under the same licence. Changes: the encoder is
+quantized and compiled into `{mxq_name}`; `model.safetensors` holds the base model's embedding-layer weights only,
+unchanged; `config.json` and `{spec["proxy"].name}` are new files for `transformers-mblt`.
+{tokenizer_note}{licence_notes}
 """
 
 
@@ -332,6 +343,8 @@ def build(
     card_facts: Optional[Path] = None,
     target_device: str = "aries-rb",
     license_id: Optional[str] = None,
+    languages: Optional[list[str]] = None,
+    license_file: Optional[Path] = None,
 ) -> Path:
     """Write the Hub folder ``out`` and return it."""
     from safetensors.torch import save_file
@@ -352,11 +365,17 @@ def build(
             raise SystemExit(f"[error] {upstream} has no {name}; pass a snapshot with a single model.safetensors")
     if not _COMMIT.fullmatch(revision):
         raise SystemExit(f"[error] the base model revision must be a 40-character commit hash, got {revision!r}")
-    license_id = license_id or upstream_license(upstream)
+    base_card = upstream_card(upstream)
+    license_id = license_id or base_card.get("license")
     if license_id not in LICENCES:
         raise SystemExit(
             f"[error] the base model's licence {license_id!r} is not one of {sorted(LICENCES)}; pass --license"
         )
+    languages = languages or _as_list(base_card.get("language"))
+    license_text = license_file or (upstream / "LICENSE" if (upstream / "LICENSE").is_file() else None)
+    license_text = license_text or LICENSE_TEXTS.get(license_id)
+    if license_text is None or not license_text.is_file():
+        raise SystemExit(f"[error] no {license_id} licence text to ship; pass --license-file")
     if out.exists() and (not out.is_dir() or any(out.iterdir())):
         raise SystemExit(f"[error] {out} is not an empty folder; a stale file there would be uploaded with it")
     upstream_config = json.loads((upstream / "config.json").read_text(encoding="utf-8"))
@@ -374,9 +393,9 @@ def build(
         positions -= int(upstream_config.get("pad_token_id", 1)) + 1
     max_length = min(positions, _mxq_length(mxq))
     tokenizer_changes = []
-    for name in TOKENIZER_FILES:
-        if (upstream / name).is_file():
-            shutil.copyfile(upstream / name, out / name)
+    tokenizer_files = [name for name in TOKENIZER_FILES if (upstream / name).is_file()]
+    for name in tokenizer_files:
+        shutil.copyfile(upstream / name, out / name)
     # Truncation without max_length stops at model_max_length, which must not exceed what the MXQ takes.
     tokenizer_config = json.loads((out / "tokenizer_config.json").read_text(encoding="utf-8"))
     original = tokenizer_config.get("model_max_length")
@@ -388,6 +407,7 @@ def build(
         tokenizer_changes.append(f"`tokenizer_config.json`: `model_max_length` {original} -> {max_length}")
     shutil.copyfile(KINDS[kind]["proxy"], out / KINDS[kind]["proxy"].name)
     shutil.copyfile(mxq, out / mxq_name)
+    shutil.copyfile(license_text, out / "LICENSE")
     card = model_card(
         kind,
         repo_id,
@@ -400,24 +420,25 @@ def build(
         tokenizer_changes,
         target_device,
         license_id,
+        languages,
+        tokenizer_files,
     )
     (out / "README.md").write_text(card, encoding="utf-8")
     return out
 
 
-def upstream_license(upstream: Path) -> Optional[str]:
-    """The ``license:`` of the snapshot's model card front matter, when the snapshot has the card."""
+def upstream_card(upstream: Path) -> dict[str, Any]:
+    """The front matter of the snapshot's model card (``README.md``), or ``{}`` when the snapshot has no card."""
+    from huggingface_hub.repocard import metadata_load
+
     readme = upstream / "README.md"
-    if not readme.is_file():
+    return (metadata_load(readme) or {}) if readme.is_file() else {}
+
+
+def _as_list(value: Any) -> Optional[list[str]]:
+    if value is None:
         return None
-    text = readme.read_text(encoding="utf-8")
-    if not text.startswith("---"):
-        return None
-    for line in text.split("---", 2)[1].splitlines():
-        key, _, value = line.partition(":")
-        if key.strip() == "license":
-            return value.strip().strip("'\"") or None
-    return None
+    return [value] if isinstance(value, str) else [str(v) for v in value]
 
 
 def _mxq_length(mxq: Path) -> int:
@@ -454,6 +475,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="the base model's Hub licence id (default: the snapshot's README front matter)",
     )
     parser.add_argument(
+        "--language",
+        default=None,
+        help="comma-separated language codes for the card (default: the snapshot's README front matter)",
+    )
+    parser.add_argument(
+        "--license-file",
+        type=Path,
+        default=None,
+        help="licence text to ship as LICENSE (default: the snapshot's LICENSE, or the bundled Apache-2.0 text)",
+    )
+    parser.add_argument(
         "--target-device", choices=sorted(DEVICES), default="aries-rb", help="the board the MXQ was compiled for"
     )
     args = parser.parse_args(argv)
@@ -469,6 +501,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         args.card_facts,
         args.target_device,
         args.license,
+        args.language.split(",") if args.language else None,
+        args.license_file,
     )
     print(f"[ok] wrote {out}")
     return 0
