@@ -80,7 +80,7 @@ def encode_rows(
         return infer_sequence(mxq_models[slot], hidden)
 
     slots = max(1, len(mxq_models))
-    if slots == 1 or len(rows) == 1:
+    if slots == 1 or len(rows) <= 1:
         outs = [run(row, 0) for row in range(len(rows))]
     else:
         def run_slot(slot: int) -> list[tuple[int, np.ndarray]]:

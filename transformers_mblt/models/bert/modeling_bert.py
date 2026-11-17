@@ -197,7 +197,8 @@ class MobilintBertForMaskedLM(PretrainedOnlyMixin, MobilintBertPreTrainedModel):
     
     def dispose(self):
         self.bert.dispose()
-        
+
+
 class MobilintBertEmbeddingModel(MobilintBertModel):
     """A BERT encoder for sentence embeddings (such as multilingual E5) on the NPU.
 

@@ -357,7 +357,7 @@ def test_build_refuses_a_folder_with_files(tmp_path: Path) -> None:
     upstream, mxq = _fake_upstream(tmp_path, "embedder")
     (tmp_path / "hub").mkdir()
     (tmp_path / "hub" / "old.mxq").write_bytes(b"old")
-    with pytest.raises(SystemExit, match="not empty"):
+    with pytest.raises(SystemExit, match="not an empty folder"):
         build.build("embedder", mxq, upstream, tmp_path / "hub", "mobilint/e5", "org/base", REV)
 
 
@@ -367,6 +367,22 @@ def test_build_without_llm_settings_takes_the_compiler_default(tmp_path: Path) -
     mxq.with_name(mxq.name + ".config.json").write_text(json.dumps({"inferenceScheme": "all"}), encoding="utf-8")
     out = build.build("reranker", mxq, upstream, tmp_path / "hub", "mobilint/rr", "org/base", REV)
     assert "Sequences of up to 4,096 tokens" in (out / "README.md").read_text()
+
+
+def test_build_without_llm_apply_ignores_the_recorded_length(tmp_path: Path) -> None:
+    build = _load_build()
+    upstream, mxq = _fake_upstream(tmp_path, "reranker")
+    record = {"inferenceScheme": "all", "llm": {"apply": False, "attributes": {"maxSequenceLength": 2048}}}
+    mxq.with_name(mxq.name + ".config.json").write_text(json.dumps(record), encoding="utf-8")
+    out = build.build("reranker", mxq, upstream, tmp_path / "hub", "mobilint/rr", "org/base", REV)
+    assert "Sequences of up to 4,096 tokens" in (out / "README.md").read_text()
+
+
+def test_an_empty_batch_with_several_slots() -> None:
+    model, first = make_embedder()
+    model.npu_backend = SimpleNamespace(mxq_models=[first, FakeEncoderMxq()])
+    ids = torch.zeros((0, 4), dtype=torch.long)
+    assert model(input_ids=ids, attention_mask=ids).last_hidden_state.shape[0] == 0
 
 
 def test_outputs_take_in_place_ops() -> None:

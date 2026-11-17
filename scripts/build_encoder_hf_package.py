@@ -65,6 +65,10 @@ DEVICES: dict[str, dict[str, Any]] = {
         "slots": False,
     },
 }
+# qbcompiler keeps an encoder's sequence axis at this length unless llm.apply is true.
+DEFAULT_MXQ_LENGTH = 4096
+# Hub licence ids this script can state, with the name the card's Licence section uses.
+LICENCES = {"apache-2.0": "Apache License 2.0", "mit": "MIT License"}
 TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "sentencepiece.bpe.model")
 MIN_TRANSFORMERS_MBLT = "0.7.3"
 TESTED_QBRUNTIME = "1.5.3"
@@ -163,7 +167,7 @@ tokenizer = AutoTokenizer.from_pretrained("{repo_id}")
 model = AutoModel.from_pretrained("{repo_id}")
 
 texts = ["query: 엔진 오일은 언제 교체하나요?", "passage: 엔진 오일은 1만 km마다 교체합니다."]
-batch = tokenizer(texts, padding=True, truncation=True, max_length=512, return_tensors="pt")
+batch = tokenizer(texts, padding=True, truncation=True, return_tensors="pt")
 hidden = model(**batch).last_hidden_state
 mask = batch["attention_mask"].unsqueeze(-1).float()
 embeddings = torch.nn.functional.normalize((hidden * mask).sum(1) / mask.sum(1), dim=-1)
@@ -184,8 +188,7 @@ model = AutoModelForSequenceClassification.from_pretrained("{repo_id}")
 
 query = "엔진 오일은 언제 교체하나요?"
 documents = ["엔진 오일은 1만 km마다 교체합니다.", "타이어 공기압은 매달 확인합니다."]
-batch = tokenizer([query] * len(documents), documents, padding=True, truncation=True, max_length=512,
-                  return_tensors="pt")
+batch = tokenizer([query] * len(documents), documents, padding=True, truncation=True, return_tensors="pt")
 scores = torch.sigmoid(model(**batch).logits[:, 0])
 print(scores)
 model.dispose()
@@ -354,8 +357,8 @@ def build(
         raise SystemExit(
             f"[error] the base model's licence {license_id!r} is not one of {sorted(LICENCES)}; pass --license"
         )
-    if out.exists() and any(out.iterdir()):
-        raise SystemExit(f"[error] {out} is not empty; a stale file there would be uploaded with the folder")
+    if out.exists() and (not out.is_dir() or any(out.iterdir())):
+        raise SystemExit(f"[error] {out} is not an empty folder; a stale file there would be uploaded with it")
     upstream_config = json.loads((upstream / "config.json").read_text(encoding="utf-8"))
     config = build_config(upstream_config, kind, mxq_name, modes, target_device)
     facts = json.loads(card_facts.read_text(encoding="utf-8")) if card_facts is not None else {}
@@ -402,11 +405,6 @@ def build(
     return out
 
 
-DEFAULT_MXQ_LENGTH = 4096
-# Hub licence ids this script can state, with the name the card's Licence section uses.
-LICENCES = {"apache-2.0": "Apache License 2.0", "mit": "MIT License"}
-
-
 def upstream_license(upstream: Path) -> Optional[str]:
     """The ``license:`` of the snapshot's model card front matter, when the snapshot has the card."""
     readme = upstream / "README.md"
@@ -428,9 +426,9 @@ def _mxq_length(mxq: Path) -> int:
     the record says."""
     record = json.loads(mxq.with_name(mxq.name + ".config.json").read_text(encoding="utf-8"))
     llm = record.get("llm", {})
-    length = int(llm.get("attributes", {}).get("maxSequenceLength") or 0)
     if not llm.get("apply"):
-        return min(length, DEFAULT_MXQ_LENGTH) if length > 0 else DEFAULT_MXQ_LENGTH
+        return DEFAULT_MXQ_LENGTH
+    length = int(llm.get("attributes", {}).get("maxSequenceLength") or 0)
     if length <= 0:
         raise SystemExit(f"[error] the compile record of {mxq} applies llm settings without a maxSequenceLength")
     return length
