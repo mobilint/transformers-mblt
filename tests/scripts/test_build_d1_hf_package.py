@@ -125,6 +125,13 @@ def test_card_takes_the_base_languages_and_config_has_no_recipe(tmp_path: Path) 
     assert "mblt_recipe" not in json.loads((out / "config.json").read_text())
 
 
+def test_build_keeps_an_upstream_notice(tmp_path: Path) -> None:
+    package, upstream = _fake_package(tmp_path, np.zeros((4, 8), np.float32))
+    (upstream / "NOTICE").write_text("Liquid AI notice\n", encoding="utf-8")
+    out = build.build(package, tmp_path / "hub", upstream)
+    assert (out / "NOTICE").read_text() == "Liquid AI notice\n"
+
+
 def test_build_writes_the_hub_layout(tmp_path: Path) -> None:
     table = torch.randn(4, 8).to(torch.bfloat16).float().numpy()
     package, upstream = _fake_package(tmp_path, table)

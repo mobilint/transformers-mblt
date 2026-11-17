@@ -216,6 +216,7 @@ def model_card(
     license_id: str = "apache-2.0",
     languages: Optional[list[str]] = None,
     tokenizer_files: Sequence[str] = TOKENIZER_FILES,
+    notice: bool = False,
 ) -> str:
     spec = KINDS[kind]
     changed = "; ".join(tokenizer_changes or [])
@@ -276,7 +277,10 @@ def model_card(
     body = "\n".join(sections)
     language = "".join(f"\n- {json.dumps(code)}" for code in languages or [])
     language = f"language:{language}\n" if language else ""
-    licence_notes = "".join(f"\n\n{note}" for note in facts.get("licence", {}).get("notes", []))
+    notes = list(facts.get("licence", {}).get("notes", []))
+    if notice:
+        notes.insert(0, "The base model's attribution notices are kept in [NOTICE](NOTICE).")
+    licence_notes = "".join(f"\n\n{note}" for note in notes)
     return f"""---
 library_name: transformers
 license: {license_id}
@@ -412,6 +416,10 @@ def build(
     shutil.copyfile(KINDS[kind]["proxy"], out / KINDS[kind]["proxy"].name)
     shutil.copyfile(mxq, out / mxq_name)
     shutil.copyfile(license_text, out / "LICENSE")
+    # Apache-2.0 section 4(d): a derivative keeps the attribution notices of the base model's NOTICE file.
+    notice = (upstream / "NOTICE").is_file()
+    if notice:
+        shutil.copyfile(upstream / "NOTICE", out / "NOTICE")
     card = model_card(
         kind,
         repo_id,
@@ -426,6 +434,7 @@ def build(
         license_id,
         languages,
         tokenizer_files,
+        notice,
     )
     (out / "README.md").write_text(card, encoding="utf-8")
     return out

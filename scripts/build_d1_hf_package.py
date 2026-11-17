@@ -618,6 +618,8 @@ def build(
     shutil.copy2(package["prompt"], out / "prompt.py")
     shutil.copy2(PROXY_SOURCE, out / "proxy_d1.py")
     shutil.copy2(license_path, out / "LICENSE")
+    if upstream is not None and (upstream / "NOTICE").is_file():
+        shutil.copy2(upstream / "NOTICE", out / "NOTICE")
     vision = {key: config[key] for key in ("image_size", "patch_size", "image_tokens")}
     card = model_card(
         package,

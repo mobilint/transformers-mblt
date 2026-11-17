@@ -389,6 +389,17 @@ def test_an_overriding_licence_does_not_ship_the_snapshot_text(tmp_path: Path) -
         )
 
 
+def test_build_keeps_the_base_model_notice(tmp_path: Path) -> None:
+    build = _load_build()
+    upstream, mxq = _fake_upstream(tmp_path, "embedder")
+    out = build.build("embedder", mxq, upstream, tmp_path / "a", "mobilint/e5", "org/base", REV)
+    assert not (out / "NOTICE").exists() and "NOTICE" not in (out / "README.md").read_text()
+    (upstream / "NOTICE").write_text("Base model\nCopyright Someone\n", encoding="utf-8")
+    out = build.build("embedder", mxq, upstream, tmp_path / "b", "mobilint/e5", "org/base", REV)
+    assert (out / "NOTICE").read_text() == "Base model\nCopyright Someone\n"
+    assert "kept in [NOTICE](NOTICE)" in (out / "README.md").read_text()
+
+
 def test_language_codes_are_quoted_and_trimmed(tmp_path: Path) -> None:
     import yaml
 
