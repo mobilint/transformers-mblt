@@ -152,6 +152,12 @@ description: >-
   buffers are snapshotted after it and restored before every branch. `plan_chunks` keeps every infer call's length
   off `0`/`63` mod 64 in global core modes, because LFM2 hybrid graphs hang the NPU there. Only a branch's final call
   is zero-padded. Do not vendor upstream d1 code: it is LFM Open License v1.0, not BSD.
+- Encoder contract (`models/bert` embedding classes, `models/xlm_roberta`, `utils/encoder_utils.py`): the MXQ is the
+  encoder body (plus the reranker's classifier) on one unpadded sequence with a dynamic length and no attention mask.
+  Every row runs alone on its `attention_mask` positions, so never feed padded rows to the MXQ. The embedder and
+  reranker repositories ship their own proxies (`proxy_bert_embedding.py`, `proxy_xlm_roberta.py`); do not add their
+  classes to `proxy_bert.py`, which the `mobilint/bert-*` repositories ship. `scripts/build_encoder_hf_package.py`
+  builds their Hub folders for `aries-rb` or `--target-device regulus-rb-usb` (single core, `target_cores ["0:0"]`).
 - Preserve local style in `transformers_mblt/models` and `transformers_mblt/utils`; they are
   excluded from repository-wide Ruff checks.
 

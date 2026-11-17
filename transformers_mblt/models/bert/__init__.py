@@ -11,10 +11,23 @@ def __getattr__(name: str):
         module = importlib.import_module(".configuration_bert", __package__)
         return module.MobilintBertConfig
     
+    if name == "MobilintBertEmbeddingConfig":
+        module = importlib.import_module(".configuration_bert", __package__)
+        return module.MobilintBertEmbeddingConfig
+
+    if name == "MobilintBertEmbeddingModel":
+        module = importlib.import_module(".modeling_bert", __package__)
+        return module.MobilintBertEmbeddingModel
+
     if name == "MobilintBertForMaskedLM":
         module = importlib.import_module(".modeling_bert", __package__)
         return module.MobilintBertForMaskedLM
 
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
-__all__ = ["MobilintBertConfig", "MobilintBertForMaskedLM"]
+__all__ = [
+    "MobilintBertConfig",
+    "MobilintBertEmbeddingConfig",
+    "MobilintBertEmbeddingModel",
+    "MobilintBertForMaskedLM",
+]

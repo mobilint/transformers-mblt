@@ -98,6 +98,8 @@ print(list_models("text-generation"))
 | `automatic-speech-recognition` | Whisper, Qwen3-ASR, LFM2-Audio |
 | `image-to-text` | BLIP |
 | `fill-mask` | BERT |
+| `feature-extraction` | BERT embedding (multilingual E5) |
+| `text-classification` | XLM-RoBERTa cross-encoder (BGE reranker) |
 
 ## Command line
 
