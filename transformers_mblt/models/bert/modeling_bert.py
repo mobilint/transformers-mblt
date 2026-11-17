@@ -1,6 +1,5 @@
 from typing import Union, cast
 
-import numpy as np
 import torch
 from torch.nn import CrossEntropyLoss
 from transformers.modeling_outputs import (
@@ -19,8 +18,8 @@ from transformers.processing_utils import Unpack
 from transformers.utils.generic import TransformersKwargs, logging
 
 from ...utils.base_utils import PretrainedOnlyMixin
-from ...utils.modeling_utils import MobilintModelMixin
 from ...utils.encoder_utils import encode_rows, mxq_max_length
+from ...utils.modeling_utils import MobilintModelMixin
 from .configuration_bert import MobilintBertConfig, MobilintBertEmbeddingConfig
 
 logger = logging.get_logger(__name__)

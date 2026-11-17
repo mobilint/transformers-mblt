@@ -3,7 +3,8 @@
 Those MXQs hold the encoder body only: they take the embedding-layer output of one sequence, ``(1, length, hidden)``,
 with a dynamic length axis and no attention mask. The host looks up the embeddings and runs each sequence of a batch
 on its own, without its padding, so padding never reaches the attention and position ids start fresh per sequence.
-With several launched slots (``max_batch_size`` or a list ``dev_no``), the rows are spread over them round robin.
+With several launched slots, the rows are spread over them round robin. ``max_batch_size`` sets the number of
+slots; a list ``dev_no`` places them on several devices, so it needs ``max_batch_size`` of at least its length.
 """
 
 from __future__ import annotations

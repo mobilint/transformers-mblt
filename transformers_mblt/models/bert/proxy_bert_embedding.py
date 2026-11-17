@@ -9,13 +9,19 @@ _MISSING = {
     "mblt_model_zoo.hf_transformers.models",
     "mblt_model_zoo.hf_transformers.models.bert",
 }
+# Releases before 0.7.3 have these modules without the embedding classes.
+_OLD_MODULES = {
+    f"{package}.models.bert.{module}"
+    for package in ("transformers_mblt", "mblt_model_zoo.hf_transformers")
+    for module in ("configuration_bert", "modeling_bert")
+}
 
 
 def _missing(exc: ImportError) -> bool:
     """A missing package, or an older release without these classes; any other import failure is re-raised."""
     if isinstance(exc, ModuleNotFoundError):
         return exc.name in _MISSING
-    return "cannot import name" in str(exc)
+    return exc.name in _OLD_MODULES and "MobilintBertEmbedding" in str(exc)
 
 
 try:

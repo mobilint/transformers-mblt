@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -52,10 +53,16 @@ _SCHEME_MODES = {
     "single": ["single"],
 }
 DEVICES: dict[str, dict[str, Any]] = {
-    "aries-rb": {"npu": "A Mobilint ARIES (`aries-rb`) NPU with its driver.", "schemes": set(_SCHEME_MODES)},
+    # slots: whether several launched copies (max_batch_size) can run at once; REGULUS has one core.
+    "aries-rb": {
+        "npu": "A Mobilint ARIES (`aries-rb`) NPU with its driver.",
+        "schemes": set(_SCHEME_MODES),
+        "slots": True,
+    },
     "regulus-rb-usb": {
         "npu": "A Mobilint REGULUS USB board (`regulus-rb-usb`) with its driver.",
         "schemes": {"single"},
+        "slots": False,
     },
 }
 TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "sentencepiece.bpe.model")
@@ -85,6 +92,7 @@ KINDS: dict[str, dict[str, Any]] = {
     },
 }
 # transformers_version stays: Transformers 5 warns of a broken (Mistral) regex for local folders without it.
+_COMMIT = re.compile(r"[0-9a-f]{40}")
 _CONFIG_DROP = ("_name_or_path", "architectures", "auto_map", "torch_dtype", "dtype")
 
 
@@ -187,7 +195,13 @@ As the base model, the relevance score of a (query, document) pair is the sigmoi
 
 
 def model_card(
-    kind: str, repo_id: str, base_model: str, revision: str, mxq_name: str, modes: list[str], max_length: int,
+    kind: str,
+    repo_id: str,
+    base_model: str,
+    revision: str,
+    mxq_name: str,
+    modes: list[str],
+    max_length: int,
     facts: dict[str, Any],
     tokenizer_changes: Optional[list[str]] = None,
     target_device: str = "aries-rb",
@@ -205,9 +219,16 @@ def model_card(
         if kind == "embedder"
         else "The embedding lookup runs on the host; the encoder and the classification head run on the NPU."
     )
+    batch_text = (
+        "Each sequence of a batch runs on its own, without its padding; with\n  several launched slots "
+        "(`max_batch_size=`), the sequences spread over them."
+        if DEVICES[target_device]["slots"]
+        else "Each sequence of a batch runs on its own, without its padding."
+    )
     others = ", ".join(f"`{m}`" for m in modes[1:])
     mode_text = (
-        f"`{modes[0]}` by default" + (f"; {others} also run" if others else "")
+        f"`{modes[0]}` by default"
+        + (f"; {others} also run" if others else "")
         + ". Pass `core_mode=` (with `target_clusters=` or `target_cores=`) to `from_pretrained` to pick one."
         if len(modes) > 1
         else f"`{modes[0]}` only."
@@ -215,8 +236,16 @@ def model_card(
     sections = []
     q = facts.get("quantization")
     if q:
-        rows = [[label, q[key]] for label, key in (("Weights", "weights"), ("Activations", "activations"),
-                                                  ("Method", "method"), ("Compiler", "compiler")) if q.get(key)]
+        rows = [
+            [label, q[key]]
+            for label, key in (
+                ("Weights", "weights"),
+                ("Activations", "activations"),
+                ("Method", "method"),
+                ("Compiler", "compiler"),
+            )
+            if q.get(key)
+        ]
         sections.append("## Quantization\n\n" + _table(["Item", "Setting"], rows) + "\n")
     c = facts.get("calibration")
     if c:
@@ -240,7 +269,7 @@ license: apache-2.0
 license_link: https://huggingface.co/{base_model}
 base_model: {base_model}
 base_model_relation: quantized
-pipeline_tag: {spec['pipeline_tag']}
+pipeline_tag: {spec["pipeline_tag"]}
 tags:
 - mobilint
 - transformers
@@ -270,14 +299,13 @@ environment.
 
 ## Requirements
 
-- {DEVICES[target_device]['npu']}
+- {DEVICES[target_device]["npu"]}
 - `pip install "transformers-mblt>={MIN_TRANSFORMERS_MBLT}"`. It installs `mobilint-qb-runtime`; this build was
   tested with qbruntime {TESTED_QBRUNTIME}.
 - The model loads after `transformers_mblt.register()`, or with `trust_remote_code=True` (which runs
-  `{spec['proxy'].name}`). The tokenizer is the base model's own.
+  `{spec["proxy"].name}`). The tokenizer is the base model's own.
 - Core modes: {mode_text}
-- Sequences of up to {max_length:,} tokens. Each sequence of a batch runs on its own, without its padding; with
-  several launched slots (`max_batch_size=`), the sequences spread over them.
+- Sequences of up to {max_length:,} tokens. {batch_text}
 
 {body}
 ## Licence
@@ -285,7 +313,7 @@ environment.
 The base model, [{base_model}](https://huggingface.co/{base_model}), is licensed under the Apache License 2.0. This
 repository is a derivative work under the same licence. Changes: the encoder is quantized and compiled into
 `{mxq_name}`; `model.safetensors` holds the base model's embedding-layer weights only, unchanged; `config.json` and
-`{spec['proxy'].name}` are new files for `transformers-mblt`. {tokenizer_note}
+`{spec["proxy"].name}` are new files for `transformers-mblt`. {tokenizer_note}
 """
 
 
@@ -315,14 +343,20 @@ def build(
     scheme = json.loads(mxq.with_name(mxq.name + ".config.json").read_text(encoding="utf-8"))["inferenceScheme"]
     if scheme not in DEVICES[target_device]["schemes"]:
         raise SystemExit(f"[error] {target_device} does not run an MXQ compiled with inferenceScheme {scheme!r}")
+    for name in ("config.json", "model.safetensors", "tokenizer.json", "tokenizer_config.json"):
+        if not (upstream / name).is_file():
+            raise SystemExit(f"[error] {upstream} has no {name}; pass a snapshot with a single model.safetensors")
+    if not _COMMIT.fullmatch(revision):
+        raise SystemExit(f"[error] the base model revision must be a 40-character commit hash, got {revision!r}")
     upstream_config = json.loads((upstream / "config.json").read_text(encoding="utf-8"))
     config = build_config(upstream_config, kind, mxq_name, modes, target_device)
     facts = json.loads(card_facts.read_text(encoding="utf-8")) if card_facts is not None else {}
 
     out.mkdir(parents=True, exist_ok=True)
     (out / "config.json").write_text(json.dumps(config, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    save_file(embedding_weights(upstream, KINDS[kind]["prefix"]), str(out / "model.safetensors"),
-              metadata={"format": "pt"})
+    save_file(
+        embedding_weights(upstream, KINDS[kind]["prefix"]), str(out / "model.safetensors"), metadata={"format": "pt"}
+    )
     os.chmod(out / "model.safetensors", 0o644)
     positions = int(upstream_config["max_position_embeddings"])
     if kind == "reranker":
@@ -373,15 +407,26 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--repo-id", required=True, help="Hub repository, such as mobilint/bge-reranker-v2-m3-ko")
     parser.add_argument("--base-model", required=True, help="base model id, such as dragonkue/bge-reranker-v2-m3-ko")
-    parser.add_argument("--revision", default=None, help="base model revision (default: the snapshot folder name)")
+    parser.add_argument(
+        "--revision", default=None, help="base model commit hash (default: the snapshot folder name, which must be one)"
+    )
     parser.add_argument("--mxq-name", default=None, help="MXQ file name (default: <repo name>.mxq)")
     parser.add_argument("--card-facts", type=Path, default=None)
-    parser.add_argument("--target-device", choices=sorted(DEVICES), default="aries-rb",
-                        help="the board the MXQ was compiled for")
+    parser.add_argument(
+        "--target-device", choices=sorted(DEVICES), default="aries-rb", help="the board the MXQ was compiled for"
+    )
     args = parser.parse_args(argv)
     out = build(
-        args.kind, args.mxq, args.upstream, args.out, args.repo_id, args.base_model,
-        args.revision or args.upstream.resolve().name, args.mxq_name, args.card_facts, args.target_device,
+        args.kind,
+        args.mxq,
+        args.upstream,
+        args.out,
+        args.repo_id,
+        args.base_model,
+        args.revision or args.upstream.resolve().name,
+        args.mxq_name,
+        args.card_facts,
+        args.target_device,
     )
     print(f"[ok] wrote {out}")
     return 0

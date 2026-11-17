@@ -155,6 +155,21 @@ def test_registration_and_proxies() -> None:
         assert all(hasattr(module, n) for n in names)
 
 
+def test_bert_proxy_blames_an_old_release_only_for_its_own_names() -> None:
+    file = Path(transformers_mblt.__file__).parent / "models" / "bert" / "proxy_bert_embedding.py"
+    spec = importlib.util.spec_from_file_location("proxy_under_test_missing", file)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    old = "transformers_mblt.models.bert.configuration_bert"
+    assert module._missing(ImportError(f"cannot import name 'MobilintBertEmbeddingConfig' from '{old}'", name=old))
+    assert module._missing(ModuleNotFoundError("No module named 'transformers_mblt'", name="transformers_mblt"))
+    # A transformers mismatch inside the modules, or a missing runtime dependency, is the real error.
+    assert not module._missing(
+        ImportError("cannot import name 'TransformersKwargs' from 'transformers.utils'", name="transformers.utils")
+    )
+    assert not module._missing(ModuleNotFoundError("No module named 'mblt_npu'", name="mblt_npu"))
+
+
 def test_tasks_list_the_encoders() -> None:
     from transformers_mblt.utils.api import TASKS
 
@@ -177,24 +192,42 @@ def _load_build() -> ModuleType:
     return module
 
 
+REV = "0123456789abcdef0123456789abcdef01234567"
+
+
 def _fake_upstream(root: Path, kind: str) -> tuple[Path, Path]:
     from safetensors.torch import save_file
 
     upstream = root / "upstream"
     upstream.mkdir()
     if kind == "embedder":
-        config = {"model_type": "bert", "architectures": ["BertModel"], "hidden_size": 8,
-                  "max_position_embeddings": 512, "vocab_size": 10, "torch_dtype": "float32",
-                  "transformers_version": "4.52.4"}
+        config = {
+            "model_type": "bert",
+            "architectures": ["BertModel"],
+            "hidden_size": 8,
+            "max_position_embeddings": 512,
+            "vocab_size": 10,
+            "torch_dtype": "float32",
+            "transformers_version": "4.52.4",
+        }
         prefix = "embeddings."
     else:
-        config = {"model_type": "xlm-roberta", "architectures": ["XLMRobertaForSequenceClassification"],
-                  "hidden_size": 8, "max_position_embeddings": 8194, "pad_token_id": 1, "vocab_size": 10,
-                  "_name_or_path": "BAAI/bge-reranker-v2-m3"}
+        config = {
+            "model_type": "xlm-roberta",
+            "architectures": ["XLMRobertaForSequenceClassification"],
+            "hidden_size": 8,
+            "max_position_embeddings": 8194,
+            "pad_token_id": 1,
+            "vocab_size": 10,
+            "_name_or_path": "BAAI/bge-reranker-v2-m3",
+        }
         prefix = "roberta.embeddings."
     (upstream / "config.json").write_text(json.dumps(config), encoding="utf-8")
-    tensors = {f"{prefix}word_embeddings.weight": torch.randn(10, 8), f"{prefix}LayerNorm.weight": torch.ones(8),
-               "encoder.layer.0.attention.self.query.weight": torch.randn(8, 8)}
+    tensors = {
+        f"{prefix}word_embeddings.weight": torch.randn(10, 8),
+        f"{prefix}LayerNorm.weight": torch.ones(8),
+        "encoder.layer.0.attention.self.query.weight": torch.randn(8, 8),
+    }
     save_file(tensors, str(upstream / "model.safetensors"))
     for name in ("tokenizer.json", "special_tokens_map.json"):
         (upstream / name).write_text("{}", encoding="utf-8")
@@ -214,7 +247,7 @@ def test_build_writes_the_hub_folder(tmp_path: Path, kind: str) -> None:
     build = _load_build()
     upstream, mxq = _fake_upstream(tmp_path, kind)
     repo = "mobilint/e5" if kind == "embedder" else "mobilint/rr"
-    out = build.build(kind, mxq, upstream, tmp_path / "hub", repo, "org/base", "abc")
+    out = build.build(kind, mxq, upstream, tmp_path / "hub", repo, "org/base", REV)
     config = json.loads((out / "config.json").read_text())
     spec = build.KINDS[kind]
     assert config["model_type"] == spec["model_type"] and config["architectures"] == [spec["architecture"]]
@@ -226,6 +259,7 @@ def test_build_writes_the_hub_folder(tmp_path: Path, kind: str) -> None:
     card = (out / "README.md").read_text()
     assert "base_model_relation: quantized" in card and f"pipeline_tag: {spec['pipeline_tag']}" in card
     assert "`global8` by default; `global4`, `single` also run" in card
+    assert "several launched slots (`max_batch_size=`)" in card
     limit = "4,096" if kind == "reranker" else "512"
     assert f"Sequences of up to {limit} tokens" in card
     assert (out / spec["proxy"].name).read_bytes() == spec["proxy"].read_bytes()
@@ -251,7 +285,7 @@ def test_build_takes_the_length_the_compiler_applied(tmp_path: Path, apply: bool
     upstream, mxq = _fake_upstream(tmp_path, "reranker")
     record = {"inferenceScheme": "all", "llm": {"apply": apply, "attributes": {"maxSequenceLength": 8192}}}
     mxq.with_name(mxq.name + ".config.json").write_text(json.dumps(record), encoding="utf-8")
-    out = build.build("reranker", mxq, upstream, tmp_path / "hub", "mobilint/rr", "org/base", "abc")
+    out = build.build("reranker", mxq, upstream, tmp_path / "hub", "mobilint/rr", "org/base", REV)
     assert f"Sequences of up to {length:,} tokens" in (out / "README.md").read_text()
     assert json.loads((out / "tokenizer_config.json").read_text())["model_max_length"] == length
 
@@ -260,18 +294,27 @@ def test_build_for_regulus_runs_single_only(tmp_path: Path) -> None:
     build = _load_build()
     upstream, mxq = _fake_upstream(tmp_path, "embedder")
     with pytest.raises(SystemExit, match="regulus-rb-usb"):
-        build.build("embedder", mxq, upstream, tmp_path / "hub", "mobilint/e5", "org/base", "abc",
-                    target_device="regulus-rb-usb")
+        build.build(
+            "embedder", mxq, upstream, tmp_path / "hub", "mobilint/e5", "org/base", REV, target_device="regulus-rb-usb"
+        )
     record = {"inferenceScheme": "single", "llm": {"attributes": {"maxSequenceLength": 4096}}}
     mxq.with_name(mxq.name + ".config.json").write_text(json.dumps(record), encoding="utf-8")
-    out = build.build("embedder", mxq, upstream, tmp_path / "hub", "mobilint/e5-regulus-rb-usb", "org/base", "abc",
-                      target_device="regulus-rb-usb")
+    out = build.build(
+        "embedder",
+        mxq,
+        upstream,
+        tmp_path / "hub",
+        "mobilint/e5-regulus-rb-usb",
+        "org/base",
+        REV,
+        target_device="regulus-rb-usb",
+    )
     config = json.loads((out / "config.json").read_text())
     assert config["target_device"] == "regulus-rb-usb" and config["core_mode"] == "single"
     assert config["target_cores"] == ["0:0"]
     card = (out / "README.md").read_text()
     assert "`regulus-rb-usb` NPU" in card and "REGULUS USB board" in card and "`single` only." in card
-    assert "aries" not in card.lower()
+    assert "aries" not in card.lower() and "max_batch_size" not in card
 
     from transformers import AutoConfig
 
@@ -280,11 +323,26 @@ def test_build_for_regulus_runs_single_only(tmp_path: Path) -> None:
     assert loaded.target_device == "regulus-rb-usb" and loaded.core_mode == "single"
 
 
+def test_build_refuses_a_revision_that_is_not_a_commit(tmp_path: Path) -> None:
+    build = _load_build()
+    upstream, mxq = _fake_upstream(tmp_path, "embedder")
+    with pytest.raises(SystemExit, match="commit hash"):
+        build.build("embedder", mxq, upstream, tmp_path / "hub", "mobilint/e5", "org/base", "my-snapshot")
+
+
+def test_build_names_a_missing_upstream_file(tmp_path: Path) -> None:
+    build = _load_build()
+    upstream, mxq = _fake_upstream(tmp_path, "embedder")
+    (upstream / "model.safetensors").unlink()
+    with pytest.raises(SystemExit, match="model.safetensors"):
+        build.build("embedder", mxq, upstream, tmp_path / "hub", "mobilint/e5", "org/base", REV)
+
+
 def test_build_refuses_the_wrong_checkpoint(tmp_path: Path) -> None:
     build = _load_build()
     upstream, mxq = _fake_upstream(tmp_path, "embedder")
     with pytest.raises(SystemExit, match="xlm-roberta"):
-        build.build("reranker", mxq, upstream, tmp_path / "hub", "mobilint/rr", "org/base", "abc")
+        build.build("reranker", mxq, upstream, tmp_path / "hub", "mobilint/rr", "org/base", REV)
 
 
 def test_rows_spread_over_launched_slots() -> None:
@@ -313,15 +371,33 @@ def test_from_pretrained_loads_the_embedding_only_folder(tmp_path: Path, monkeyp
     monkeypatch.setattr(MobilintNPUBackend, "dispose", lambda self: None)
     transformers_mblt.register()
     if kind == "embedder":
-        config = MobilintBertEmbeddingConfig(vocab_size=30, hidden_size=8, max_position_embeddings=32,
-                                             type_vocab_size=2, pad_token_id=0, num_hidden_layers=1,
-                                             num_attention_heads=2, intermediate_size=16, mxq_path="m.mxq",
-                                             core_mode="global8")
+        config = MobilintBertEmbeddingConfig(
+            vocab_size=30,
+            hidden_size=8,
+            max_position_embeddings=32,
+            type_vocab_size=2,
+            pad_token_id=0,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            intermediate_size=16,
+            mxq_path="m.mxq",
+            core_mode="global8",
+        )
         prefix, auto = "embeddings.", AutoModel
     else:
-        config = MobilintXLMRobertaConfig(vocab_size=30, hidden_size=8, max_position_embeddings=40, type_vocab_size=1,
-                                          pad_token_id=1, num_hidden_layers=1, num_attention_heads=2,
-                                          intermediate_size=16, num_labels=1, mxq_path="m.mxq", core_mode="global8")
+        config = MobilintXLMRobertaConfig(
+            vocab_size=30,
+            hidden_size=8,
+            max_position_embeddings=40,
+            type_vocab_size=1,
+            pad_token_id=1,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            intermediate_size=16,
+            num_labels=1,
+            mxq_path="m.mxq",
+            core_mode="global8",
+        )
         prefix, auto = "roberta.embeddings.", AutoModelForSequenceClassification
     config.save_pretrained(tmp_path)
     torch.manual_seed(1)
