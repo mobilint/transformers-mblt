@@ -21,7 +21,8 @@ The card's measured facts come from a JSON sidecar (``--card-facts``)::
      "fidelity": {"intro": str, "columns": [str, ...], "rows": [{"set": str, "values": [str, ...]}, ...],
                   "notes": [str, ...]}}
 
-The core modes come from the MXQ's compile record (``<mxq>.config.json``: ``inferenceScheme``).
+The core modes come from the MXQ's compile record (``<mxq>.config.json``: ``inferenceScheme``). ``--target-device``
+names the board the MXQ was compiled for (``aries-rb`` by default, or ``regulus-rb-usb``, which runs only ``single``).
 
 Usage::
 
@@ -49,6 +50,13 @@ _SCHEME_MODES = {
     "global8": ["global8"],
     "global4": ["global4"],
     "single": ["single"],
+}
+DEVICES: dict[str, dict[str, Any]] = {
+    "aries-rb": {"npu": "A Mobilint ARIES (`aries-rb`) NPU with its driver.", "schemes": set(_SCHEME_MODES)},
+    "regulus-rb-usb": {
+        "npu": "A Mobilint REGULUS USB board (`regulus-rb-usb`) with its driver.",
+        "schemes": {"single"},
+    },
 }
 TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "sentencepiece.bpe.model")
 MIN_TRANSFORMERS_MBLT = "0.7.3"
@@ -91,7 +99,9 @@ def core_modes(mxq: Path) -> list[str]:
     return _SCHEME_MODES[scheme]
 
 
-def build_config(upstream: dict[str, Any], kind: str, mxq_name: str, modes: list[str]) -> dict[str, Any]:
+def build_config(
+    upstream: dict[str, Any], kind: str, mxq_name: str, modes: list[str], target_device: str = "aries-rb"
+) -> dict[str, Any]:
     spec = KINDS[kind]
     if upstream.get("model_type") != spec["upstream_type"]:
         raise SystemExit(
@@ -107,10 +117,12 @@ def build_config(upstream: dict[str, Any], kind: str, mxq_name: str, modes: list
         architectures=[spec["architecture"]],
         auto_map=auto_map,
         mxq_path=mxq_name,
-        target_device="aries-rb",
+        target_device=target_device,
         core_mode=modes[0],
         dtype="float32",
     )
+    if modes == ["single"]:
+        config["target_cores"] = ["0:0"]
     return config
 
 
@@ -178,6 +190,7 @@ def model_card(
     kind: str, repo_id: str, base_model: str, revision: str, mxq_name: str, modes: list[str], max_length: int,
     facts: dict[str, Any],
     tokenizer_changes: Optional[list[str]] = None,
+    target_device: str = "aries-rb",
 ) -> str:
     spec = KINDS[kind]
     changed = "; ".join(tokenizer_changes or [])
@@ -193,7 +206,12 @@ def model_card(
         else "The embedding lookup runs on the host; the encoder and the classification head run on the NPU."
     )
     others = ", ".join(f"`{m}`" for m in modes[1:])
-    mode_text = f"`{modes[0]}` by default" + (f"; {others} also run" if others else "")
+    mode_text = (
+        f"`{modes[0]}` by default" + (f"; {others} also run" if others else "")
+        + ". Pass `core_mode=` (with `target_clusters=` or `target_cores=`) to `from_pretrained` to pick one."
+        if len(modes) > 1
+        else f"`{modes[0]}` only."
+    )
     sections = []
     q = facts.get("quantization")
     if q:
@@ -246,19 +264,18 @@ environment.
 # {repo_id.split("/")[-1]} for Mobilint NPUs
 
 [{base_model}](https://huggingface.co/{base_model}) (revision `{revision}`), a {what}, compiled for the Mobilint
-`aries-rb` NPU. {runs}
+`{target_device}` NPU. {runs}
 
 {_usage(kind, repo_id)}
 
 ## Requirements
 
-- A Mobilint ARIES (`aries-rb`) NPU with its driver.
+- {DEVICES[target_device]['npu']}
 - `pip install "transformers-mblt>={MIN_TRANSFORMERS_MBLT}"`. It installs `mobilint-qb-runtime`; this build was
   tested with qbruntime {TESTED_QBRUNTIME}.
 - The model loads after `transformers_mblt.register()`, or with `trust_remote_code=True` (which runs
   `{spec['proxy'].name}`). The tokenizer is the base model's own.
-- Core modes: {mode_text}. Pass `core_mode=` (with `target_clusters=` or `target_cores=`) to `from_pretrained` to
-  pick one.
+- Core modes: {mode_text}
 - Sequences of up to {max_length:,} tokens. Each sequence of a batch runs on its own, without its padding; with
   several launched slots (`max_batch_size=`), the sequences spread over them.
 
@@ -282,6 +299,7 @@ def build(
     revision: str,
     mxq_name: Optional[str] = None,
     card_facts: Optional[Path] = None,
+    target_device: str = "aries-rb",
 ) -> Path:
     """Write the Hub folder ``out`` and return it."""
     from safetensors.torch import save_file
@@ -291,9 +309,14 @@ def build(
     if not mxq.is_file():
         raise SystemExit(f"[error] {mxq} is not a file")
     mxq_name = mxq_name or f"{repo_id.split('/')[-1]}.mxq"
+    if target_device not in DEVICES:
+        raise SystemExit(f"[error] --target-device must be one of {sorted(DEVICES)}")
     modes = core_modes(mxq)
+    scheme = json.loads(mxq.with_name(mxq.name + ".config.json").read_text(encoding="utf-8"))["inferenceScheme"]
+    if scheme not in DEVICES[target_device]["schemes"]:
+        raise SystemExit(f"[error] {target_device} does not run an MXQ compiled with inferenceScheme {scheme!r}")
     upstream_config = json.loads((upstream / "config.json").read_text(encoding="utf-8"))
-    config = build_config(upstream_config, kind, mxq_name, modes)
+    config = build_config(upstream_config, kind, mxq_name, modes, target_device)
     facts = json.loads(card_facts.read_text(encoding="utf-8")) if card_facts is not None else {}
 
     out.mkdir(parents=True, exist_ok=True)
@@ -320,7 +343,9 @@ def build(
         tokenizer_changes.append(f"`tokenizer_config.json`: `model_max_length` {original} -> {max_length}")
     shutil.copyfile(KINDS[kind]["proxy"], out / KINDS[kind]["proxy"].name)
     shutil.copyfile(mxq, out / mxq_name)
-    card = model_card(kind, repo_id, base_model, revision, mxq_name, modes, max_length, facts, tokenizer_changes)
+    card = model_card(
+        kind, repo_id, base_model, revision, mxq_name, modes, max_length, facts, tokenizer_changes, target_device
+    )
     (out / "README.md").write_text(card, encoding="utf-8")
     return out
 
@@ -351,10 +376,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--revision", default=None, help="base model revision (default: the snapshot folder name)")
     parser.add_argument("--mxq-name", default=None, help="MXQ file name (default: <repo name>.mxq)")
     parser.add_argument("--card-facts", type=Path, default=None)
+    parser.add_argument("--target-device", choices=sorted(DEVICES), default="aries-rb",
+                        help="the board the MXQ was compiled for")
     args = parser.parse_args(argv)
     out = build(
         args.kind, args.mxq, args.upstream, args.out, args.repo_id, args.base_model,
-        args.revision or args.upstream.resolve().name, args.mxq_name, args.card_facts,
+        args.revision or args.upstream.resolve().name, args.mxq_name, args.card_facts, args.target_device,
     )
     print(f"[ok] wrote {out}")
     return 0

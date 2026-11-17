@@ -256,6 +256,30 @@ def test_build_takes_the_length_the_compiler_applied(tmp_path: Path, apply: bool
     assert json.loads((out / "tokenizer_config.json").read_text())["model_max_length"] == length
 
 
+def test_build_for_regulus_runs_single_only(tmp_path: Path) -> None:
+    build = _load_build()
+    upstream, mxq = _fake_upstream(tmp_path, "embedder")
+    with pytest.raises(SystemExit, match="regulus-rb-usb"):
+        build.build("embedder", mxq, upstream, tmp_path / "hub", "mobilint/e5", "org/base", "abc",
+                    target_device="regulus-rb-usb")
+    record = {"inferenceScheme": "single", "llm": {"attributes": {"maxSequenceLength": 4096}}}
+    mxq.with_name(mxq.name + ".config.json").write_text(json.dumps(record), encoding="utf-8")
+    out = build.build("embedder", mxq, upstream, tmp_path / "hub", "mobilint/e5-regulus-rb-usb", "org/base", "abc",
+                      target_device="regulus-rb-usb")
+    config = json.loads((out / "config.json").read_text())
+    assert config["target_device"] == "regulus-rb-usb" and config["core_mode"] == "single"
+    assert config["target_cores"] == ["0:0"]
+    card = (out / "README.md").read_text()
+    assert "`regulus-rb-usb` NPU" in card and "REGULUS USB board" in card and "`single` only." in card
+    assert "aries" not in card.lower()
+
+    from transformers import AutoConfig
+
+    transformers_mblt.register()
+    loaded = AutoConfig.from_pretrained(str(out))
+    assert loaded.target_device == "regulus-rb-usb" and loaded.core_mode == "single"
+
+
 def test_build_refuses_the_wrong_checkpoint(tmp_path: Path) -> None:
     build = _load_build()
     upstream, mxq = _fake_upstream(tmp_path, "embedder")
