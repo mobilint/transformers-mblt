@@ -274,7 +274,7 @@ def model_card(
             parts += [note, ""]
         sections.append("\n".join(parts))
     body = "\n".join(sections)
-    language = "".join(f"\n- {code}" for code in languages or [])
+    language = "".join(f"\n- {json.dumps(code)}" for code in languages or [])
     language = f"language:{language}\n" if language else ""
     licence_notes = "".join(f"\n\n{note}" for note in facts.get("licence", {}).get("notes", []))
     return f"""---
@@ -366,15 +366,19 @@ def build(
     if not _COMMIT.fullmatch(revision):
         raise SystemExit(f"[error] the base model revision must be a 40-character commit hash, got {revision!r}")
     base_card = upstream_card(upstream)
-    license_id = license_id or base_card.get("license")
+    card_licence = base_card.get("license")
+    license_id = license_id or card_licence
     if license_id not in LICENCES:
         raise SystemExit(
             f"[error] the base model's licence {license_id!r} is not one of {sorted(LICENCES)}; pass --license"
         )
     languages = languages or _as_list(base_card.get("language"))
-    license_text = license_file or (upstream / "LICENSE" if (upstream / "LICENSE").is_file() else None)
-    license_text = license_text or LICENSE_TEXTS.get(license_id)
-    if license_text is None or not license_text.is_file():
+    if license_file is not None and not license_file.is_file():
+        raise SystemExit(f"[error] --license-file {license_file} is not a file")
+    # The snapshot's LICENSE is the card's licence; it does not stand for a --license that overrides the card.
+    snapshot_text = upstream / "LICENSE" if license_id == card_licence and (upstream / "LICENSE").is_file() else None
+    license_text = license_file or snapshot_text or LICENSE_TEXTS.get(license_id)
+    if license_text is None:
         raise SystemExit(f"[error] no {license_id} licence text to ship; pass --license-file")
     if out.exists() and (not out.is_dir() or any(out.iterdir())):
         raise SystemExit(f"[error] {out} is not an empty folder; a stale file there would be uploaded with it")
@@ -501,7 +505,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         args.card_facts,
         args.target_device,
         args.license,
-        args.language.split(",") if args.language else None,
+        [code.strip() for code in args.language.split(",") if code.strip()] if args.language else None,
         args.license_file,
     )
     print(f"[ok] wrote {out}")

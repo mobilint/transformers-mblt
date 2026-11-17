@@ -121,7 +121,7 @@ def test_card_takes_the_base_languages_and_config_has_no_recipe(tmp_path: Path) 
     (upstream / "README.md").write_text("---\nlicense: other\nlanguage:\n- en\n- ko\n---\n# d1\n", encoding="utf-8")
     out = build.build(package, tmp_path / "hub", upstream)
     card = (out / "README.md").read_text()
-    assert "language:\n- en\n- ko\nbase_model:" in card and "d1-test" not in card
+    assert 'language:\n- "en"\n- "ko"\nbase_model:' in card and "d1-test" not in card
     assert "mblt_recipe" not in json.loads((out / "config.json").read_text())
 
 

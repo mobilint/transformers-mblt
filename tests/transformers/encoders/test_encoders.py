@@ -345,7 +345,7 @@ def test_build_states_the_base_model_licence(tmp_path: Path) -> None:
     out = build.build("embedder", mxq, upstream, tmp_path / "a", "mobilint/e5", "org/base", REV)
     card = (out / "README.md").read_text()
     assert "license: apache-2.0" in card and "under the Apache License 2.0" in card and "license_link" not in card
-    assert "language:\n- ko\n" in card and "text is in [LICENSE](LICENSE)" in card
+    assert 'language:\n- "ko"\n' in card and "text is in [LICENSE](LICENSE)" in card
     bundled = REPO_ROOT / "scripts" / "licenses" / "apache-2.0.txt"
     assert (out / "LICENSE").read_bytes() == bundled.read_bytes()
     # An MIT text names its copyright holder, so it must be given.
@@ -371,8 +371,52 @@ def test_build_adds_licence_notes_and_lists_only_shipped_tokenizer_files(tmp_pat
         "embedder", mxq, upstream, tmp_path / "hub", "mobilint/e5", "org/base", REV, card_facts=facts, languages=["en"]
     )
     card = (out / "README.md").read_text()
-    assert card.rstrip().endswith("Upstream X is MIT.") and "language:\n- en\n" in card
+    assert card.rstrip().endswith("Upstream X is MIT.") and 'language:\n- "en"\n' in card
     assert "sentencepiece.bpe.model" not in card and "`tokenizer.json`" in card
+
+
+def test_an_overriding_licence_does_not_ship_the_snapshot_text(tmp_path: Path) -> None:
+    build = _load_build()
+    upstream, mxq = _fake_upstream(tmp_path, "embedder")
+    (upstream / "LICENSE").write_text("Apache text of the snapshot\n", encoding="utf-8")
+    out = build.build("embedder", mxq, upstream, tmp_path / "a", "mobilint/e5", "org/base", REV)
+    assert (out / "LICENSE").read_text() == "Apache text of the snapshot\n"
+    with pytest.raises(SystemExit, match="--license-file"):
+        build.build("embedder", mxq, upstream, tmp_path / "b", "mobilint/e5", "org/base", REV, license_id="mit")
+    with pytest.raises(SystemExit, match="is not a file"):
+        build.build(
+            "embedder", mxq, upstream, tmp_path / "c", "mobilint/e5", "org/base", REV, license_file=tmp_path / "nope"
+        )
+
+
+def test_language_codes_are_quoted_and_trimmed(tmp_path: Path) -> None:
+    import yaml
+
+    build = _load_build()
+    upstream, mxq = _fake_upstream(tmp_path, "embedder")
+    rc = build.main(
+        [
+            "--kind",
+            "embedder",
+            "--mxq",
+            str(mxq),
+            "--upstream",
+            str(upstream),
+            "--out",
+            str(tmp_path / "hub"),
+            "--repo-id",
+            "mobilint/e5",
+            "--base-model",
+            "org/base",
+            "--revision",
+            REV,
+            "--language",
+            "no, en,",
+        ]
+    )
+    assert rc == 0
+    front = (tmp_path / "hub" / "README.md").read_text().split("---")[1]
+    assert yaml.safe_load(front)["language"] == ["no", "en"]
 
 
 def test_build_refuses_a_folder_with_files(tmp_path: Path) -> None:

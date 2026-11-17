@@ -459,7 +459,7 @@ def model_card(
         _licence(base, mxq_name, vision_mxq_name, tokenizer_changes or []),
     ]
     body = "\n".join(s for s in sections if s)
-    language = "".join(f"\n- {code}" for code in languages or [])
+    language = "".join(f"\n- {json.dumps(code)}" for code in languages or [])
     language = f"language:{language}\n" if language else ""
     return f"""---
 library_name: transformers
