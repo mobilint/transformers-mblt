@@ -280,7 +280,6 @@ def build_config(
     for key in ("_name_or_path", "name_or_path", "revision", "commit_hash", "_commit_hash", "id2label", "label2id"):
         data.pop(key, None)
     data["npu_prefill_chunk_size"] = config.npu_prefill_chunk_size
-    data["mblt_recipe"] = meta.get("recipe")
     return data
 
 
@@ -442,6 +441,7 @@ def model_card(
     vision: dict[str, Any],
     facts: Optional[dict[str, Any]] = None,
     tokenizer_changes: Optional[list[str]] = None,
+    languages: Optional[list[str]] = None,
 ) -> str:
     """The whole ``README.md``: front matter, usage, requirements, and the sections ``facts`` provides.
 
@@ -459,12 +459,14 @@ def model_card(
         _licence(base, mxq_name, vision_mxq_name, tokenizer_changes or []),
     ]
     body = "\n".join(s for s in sections if s)
+    language = "".join(f"\n- {json.dumps(code)}" for code in languages or [])
+    language = f"language:{language}\n" if language else ""
     return f"""---
 library_name: transformers
 license: other
 license_name: lfm1.0
 license_link: LICENSE
-base_model: {base}
+{language}base_model: {base}
 base_model_relation: quantized
 pipeline_tag: {D1_TASK}
 tags:
@@ -494,7 +496,7 @@ environment.
 # d1-3B for Mobilint NPUs
 
 [{base}](https://huggingface.co/{base}) (revision `{revision}`), compiled for the Mobilint
-`{meta.get("target_device") or "aries-rb"}` NPU (`{meta.get("recipe") or mxq_name}`). It reads text, JSON and pictures:
+`{meta.get("target_device") or "aries-rb"}` NPU. It reads text, JSON and pictures:
 the language model runs from `{mxq_name}` and the vision tower and projector from `{vision_mxq_name}`. The prompt is the
 checkpoint's own `prompt.py`, which the model loads from this repository.
 
@@ -537,6 +539,26 @@ def find_license(upstream: Optional[Path], meta: dict[str, Any]) -> Path:
     from huggingface_hub import hf_hub_download
 
     return Path(hf_hub_download(meta.get("model_id") or "LiquidAI/d1-3B", "LICENSE", revision=meta.get("revision")))
+
+
+def base_languages(upstream: Optional[Path], meta: dict[str, Any]) -> Optional[list[str]]:
+    """The ``language:`` of the base model's card: the snapshot's ``README.md``, else downloaded at its revision."""
+    from huggingface_hub.repocard import metadata_load
+
+    if upstream is not None:
+        readme = upstream / "README.md"
+        if not readme.is_file():
+            return None
+    else:
+        from huggingface_hub import hf_hub_download
+
+        readme = Path(
+            hf_hub_download(meta.get("model_id") or "LiquidAI/d1-3B", "README.md", revision=meta.get("revision"))
+        )
+    value = (metadata_load(readme) or {}).get("language")
+    if value is None:
+        return None
+    return [value] if isinstance(value, str) else [str(v) for v in value]
 
 
 def build(
@@ -596,6 +618,8 @@ def build(
     shutil.copy2(package["prompt"], out / "prompt.py")
     shutil.copy2(PROXY_SOURCE, out / "proxy_d1.py")
     shutil.copy2(license_path, out / "LICENSE")
+    if upstream is not None and (upstream / "NOTICE").is_file():
+        shutil.copy2(upstream / "NOTICE", out / "NOTICE")
     vision = {key: config[key] for key in ("image_size", "patch_size", "image_tokens")}
     card = model_card(
         package,
@@ -604,6 +628,7 @@ def build(
         vision,
         facts,
         tokenizer_config_changes(original_tokenizer_config, tokenizer_config),
+        base_languages(upstream, package["meta"]),
     )
     (out / "README.md").write_text(card, encoding="utf-8")
     return out
