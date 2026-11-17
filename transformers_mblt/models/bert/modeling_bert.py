@@ -219,7 +219,7 @@ class MobilintBertEmbeddingModel(MobilintBertModel):
         """The longest sequence: the position table, capped by the MXQ's input width."""
         return mxq_max_length(self.npu_backend.mxq_models[0], int(self.config.max_position_embeddings))
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def forward(
         self,
         input_ids: Union[torch.Tensor, None] = None,

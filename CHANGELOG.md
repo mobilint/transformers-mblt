@@ -27,7 +27,7 @@
   `last_hidden_state` with zeros at padded positions for mask-weighted pooling. New Hub repositories carry their own
   proxies (`proxy_bert_embedding.py`, `proxy_xlm_roberta.py`), so the `mobilint/bert-*` repositories keep theirs.
   `scripts/build_encoder_hf_package.py` assembles either Hub folder, model card included, from the compiled MXQ and
-  the upstream snapshot.
+  the upstream snapshot, for `aries-rb` or, with `--target-device regulus-rb-usb`, a REGULUS USB board (single core).
 - EXAONE 3.5 EAGLE-3 speculative decoding: `MobilintExaoneEagle3Config` / `MobilintExaoneEagle3ForCausalLM`
   (`model_type` `mobilint-exaone-eagle3`, `transformers_mblt/models/exaone_eagle3/`) wire the EXAONE 3.5 base body,
   the Llama-family one-block draft, and the FC projector on the shared EAGLE-3 mixins, for the

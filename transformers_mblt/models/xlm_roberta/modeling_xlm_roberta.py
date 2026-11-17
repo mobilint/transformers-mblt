@@ -63,7 +63,7 @@ class MobilintXLMRobertaForSequenceClassification(MobilintModelMixin, MobilintXL
         positions = int(self.config.max_position_embeddings) - int(self.config.pad_token_id) - 1
         return mxq_max_length(self.npu_backend.mxq_models[0], positions)
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def forward(
         self,
         input_ids: Union[torch.Tensor, None] = None,

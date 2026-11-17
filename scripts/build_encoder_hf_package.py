@@ -28,7 +28,7 @@ Usage::
 
     python scripts/build_encoder_hf_package.py --kind embedder --mxq <encoder.mxq> --upstream <snapshot> \
         --repo-id mobilint/multilingual-e5-small-ko-v2 --base-model dragonkue/multilingual-e5-small-ko-v2 \
-        --out <folder> [--card-facts facts.json]
+        --out <folder> [--card-facts facts.json] [--target-device regulus-rb-usb] [--license apache-2.0]
 """
 
 from __future__ import annotations
@@ -205,6 +205,7 @@ def model_card(
     facts: dict[str, Any],
     tokenizer_changes: Optional[list[str]] = None,
     target_device: str = "aries-rb",
+    license_id: str = "apache-2.0",
 ) -> str:
     spec = KINDS[kind]
     changed = "; ".join(tokenizer_changes or [])
@@ -265,8 +266,7 @@ def model_card(
     body = "\n".join(sections)
     return f"""---
 library_name: transformers
-license: apache-2.0
-license_link: https://huggingface.co/{base_model}
+license: {license_id}
 base_model: {base_model}
 base_model_relation: quantized
 pipeline_tag: {spec["pipeline_tag"]}
@@ -310,7 +310,7 @@ environment.
 {body}
 ## Licence
 
-The base model, [{base_model}](https://huggingface.co/{base_model}), is licensed under the Apache License 2.0. This
+The base model, [{base_model}](https://huggingface.co/{base_model}), is licensed under the {LICENCES[license_id]}. This
 repository is a derivative work under the same licence. Changes: the encoder is quantized and compiled into
 `{mxq_name}`; `model.safetensors` holds the base model's embedding-layer weights only, unchanged; `config.json` and
 `{spec["proxy"].name}` are new files for `transformers-mblt`. {tokenizer_note}
@@ -328,6 +328,7 @@ def build(
     mxq_name: Optional[str] = None,
     card_facts: Optional[Path] = None,
     target_device: str = "aries-rb",
+    license_id: Optional[str] = None,
 ) -> Path:
     """Write the Hub folder ``out`` and return it."""
     from safetensors.torch import save_file
@@ -348,6 +349,13 @@ def build(
             raise SystemExit(f"[error] {upstream} has no {name}; pass a snapshot with a single model.safetensors")
     if not _COMMIT.fullmatch(revision):
         raise SystemExit(f"[error] the base model revision must be a 40-character commit hash, got {revision!r}")
+    license_id = license_id or upstream_license(upstream)
+    if license_id not in LICENCES:
+        raise SystemExit(
+            f"[error] the base model's licence {license_id!r} is not one of {sorted(LICENCES)}; pass --license"
+        )
+    if out.exists() and any(out.iterdir()):
+        raise SystemExit(f"[error] {out} is not empty; a stale file there would be uploaded with the folder")
     upstream_config = json.loads((upstream / "config.json").read_text(encoding="utf-8"))
     config = build_config(upstream_config, kind, mxq_name, modes, target_device)
     facts = json.loads(card_facts.read_text(encoding="utf-8")) if card_facts is not None else {}
@@ -378,13 +386,40 @@ def build(
     shutil.copyfile(KINDS[kind]["proxy"], out / KINDS[kind]["proxy"].name)
     shutil.copyfile(mxq, out / mxq_name)
     card = model_card(
-        kind, repo_id, base_model, revision, mxq_name, modes, max_length, facts, tokenizer_changes, target_device
+        kind,
+        repo_id,
+        base_model,
+        revision,
+        mxq_name,
+        modes,
+        max_length,
+        facts,
+        tokenizer_changes,
+        target_device,
+        license_id,
     )
     (out / "README.md").write_text(card, encoding="utf-8")
     return out
 
 
 DEFAULT_MXQ_LENGTH = 4096
+# Hub licence ids this script can state, with the name the card's Licence section uses.
+LICENCES = {"apache-2.0": "Apache License 2.0", "mit": "MIT License"}
+
+
+def upstream_license(upstream: Path) -> Optional[str]:
+    """The ``license:`` of the snapshot's model card front matter, when the snapshot has the card."""
+    readme = upstream / "README.md"
+    if not readme.is_file():
+        return None
+    text = readme.read_text(encoding="utf-8")
+    if not text.startswith("---"):
+        return None
+    for line in text.split("---", 2)[1].splitlines():
+        key, _, value = line.partition(":")
+        if key.strip() == "license":
+            return value.strip().strip("'\"") or None
+    return None
 
 
 def _mxq_length(mxq: Path) -> int:
@@ -394,9 +429,11 @@ def _mxq_length(mxq: Path) -> int:
     record = json.loads(mxq.with_name(mxq.name + ".config.json").read_text(encoding="utf-8"))
     llm = record.get("llm", {})
     length = int(llm.get("attributes", {}).get("maxSequenceLength") or 0)
+    if not llm.get("apply"):
+        return min(length, DEFAULT_MXQ_LENGTH) if length > 0 else DEFAULT_MXQ_LENGTH
     if length <= 0:
-        raise SystemExit(f"[error] the compile record of {mxq} has no maxSequenceLength")
-    return length if llm.get("apply") else min(length, DEFAULT_MXQ_LENGTH)
+        raise SystemExit(f"[error] the compile record of {mxq} applies llm settings without a maxSequenceLength")
+    return length
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -413,6 +450,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--mxq-name", default=None, help="MXQ file name (default: <repo name>.mxq)")
     parser.add_argument("--card-facts", type=Path, default=None)
     parser.add_argument(
+        "--license",
+        choices=sorted(LICENCES),
+        default=None,
+        help="the base model's Hub licence id (default: the snapshot's README front matter)",
+    )
+    parser.add_argument(
         "--target-device", choices=sorted(DEVICES), default="aries-rb", help="the board the MXQ was compiled for"
     )
     args = parser.parse_args(argv)
@@ -427,6 +470,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         args.mxq_name,
         args.card_facts,
         args.target_device,
+        args.license,
     )
     print(f"[ok] wrote {out}")
     return 0

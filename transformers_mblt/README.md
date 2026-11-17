@@ -630,7 +630,10 @@ capped by the MXQ's input width. `labels`, `inputs_embeds` and `position_ids` ar
 
 `scripts/build_encoder_hf_package.py --kind embedder|reranker` assembles the Hub folder from the compiled MXQ (with
 its `<mxq>.config.json` compile record) and a local snapshot of the base model: the config, the embedding-layer
-weights, the tokenizer files, the proxy and the model card (measured sections from `--card-facts`).
+weights, the tokenizer files, the proxy and the model card (measured sections from `--card-facts`). The MXQ is for
+`aries-rb` by default; `--target-device regulus-rb-usb` takes a single-scheme MXQ for a REGULUS USB board and writes
+`core_mode: single`. The card's licence comes from the snapshot's model card, or `--license`. The output folder
+must be empty, so no file of an earlier build is uploaded with it.
 
 ## Host-Side Sampling
 

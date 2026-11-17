@@ -231,6 +231,7 @@ def _fake_upstream(root: Path, kind: str) -> tuple[Path, Path]:
     save_file(tensors, str(upstream / "model.safetensors"))
     for name in ("tokenizer.json", "special_tokens_map.json"):
         (upstream / name).write_text("{}", encoding="utf-8")
+    (upstream / "README.md").write_text("---\nlicense: apache-2.0\nlanguage:\n- ko\n---\n# base\n", encoding="utf-8")
     limit = 512 if kind == "embedder" else 8192
     (upstream / "tokenizer_config.json").write_text(json.dumps({"model_max_length": limit}), encoding="utf-8")
     mxq = root / "model.mxq"
@@ -336,6 +337,45 @@ def test_build_names_a_missing_upstream_file(tmp_path: Path) -> None:
     (upstream / "model.safetensors").unlink()
     with pytest.raises(SystemExit, match="model.safetensors"):
         build.build("embedder", mxq, upstream, tmp_path / "hub", "mobilint/e5", "org/base", REV)
+
+
+def test_build_states_the_base_model_licence(tmp_path: Path) -> None:
+    build = _load_build()
+    upstream, mxq = _fake_upstream(tmp_path, "embedder")
+    out = build.build("embedder", mxq, upstream, tmp_path / "a", "mobilint/e5", "org/base", REV)
+    card = (out / "README.md").read_text()
+    assert "license: apache-2.0" in card and "under the Apache License 2.0" in card and "license_link" not in card
+    out = build.build("embedder", mxq, upstream, tmp_path / "b", "mobilint/e5", "org/base", REV, license_id="mit")
+    assert "license: mit" in (out / "README.md").read_text()
+    (upstream / "README.md").unlink()
+    with pytest.raises(SystemExit, match="--license"):
+        build.build("embedder", mxq, upstream, tmp_path / "c", "mobilint/e5", "org/base", REV)
+
+
+def test_build_refuses_a_folder_with_files(tmp_path: Path) -> None:
+    build = _load_build()
+    upstream, mxq = _fake_upstream(tmp_path, "embedder")
+    (tmp_path / "hub").mkdir()
+    (tmp_path / "hub" / "old.mxq").write_bytes(b"old")
+    with pytest.raises(SystemExit, match="not empty"):
+        build.build("embedder", mxq, upstream, tmp_path / "hub", "mobilint/e5", "org/base", REV)
+
+
+def test_build_without_llm_settings_takes_the_compiler_default(tmp_path: Path) -> None:
+    build = _load_build()
+    upstream, mxq = _fake_upstream(tmp_path, "reranker")
+    mxq.with_name(mxq.name + ".config.json").write_text(json.dumps({"inferenceScheme": "all"}), encoding="utf-8")
+    out = build.build("reranker", mxq, upstream, tmp_path / "hub", "mobilint/rr", "org/base", REV)
+    assert "Sequences of up to 4,096 tokens" in (out / "README.md").read_text()
+
+
+def test_outputs_take_in_place_ops() -> None:
+    model, _ = make_reranker()
+    ids = torch.tensor([[0, 5, 6, 2]])
+    model(input_ids=ids, attention_mask=torch.ones_like(ids)).logits.sigmoid_()
+    model, _ = make_embedder()
+    ids = torch.tensor([[2, 5, 6, 3]])
+    model(input_ids=ids, attention_mask=torch.ones_like(ids)).last_hidden_state.mul_(2)
 
 
 def test_build_refuses_the_wrong_checkpoint(tmp_path: Path) -> None:
