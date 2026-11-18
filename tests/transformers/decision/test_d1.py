@@ -825,7 +825,7 @@ def test_proxy_asks_for_an_upgrade_on_a_release_without_d1(monkeypatch) -> None:
     proxy = Path(transformers_mblt.__file__).parent / "models" / "d1" / "proxy_d1.py"
     spec = importlib.util.spec_from_file_location("proxy_d1_old_release", proxy)
     module = importlib.util.module_from_spec(spec)
-    with pytest.raises(ImportError, match=r"transformers-mblt>=0\.7\.3"):
+    with pytest.raises(ImportError, match=r"transformers-mblt>=0\.8\.0"):
         spec.loader.exec_module(module)
 
 

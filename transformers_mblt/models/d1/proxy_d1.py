@@ -33,8 +33,8 @@ except ModuleNotFoundError as exc:
         if legacy_exc.name not in _MISSING:
             raise
         raise ImportError(
-            "This model requires transformers-mblt 0.7.3 or later, which adds D1. Please run: "
-            "pip install -U 'transformers-mblt>=0.7.3'"
+            "This model requires transformers-mblt 0.8.0 or later, which adds D1. Please run: "
+            "pip install -U 'transformers-mblt>=0.8.0'"
         ) from legacy_exc
 
 

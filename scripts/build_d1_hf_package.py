@@ -61,7 +61,7 @@ from transformers_mblt.models.d1 import D1_TASK  # noqa: E402
 PROXY_SOURCE = _REPO_ROOT / "transformers_mblt" / "models" / "d1" / "proxy_d1.py"
 DEFAULT_MXQ_NAME = "d1-3B.mxq"
 DEFAULT_VISION_MXQ_NAME = "d1-3B-vision.mxq"
-MIN_TRANSFORMERS_MBLT = "0.7.3"
+MIN_TRANSFORMERS_MBLT = "0.8.0"
 TESTED_QBRUNTIME = "1.5.3"
 AUTO_MAP = {"AutoConfig": "proxy_d1.MobilintD1Config", "AutoModel": "proxy_d1.MobilintD1Model"}
 # Runtime noise that transformers writes into tokenizer_config.json and that must not pin a tokenizer backend.
