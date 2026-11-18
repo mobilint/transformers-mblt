@@ -132,7 +132,19 @@ description: >-
   `shared_` / `expert_` / `lm_head_` role backends instead of subclassing `MobilintNPUBackend`
   (one MXQ file per backend does not fit thousands of MXQs). Roles are `single` core mode only,
   placed round-robin over the devices their `"d:c:k"` targets cover, and unprefixed NPU kwargs are
-  deliberately not fanned out to the roles. `batch_size` stays `1`. Releases are packed
+  deliberately not fanned out to the roles. A release of individual or packed MXQs serves one sequence
+  (`max_batch_size == 1`). A qbruntime MXQ package release (`moe_mxq_package`, `.mxqpkg`, qbruntime
+  1.6.0 `ModelPackage`; `scripts/configure_moe_package.py` writes its config fields) takes entry names
+  and the residual output of every shared MXQ from the package `manifest.json`; a BatchLLM package
+  (`"batch": true`) serves `max_batch_size` sequences through `_moe_forward_batch`: every shared MXQ
+  runs once per step with one `BatchParam` per sequence (`cache_id` = the cache row's slot), the routed
+  tokens of all sequences are grouped by expert (`_moe_mix_experts`), the post-slice last layer's experts
+  and the `lm_head` take one-token `BatchParam` rows (`experts_forward_rows`, `lm_head_forward_rows`,
+  one activation slot each; other experts stay on `NPUData` with none), steps respect the probed
+  `max_item_tokens` (shared input width) and `max_step_tokens` (expert input width), and only
+  last-token logits exist. `MobilintMixtureOfExpertsCache` mirrors `MobilintCache` slots
+  (`batch_size=K`, `slots=[s]`, `slot_of`, `from_rows`, `bind_rows`) for serving engines. Releases of
+  individual MXQs are packed
   (`scripts/pack_moe_mxq.py`, `moe_mxq_pack_index`): qbruntime re-reads an MXQ during `launch()`,
   so a member is materialized (Linux `memfd` when `/proc/self/fd` works, otherwise a short-lived
   temp file in `/dev/shm` or the temp dir; `MBLT_MOE_MXQ_MATERIALIZE` / `MBLT_MOE_MXQ_TMPDIR`)

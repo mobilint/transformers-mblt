@@ -67,6 +67,73 @@ MXQ_PACK_FORMAT = "mobilint-moe-mxqpack"
 MXQ_PACK_VERSION = 1
 # Hub downloads fetch packs by this suffix, so every pack name must end with it.
 MXQ_PACK_SUFFIX = ".mxqpack"
+# A qbruntime MXQ package (``.mxqpkg``) carries the compiler manifest under this entry name.
+MXQ_PACKAGE_MANIFEST_ENTRY = "manifest.json"
+
+
+def read_moe_package_manifest(package: Any) -> dict[str, Any]:
+    """Return the compiler manifest of an opened ``qbruntime.ModelPackage``."""
+    entries = set(package.get_entry_names())
+    if MXQ_PACKAGE_MANIFEST_ENTRY not in entries:
+        raise ValueError(f"MXQ package {package.get_path()!r} has no {MXQ_PACKAGE_MANIFEST_ENTRY!r} entry.")
+    manifest = json.loads(bytes(package.load_entry(MXQ_PACKAGE_MANIFEST_ENTRY)).decode("utf-8"))
+    if not isinstance(manifest, dict) or "blocks" not in manifest or "lmHead" not in manifest:
+        raise ValueError(f"MXQ package {package.get_path()!r} has a manifest without 'blocks' / 'lmHead'.")
+    return manifest
+
+
+@dataclass(frozen=True)
+class MobilintMixtureOfExpertsPackageLayout:
+    """Entry names of a MoE MXQ package, read from its compiler manifest.
+
+    ``shared[l]`` and ``experts[l][e]`` are the MXQ entries of layer ``l``; ``residual_output[l]`` is the index of
+    the shared output the compiler's residual add consumes (the authoritative residual role); ``batch`` says whether
+    the package was compiled for BatchLLM (``BatchParam`` inference over several sequences).
+    """
+
+    shared: tuple[str, ...]
+    experts: tuple[tuple[str, ...], ...]
+    lm_head: str
+    residual_output: tuple[int, ...]
+    batch: bool
+
+    @classmethod
+    def from_manifest(cls, manifest: dict[str, Any], num_layers: int, num_experts: int) -> "MobilintMixtureOfExpertsPackageLayout":
+        blocks = sorted(manifest["blocks"], key=lambda block: int(block["idx"]))
+        if len(blocks) != num_layers:
+            raise ValueError(f"MXQ package manifest lists {len(blocks)} blocks, expected {num_layers} layers.")
+        shared: list[str] = []
+        experts: list[tuple[str, ...]] = []
+        residual_output: list[int] = []
+        for layer_idx, block in enumerate(blocks):
+            if int(block["idx"]) != layer_idx or block.get("type", "moe") != "moe":
+                raise ValueError(f"MXQ package manifest block {layer_idx} is {block.get('idx')!r}/{block.get('type')!r}.")
+            partitions = block["partitions"]
+            block_experts = sorted(partitions["experts"], key=lambda expert: int(expert["idx"]))
+            if [int(expert["idx"]) for expert in block_experts] != list(range(num_experts)):
+                raise ValueError(
+                    f"MXQ package manifest block {layer_idx} lists {len(block_experts)} experts, expected {num_experts}."
+                )
+            shared_outputs = list(partitions["shared"]["outputs"])
+            consumed = [name for name in block["cpuOps"]["residual"]["inputs"] if name in shared_outputs]
+            if len(shared_outputs) != 3 or len(consumed) != 1:
+                raise ValueError(
+                    f"MXQ package manifest block {layer_idx}: shared outputs {shared_outputs} and residual inputs "
+                    f"{block['cpuOps']['residual']['inputs']} do not identify one residual output."
+                )
+            shared.append(str(partitions["shared"]["file"]))
+            experts.append(tuple(str(expert["file"]) for expert in block_experts))
+            residual_output.append(shared_outputs.index(consumed[0]))
+        return cls(
+            shared=tuple(shared),
+            experts=tuple(experts),
+            lm_head=str(manifest["lmHead"]["file"]),
+            residual_output=tuple(residual_output),
+            batch=bool(manifest.get("batch", False)),
+        )
+
+    def entries(self) -> list[str]:
+        return [*self.shared, *(entry for layer in self.experts for entry in layer), self.lm_head]
 
 
 @dataclass(frozen=True)
@@ -485,9 +552,6 @@ class MobilintMixtureOfExpertsNPUBackend:
     loaded so far is disposed and the failure is re-raised as :class:`MobilintBackendAllocError`.
     """
 
-    max_batch_size = 1
-    k_per_model = 1
-
     def __init__(
         self,
         *,
@@ -503,7 +567,11 @@ class MobilintMixtureOfExpertsNPUBackend:
         shared_output_indices: Sequence[Optional[tuple[int, int, int]]],
         name_or_path: str = "",
         mxq_pack_index: Optional[str] = None,
+        mxq_package: Optional[str] = None,
+        max_batch_size: int = 1,
     ) -> None:
+        if mxq_pack_index and mxq_package:
+            raise ValueError("A MoE release is either packed (moe_mxq_pack_index) or an MXQ package (moe_mxq_package).")
         self.role_backends: dict[str, MobilintNPUBackend] = {
             "shared": shared_backend,
             "expert": expert_backend,
@@ -524,6 +592,21 @@ class MobilintMixtureOfExpertsNPUBackend:
         self.name_or_path = name_or_path
         self.mxq_pack_index = mxq_pack_index
         self.pack_index: Optional[MobilintMixtureOfExpertsPackIndex] = None
+        self.mxq_package = mxq_package
+        # Set by :meth:`create` for an MXQ package release: the opened package, its manifest and the entry layout.
+        self.package: Any = None
+        self.manifest: Optional[dict[str, Any]] = None
+        self.package_layout: Optional[MobilintMixtureOfExpertsPackageLayout] = None
+        # ``max_batch_size`` is the configured capacity until :meth:`launch` probes the compiled one. A release of
+        # individual MXQs (or a non-batch package) always serves one sequence; a BatchLLM package serves
+        # ``k_per_model`` sequences through ``BatchParam`` inference, one KV slot each.
+        self.max_batch_size = max(1, int(max_batch_size))
+        self.k_per_model = 1
+        self.is_batch = False
+        # Compiled per-step limits of a BatchLLM package: tokens per sequence per infer (the shared MXQs' input width)
+        # and tokens per infer over all sequences (the expert MXQs' input width). ``None`` on a non-batch release.
+        self.max_item_tokens: Optional[int] = None
+        self.max_step_tokens: Optional[int] = None
         self.revision: Optional[str] = None
         self._commit_hash: Optional[str] = None
 
@@ -607,11 +690,32 @@ class MobilintMixtureOfExpertsNPUBackend:
                 f"{self.num_experts} experts per layer."
             )
 
-    def _make_model_config(self, role: str, dev: int) -> ModelConfig:
+    def _make_model_config(self, role: str, dev: int, activation_slots: Optional[int] = None) -> ModelConfig:
         mc = ModelConfig()
         mc.set_single_core_mode(None, self.role_backends[role].filter_cores_for(dev))
-        mc.set_activation_slots(_ROLE_ACTIVATION_SLOTS[role])
+        mc.set_activation_slots(_ROLE_ACTIVATION_SLOTS[role] if activation_slots is None else activation_slots)
         return mc
+
+    def _activation_slots(self, role: str, layer_idx: int) -> int:
+        """Activation slots of one model.
+
+        Models driven through app-owned ``NPUData`` (``infer_npu_data``) need none. In a BatchLLM package the shared
+        MXQs, the post-slice experts of the last layer and the ``lm_head`` run through ``infer`` with ``BatchParam``
+        rows, which ``infer_npu_data`` cannot pass, so they keep one slot.
+        """
+        if not self.is_batch:
+            return _ROLE_ACTIVATION_SLOTS[role]
+        if role == "shared" or role == "lm_head" or self.is_post_slice_layer(layer_idx):
+            return 1
+        return 0
+
+    def is_post_slice_layer(self, layer_idx: int) -> bool:
+        """Whether layer ``layer_idx`` of a BatchLLM package emits one row per sequence instead of one per token.
+
+        The compiler slices the sequence down to each sequence's last token after the last shared MXQ's attention,
+        so that layer's experts and the ``lm_head`` see ``BatchParam`` rows of one token.
+        """
+        return self.is_batch and layer_idx == self.num_layers - 1
 
     # ---- Artifact resolution ------------------------------------------------------------------------------------
 
@@ -622,12 +726,18 @@ class MobilintMixtureOfExpertsNPUBackend:
         return template
 
     def shared_mxq_path(self, layer_idx: int) -> str:
+        if self.package_layout is not None:
+            return self.package_layout.shared[layer_idx]
         return self._role_template("shared").format(layer=layer_idx)
 
     def expert_mxq_path(self, layer_idx: int, expert_idx: int) -> str:
+        if self.package_layout is not None:
+            return self.package_layout.experts[layer_idx][expert_idx]
         return self._role_template("expert").format(layer=layer_idx, expert=expert_idx)
 
     def lm_head_mxq_path(self) -> str:
+        if self.package_layout is not None:
+            return self.package_layout.lm_head
         return self._role_template("lm_head")
 
     def _resolve_artifact_dir(self) -> str:
@@ -642,7 +752,9 @@ class MobilintMixtureOfExpertsNPUBackend:
         if not self.name_or_path:
             raise ValueError("MobilintMixtureOfExpertsNPUBackend.name_or_path is empty.")
 
-        if self.mxq_pack_index:
+        if self.mxq_package:
+            allow_patterns = [self.mxq_package]
+        elif self.mxq_pack_index:
             pack_dir = os.path.dirname(self.mxq_pack_index)
             pack_glob = f"{pack_dir}/*{MXQ_PACK_SUFFIX}" if pack_dir else f"*{MXQ_PACK_SUFFIX}"
             allow_patterns = sorted({self.lm_head_mxq_path(), self.mxq_pack_index, pack_glob})
@@ -670,6 +782,9 @@ class MobilintMixtureOfExpertsNPUBackend:
         A download that stopped halfway leaves some files behind; checking every expected file keeps the local-cache
         shortcut from treating such a snapshot as complete, so the next load resumes the download instead.
         """
+        if self.mxq_package:
+            # One file; qbruntime validates the package index (and so a truncated download) when it is opened.
+            return [] if os.path.isfile(os.path.join(root, self.mxq_package)) else [self.mxq_package]
         missing = [path for path in (self.lm_head_mxq_path(),) if not os.path.isfile(os.path.join(root, path))]
         if self.mxq_pack_index:
             index_path = os.path.join(root, self.mxq_pack_index)
@@ -704,7 +819,41 @@ class MobilintMixtureOfExpertsNPUBackend:
         if missing:
             shown = ", ".join(missing[:5]) + (f" and {len(missing) - 5} more" if len(missing) > 5 else "")
             raise FileNotFoundError(f"MoE release under {self.model_dir!r} is missing {shown}.")
+        if self.mxq_package:
+            self._open_package()
         self._created = True
+
+    def _open_package(self) -> None:
+        """Open the MXQ package, read its manifest and check it describes this release."""
+        assert self.model_dir is not None and self.mxq_package
+        package_path = os.path.join(self.model_dir, self.mxq_package)
+        try:
+            package_cls = qbruntime.ModelPackage
+        except AttributeError as exc:
+            raise RuntimeError(
+                "This MoE release is a qbruntime MXQ package (.mxqpkg), which needs mobilint-qb-runtime >= 1.6.0 "
+                f"(installed: {getattr(qbruntime, '__version__', 'unknown')})."
+            ) from exc
+        self.package = package_cls(package_path)
+        self.manifest = read_moe_package_manifest(self.package)
+        self.package_layout = MobilintMixtureOfExpertsPackageLayout.from_manifest(
+            self.manifest, self.num_layers, self.num_experts
+        )
+        self.is_batch = self.package_layout.batch
+        if not self.is_batch and self.max_batch_size > 1:
+            logger.warning(
+                "config.max_batch_size=%d but %s is not a BatchLLM package; serving one sequence at a time.",
+                self.max_batch_size,
+                self.mxq_package,
+            )
+            self.max_batch_size = 1
+        for layer_idx, residual_idx in enumerate(self.package_layout.residual_output):
+            configured = self._configured_output_indices[layer_idx]
+            if configured is not None and configured[0] != residual_idx:
+                raise ValueError(
+                    f"moe_shared_output_order places the residual of shared[{layer_idx}] at output {configured[0]}, "
+                    f"but the package manifest's residual add consumes output {residual_idx}."
+                )
 
     def _load_pack_index(self) -> None:
         """Load the pack index and check every layer pack exists with exactly the size the index describes."""
@@ -735,12 +884,14 @@ class MobilintMixtureOfExpertsNPUBackend:
 
         model_dir = self.model_dir
         packed = self.pack_index is not None
+        package = self.package
         reader = (
             _MxqPackReader(os.path.join(model_dir, self.mxq_pack_index), self.pack_index)  # type: ignore[arg-type]
             if packed
             else None
         )
-        # ``path`` is a file under ``model_dir``, or ``None`` for a member materialized from its layer pack.
+        # ``path`` is a file under ``model_dir`` (an entry name of the MXQ package when ``package`` is set), or
+        # ``None`` for a member materialized from its layer pack.
         plan: list[tuple[str, int, int, int, Optional[str]]] = []
         for layer_idx in range(self.num_layers):
             plan.append(
@@ -767,11 +918,14 @@ class MobilintMixtureOfExpertsNPUBackend:
         devices = sorted({item[3] for item in plan})
         try:
             self.accs = {dev: Accelerator(self.target_device, dev) for dev in devices}
+            # One ``ModelConfig`` per (role, device, activation slots): a BatchLLM package gives some models of a
+            # role a slot and others none (see :meth:`_activation_slots`).
             configs = {
-                (role, dev): self._make_model_config(role, dev)
+                (role, dev, slots): self._make_model_config(role, dev, slots)
                 for role in self.role_backends
                 for dev in devices
                 if dev in self._role_cores_by_device(role)
+                for slots in (0, 1)
             }
         except BaseException:
             # Nothing is loaded yet, but the accelerators already hold their devices.
@@ -811,7 +965,13 @@ class MobilintMixtureOfExpertsNPUBackend:
                         model_path, release = reader.materialize(layer_idx, member_idx, name)
                     else:
                         model_path = os.path.join(model_dir, path)
-                    model = Model(model_path, configs[(role, dev)])
+                    config = configs[(role, dev, self._activation_slots(role, layer_idx))]
+                    if package is not None and path is not None:
+                        # ``ModelPackage.create_model`` reads the entry from the package without unpacking it; the
+                        # package object may be used from several threads at once.
+                        model = package.create_model(path, config)
+                    else:
+                        model = Model(model_path, config)
                     with loaded_lock:
                         loaded.append(model)
                     phase = "launch"
@@ -866,6 +1026,8 @@ class MobilintMixtureOfExpertsNPUBackend:
         # loaded models are not reachable from ``self`` until this succeeds, so roll back here as well.
         try:
             self.lm_head = lm_head[0]
+            if self.is_batch:
+                self._probe_batch_capacity(shared[0], experts[0][0])  # type: ignore[arg-type]
             for layer_idx in range(self.num_layers):
                 self.layers.append(self._build_layer(layer_idx, shared[layer_idx], experts[layer_idx]))  # type: ignore[arg-type]
             self._allocate_shared_buffers()
@@ -874,6 +1036,30 @@ class MobilintMixtureOfExpertsNPUBackend:
         except BaseException as exc:
             self._rollback(loaded)
             self._raise_load_failure(exc, phase="allocate", slot=len(plan), dev=-1, launched=launched[0], total=len(plan))
+
+    def _probe_batch_capacity(self, shared: Model, expert: Model) -> None:
+        """Read the compiled batch limits of a BatchLLM package off its first shared and expert MXQ.
+
+        ``k_per_model`` is the KV entries of the shared MXQs (``CacheInfo.num_batches``); ``max_item_tokens`` the
+        tokens one sequence may feed per step (the shared input width); ``max_step_tokens`` the tokens of every
+        sequence together per step (the expert input width, since every routed token of a step reaches the experts).
+        """
+        cache_infos = list(shared.get_cache_infos())
+        if not cache_infos:
+            raise ValueError("The BatchLLM package's shared MXQ reports no KV cache; cannot size the batch.")
+        k_per_model = min(int(info.num_batches) for info in cache_infos)
+        if k_per_model < 1:
+            raise ValueError(f"The BatchLLM package's shared MXQ reports {k_per_model} KV entries.")
+        if self.max_batch_size != k_per_model:
+            logger.warning(
+                "config.max_batch_size=%d but the MXQ package was compiled for %d sequences; using %d.",
+                self.max_batch_size,
+                k_per_model,
+                k_per_model,
+            )
+        self.k_per_model = self.max_batch_size = k_per_model
+        self.max_item_tokens = max(1, int(shared.get_input_buffer_info()[0].max_width))
+        self.max_step_tokens = max(self.max_item_tokens, int(expert.get_input_buffer_info()[0].max_width))
 
     def _rollback(self, loaded: Sequence[Model]) -> None:
         """Release every buffer and model of a failed :meth:`launch`."""
@@ -1015,43 +1201,57 @@ class MobilintMixtureOfExpertsNPUBackend:
         """Resolve ``(residual, expert_in, gate)`` for one layer.
 
         ``config.moe_shared_output_order`` is authoritative; the quantization scales only cross-check it. Without a
-        configured order, the gate is the output with ``num_experts`` channels and ``expert_in`` the output whose
-        scale is the reciprocal of the expert input scale.
+        configured order, the gate is the output with ``num_experts`` channels. The residual is the one an MXQ
+        package manifest names, leaving ``expert_in`` as the third output; without a manifest, ``expert_in`` is the
+        output whose scale is the reciprocal of the expert input scale.
         """
         output_shapes = shared.get_model_output_shape()
         if len(output_shapes) != 3:
             raise ValueError(f"shared[{layer_idx}] must have 3 outputs, got {len(output_shapes)}.")
         configured = self._configured_output_indices[layer_idx]
+        manifest_residual = (
+            self.package_layout.residual_output[layer_idx] if self.package_layout is not None else None
+        )
         if configured is not None:
             residual_idx, expert_in_idx, gate_idx = configured
         else:
-            gate_candidates = [idx for idx, shape in enumerate(output_shapes) if int(shape[-1]) == self.num_experts]
+            gate_candidates = [
+                idx
+                for idx, shape in enumerate(output_shapes)
+                if int(shape[-1]) == self.num_experts and idx != manifest_residual
+            ]
             if len(gate_candidates) != 1:
                 raise ValueError(
                     f"Cannot identify the router gate output of shared[{layer_idx}] from shapes {output_shapes}; "
                     "set moe_shared_output_order in config.json."
                 )
             gate_idx = gate_candidates[0]
-            detected = self._detect_expert_in_index(shared, expert, gate_idx)
-            if detected is None:
-                raise ValueError(
-                    f"Cannot identify the expert input output of shared[{layer_idx}] from its quantization "
-                    "scales (no output, or more than one, matches); set moe_shared_output_order in config.json."
-                )
-            expert_in_idx = detected
-            residual_idx = ({0, 1, 2} - {gate_idx, expert_in_idx}).pop()
+            if manifest_residual is not None:
+                # The manifest's residual add is authoritative, so scales that also match the residual cannot
+                # block the launch or swap the roles.
+                residual_idx = manifest_residual
+                expert_in_idx = ({0, 1, 2} - {gate_idx, residual_idx}).pop()
+            else:
+                detected = self._detect_expert_in_index(shared, expert, gate_idx)
+                if detected is None:
+                    raise ValueError(
+                        f"Cannot identify the expert input output of shared[{layer_idx}] from its quantization "
+                        "scales (no output, or more than one, matches); set moe_shared_output_order in config.json."
+                    )
+                expert_in_idx = detected
+                residual_idx = ({0, 1, 2} - {gate_idx, expert_in_idx}).pop()
 
         if int(output_shapes[gate_idx][-1]) != self.num_experts:
             raise ValueError(
                 f"shared[{layer_idx}] output {gate_idx} has {int(output_shapes[gate_idx][-1])} channels but the "
                 f"router gate must have num_experts={self.num_experts}; check moe_shared_output_order."
             )
-        if configured is not None:
+        if configured is not None or manifest_residual is not None:
             detected = self._detect_expert_in_index(shared, expert, gate_idx)
             if detected is not None and detected != expert_in_idx:
                 logger.warning(
-                    "shared[%d]: moe_shared_output_order places expert_in at output %d but the quantization "
-                    "scales point to output %d.",
+                    "shared[%d]: the configured order or package manifest places expert_in at output %d but the "
+                    "quantization scales point to output %d.",
                     layer_idx,
                     expert_in_idx,
                     detected,
@@ -1060,8 +1260,11 @@ class MobilintMixtureOfExpertsNPUBackend:
 
     def _build_layer(self, layer_idx: int, shared: Model, experts: list[Model]) -> MobilintMixtureOfExpertsLayer:
         residual_idx, expert_in_idx, gate_idx = self._resolve_output_indices(layer_idx, shared, experts[0])
-        # The final shared MXQ may be compiled to emit only the last token (only it feeds the lm_head).
-        last_only = int(shared.get_model_output_shape()[0][_MXQ_TOKEN_AXIS_INDEX]) == 1
+        # The final shared MXQ may be compiled to emit only the last token (only it feeds the lm_head). A BatchLLM
+        # package keeps a dynamic token axis there and slices to one row per sequence instead.
+        last_only = self.is_post_slice_layer(layer_idx) or (
+            int(shared.get_model_output_shape()[0][_MXQ_TOKEN_AXIS_INDEX]) == 1
+        )
         return MobilintMixtureOfExpertsLayer(
             shared=shared,
             experts=experts,
@@ -1076,6 +1279,11 @@ class MobilintMixtureOfExpertsNPUBackend:
         return self.num_experts if output_idx == layer.gate_idx else self.hidden_size
 
     def _allocate_shared_buffers(self) -> None:
+        if self.is_batch:
+            # A BatchLLM package runs its shared MXQs, post-slice experts and lm_head through ``infer`` with
+            # ``BatchParam`` rows, and the other experts through per-call ``NPUData`` (``experts_forward_chunk``), so
+            # none of the single-token buffers below are used.
+            return
         hidden = self.hidden_size
         expert_devices = self.expert_devices
         for layer in self.layers:
@@ -1298,6 +1506,88 @@ class MobilintMixtureOfExpertsNPUBackend:
     def lm_head_forward(self, hidden_states: np.ndarray) -> np.ndarray:
         """Run the ``lm_head`` on one ``[hidden]`` hidden state and return ``[vocab]`` logits."""
         assert self.lm_head is not None, "launch() must run before inference."
+        if self.is_batch:
+            return self.lm_head_forward_rows(hidden_states.reshape(1, self.hidden_size))[0]
         self._host_lm_head_in[:] = hidden_states.reshape(1, 1, self.hidden_size)
         self.npu_clock.call(self.lm_head.infer_npu_data, [self._host_lm_head_in], [self._host_lm_head_out])
         return np.array(self._host_lm_head_out[:], dtype=np.float32)[0, 0]
+
+    # ---- BatchLLM package primitives ----------------------------------------------------------------------------
+    #
+    # A BatchLLM package runs several sequences per step. The shared MXQs take the sequences' tokens concatenated
+    # along the token axis plus one ``BatchParam`` per sequence (its token count, KV length and KV slot); the
+    # experts of every layer but the last take the routed tokens of all sequences at once through ``NPUData``; the
+    # last layer's experts and the ``lm_head`` are post-slice models that take one row per sequence as
+    # ``BatchParam`` rows of a single token.
+
+    @staticmethod
+    def _row_params(n_rows: int) -> list[Any]:
+        return [qbruntime.BatchParam(sequence_length=1, cache_size=0, cache_id=row) for row in range(n_rows)]
+
+    def shared_forward_batch(
+        self, layer_idx: int, hidden_states: np.ndarray, params: Sequence[Any]
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Run ``shared[layer_idx]`` on the concatenated ``[T, hidden]`` tokens of the sequences in ``params``.
+
+        Returns ``(residual, gate, expert_in)`` as ``[rows, C]`` float32 arrays: ``rows == T`` on a per-token layer,
+        one row per sequence (in ``params`` order) on the post-slice last layer.
+        """
+        assert self.is_batch, "shared_forward_batch needs a BatchLLM package."
+        layer = self.layers[layer_idx]
+        inputs = [np.ascontiguousarray(hidden_states, dtype=np.float32).reshape(1, -1, self.hidden_size)]
+        outputs = self.npu_clock.call(layer.shared.infer, inputs, None, 0, list(params))
+        if outputs is None:
+            raise RuntimeError(f"shared[{layer_idx}] infer returned None.")
+
+        def rows(output_idx: int, channels: int) -> np.ndarray:
+            return np.asarray(outputs[output_idx], dtype=np.float32).reshape(-1, channels)
+
+        return (
+            rows(layer.residual_idx, self.hidden_size),
+            rows(layer.gate_idx, self.num_experts),
+            rows(layer.expert_in_idx, self.hidden_size),
+        )
+
+    def _infer_expert_rows(self, layer_idx: int, expert_idx: int, tokens: np.ndarray) -> np.ndarray:
+        # Runs on a worker; ``infer`` releases the GIL so the selected experts overlap across devices.
+        n_rows = int(tokens.shape[0])
+        inputs = [np.ascontiguousarray(tokens, dtype=np.float32).reshape(1, n_rows, self.hidden_size)]
+        outputs = self.npu_clock.call(
+            self.layers[layer_idx].experts[expert_idx].infer, inputs, None, 0, self._row_params(n_rows)
+        )
+        if outputs is None:
+            raise RuntimeError(f"expert[{layer_idx}][{expert_idx}] infer returned None.")
+        return np.asarray(outputs[0], dtype=np.float32).reshape(n_rows, self.hidden_size)
+
+    def experts_forward_rows(
+        self, layer_idx: int, expert_inputs: dict[int, np.ndarray]
+    ) -> Iterator[tuple[int, np.ndarray]]:
+        """Run each post-slice expert on its routed rows ``{expert_idx: [n_rows, hidden]}`` (one token each).
+
+        Yields ``(expert_idx, output[n_rows, hidden])`` in completion order.
+        """
+        assert self._expert_pool is not None, "launch() must run before inference."
+        futures = {
+            self._expert_pool.submit(self._infer_expert_rows, layer_idx, expert_idx, tokens): expert_idx
+            for expert_idx, tokens in expert_inputs.items()
+        }
+        for future in as_completed(futures):
+            yield futures[future], future.result()
+
+    def experts_forward_routed(
+        self, layer_idx: int, expert_inputs: dict[int, np.ndarray]
+    ) -> Iterator[tuple[int, np.ndarray]]:
+        """Run the experts of ``layer_idx`` on their routed tokens, by whichever path the layer's models take."""
+        if self.is_post_slice_layer(layer_idx):
+            return self.experts_forward_rows(layer_idx, expert_inputs)
+        return self.experts_forward_chunk(layer_idx, expert_inputs)
+
+    def lm_head_forward_rows(self, hidden_states: np.ndarray) -> np.ndarray:
+        """Run the ``lm_head`` on ``[n_rows, hidden]`` last-token states and return ``[n_rows, vocab]`` logits."""
+        assert self.lm_head is not None, "launch() must run before inference."
+        n_rows = int(hidden_states.shape[0])
+        inputs = [np.ascontiguousarray(hidden_states, dtype=np.float32).reshape(1, n_rows, self.hidden_size)]
+        outputs = self.npu_clock.call(self.lm_head.infer, inputs, None, 0, self._row_params(n_rows))
+        if outputs is None:
+            raise RuntimeError("lm_head infer returned None.")
+        return np.asarray(outputs[0], dtype=np.float32).reshape(n_rows, self.vocab_size)

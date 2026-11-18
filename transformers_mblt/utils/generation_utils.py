@@ -3,7 +3,7 @@ import inspect
 import threading
 from abc import ABC
 from functools import lru_cache, wraps
-from typing import Any, Callable, Dict, Mapping, MutableMapping, Optional, cast
+from typing import Any, Callable, Dict, Mapping, MutableMapping, Optional, Sequence, cast
 
 import qbruntime
 import torch
@@ -617,28 +617,58 @@ class MobilintGenerationMixin(ABC, GenerationMixin):
 class MobilintMixtureOfExpertsGenerationMixin(MobilintGenerationMixin):
     """Generation mixin for Mixture-of-Experts releases; pairs with :class:`MobilintMixtureOfExpertsModelMixin`.
 
-    The KV cache lives inside every per-layer ``shared`` MXQ, which holds exactly one sequence, so generation always
-    runs on a :class:`MobilintMixtureOfExpertsCache` with ``batch_size == 1``. A caller-supplied cache continues where
-    it left off even if another cache ran in between: the forward saves and restores the shared MXQs' KV.
+    The KV cache lives inside every per-layer ``shared`` MXQ, so generation always runs on a
+    :class:`MobilintMixtureOfExpertsCache`. A release of individual MXQs holds one sequence (``batch_size == 1``); a
+    BatchLLM MXQ package holds ``max_batch_size`` sequences, one KV slot each, and ``generate`` may run that many
+    prompts at once (left-padded, as the tokenizer pads for batched generation). A caller-supplied cache continues
+    where it left off even if another cache ran in between: the forward saves and restores the shared MXQs' KV.
     """
 
     def get_cache_mxq_model(self) -> None:
         """MoE releases have no single cache MXQ, so the single-model fake-prefill benchmark path does not apply."""
         return None
 
-    @staticmethod
-    def _require_single_batch(batch_size: int) -> None:
-        if int(batch_size) > 1:
-            raise ValueError(f"Mixture-of-Experts releases support only batch_size=1, got {batch_size}.")
+    def _moe_capacity(self) -> int:
+        """Sequences the release serves at once: the shared MXQs' KV entries."""
+        return max(1, int(getattr(cast(Any, self).npu_backend, "max_batch_size", 1) or 1))
 
-    def _new_moe_cache(self) -> MobilintMixtureOfExpertsCache:
-        return MobilintMixtureOfExpertsCache(cast(Any, self).get_shared_mxq_models(), owner=cast(Any, self).npu_backend)
+    def _require_batch_size(self, batch_size: int) -> None:
+        capacity = self._moe_capacity()
+        if int(batch_size) > capacity:
+            if capacity == 1:
+                raise ValueError(
+                    f"This Mixture-of-Experts release serves one sequence at a time, got batch_size={batch_size}. "
+                    "Batched generation needs a BatchLLM MXQ package release."
+                )
+            raise ValueError(
+                f"This Mixture-of-Experts release serves at most {capacity} sequences at once (its compiled batch), "
+                f"got batch_size={batch_size}."
+            )
+
+    # Kept for callers written against the single-sequence releases.
+    _require_single_batch = _require_batch_size
+
+    def _new_moe_cache(self, batch_size: Optional[int] = None, slots: Optional[Sequence[int]] = None) -> MobilintMixtureOfExpertsCache:
+        """A fresh cache of ``batch_size`` rows (default: one per KV slot) on ``slots`` (default: ``0 .. rows - 1``)."""
+        capacity = self._moe_capacity()
+        if slots is None:
+            rows = capacity if batch_size is None else int(batch_size)
+            self._require_batch_size(rows)
+            slots = range(rows)
+        return MobilintMixtureOfExpertsCache(
+            cast(Any, self).get_shared_mxq_models(),
+            owner=cast(Any, self).npu_backend,
+            batch_size=capacity,
+            slots=list(slots),
+        )
 
     def _cache_matches_backend(self, cache: MobilintMixtureOfExpertsCache) -> bool:
         """Return True when ``cache`` was built for this model's live shared MXQs (not another model or launch)."""
         shared_models = cast(Any, self).get_shared_mxq_models()
-        return len(cache.shared_mxq_models) == len(shared_models) and all(
-            cached is live for cached, live in zip(cache.shared_mxq_models, shared_models)
+        return (
+            len(cache.shared_mxq_models) == len(shared_models)
+            and all(cached is live for cached, live in zip(cache.shared_mxq_models, shared_models))
+            and int(getattr(cache, "k_per_model", 1)) == self._moe_capacity()
         )
 
     def _cache_layout_matches(self, cache: MobilintMixtureOfExpertsCache) -> bool:
@@ -660,19 +690,28 @@ class MobilintMixtureOfExpertsGenerationMixin(MobilintGenerationMixin):
             return False
         return True
 
-    def build_mobilint_cache(self, batch_size: int = 1) -> MobilintMixtureOfExpertsCache:
-        """Return a fresh cache for callers that drive generation themselves (the TPS fake-prefill decode sweep)."""
-        self._require_single_batch(batch_size)
-        return self._new_moe_cache()
+    def build_mobilint_cache(
+        self, batch_size: int = 1, slots: Optional[Sequence[int]] = None
+    ) -> MobilintMixtureOfExpertsCache:
+        """Return a fresh cache for callers that drive generation themselves.
+
+        ``batch_size`` rows on KV slots ``0 .. batch_size - 1`` (the TPS fake-prefill decode sweep), or one row per
+        entry of ``slots`` (a serving engine keeping one cache per request on the slot it assigned; join a step's
+        caches with :meth:`MobilintMixtureOfExpertsCache.from_rows`).
+        """
+        return self._new_moe_cache(batch_size, slots)
 
     # Function arguments changed for transformers>=4.56.0; see MobilintGenerationMixin._get_cache.
     def _get_cache(
         self, cache_implementation: str, batch_size: int, max_cache_len: int, *args
     ) -> MobilintMixtureOfExpertsCache:
-        self._require_single_batch(batch_size)
+        self._require_batch_size(batch_size)
         existing_cache = getattr(self, "_cache", None)
-        if not isinstance(existing_cache, MobilintMixtureOfExpertsCache) or not self._cache_matches_backend(
-            existing_cache
+        # The model's own cache spans every KV slot, so any batch up to the capacity reuses it (row ``j`` on slot ``j``).
+        if (
+            not isinstance(existing_cache, MobilintMixtureOfExpertsCache)
+            or not self._cache_matches_backend(existing_cache)
+            or existing_cache.batch_size < self._moe_capacity()
         ):
             self._cache = self._new_moe_cache()
         else:
@@ -690,7 +729,7 @@ class MobilintMixtureOfExpertsGenerationMixin(MobilintGenerationMixin):
         *args,
     ) -> bool:
         del generation_config, assistant_model, args
-        self._require_single_batch(batch_size)
+        self._require_batch_size(batch_size)
         cache_name = "past_key_values"
         current = model_kwargs.get(cache_name)
         if not isinstance(current, MobilintMixtureOfExpertsCache):

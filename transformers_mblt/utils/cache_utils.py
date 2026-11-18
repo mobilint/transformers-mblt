@@ -1771,34 +1771,172 @@ class MobilintMixtureOfExpertsCache(Cache):
     every layer; ``layers[0]`` is the authoritative cursor, matching the single-entry ``MobilintCache`` API
     (callers that rewind with ``cache.layers[0]._seen_tokens = n`` keep working).
 
-    Only ``batch_size == 1`` is supported: each shared MXQ hosts a single cache entry.
+    Slots follow :class:`MobilintCache`: every shared MXQ holds ``k_per_model`` KV entries (``1`` for a release of
+    individual MXQs, the compiled BatchLLM capacity for an MXQ package, see
+    ``MobilintMixtureOfExpertsConfigMixin.max_batch_size``), and row ``r`` of the cache lives in KV slot
+    ``slot_of(r)[1]`` (the ``BatchParam.cache_id``) of every shared MXQ. There is one chain of shared MXQs, so
+    ``n_models == 1`` and ``slot_of`` always reports model ``0``. ``rows[r][l]`` is the :class:`MobilintLayer` of
+    row ``r`` in ``shared[l]``; ``shared_layers`` is row 0, the single-sequence view older callers use. A serving
+    engine keeps one single-row cache per request on the slot it assigned (``slots=[s]``) and joins the step's
+    requests with :meth:`from_rows`, exactly as with :class:`MobilintCache`.
 
-    The shared MXQs hold one sequence at a time. Like :class:`MobilintCache`, the cache is portable: before every
-    forward the model binds all shared layers (see :mod:`transformers_mblt.utils.cache_residency`), so a cache that
-    another sequence displaced is saved and restored instead of reset, and a cache can move to another instance of
-    the same release. ``owner`` is accepted for compatibility, unused, and held weakly so a cache that moved away
-    never keeps its source backend alive.
+    Like :class:`MobilintCache`, the cache is portable: before every forward the model binds its rows (see
+    :mod:`transformers_mblt.utils.cache_residency`), so a cache that another sequence displaced is saved and
+    restored instead of reset, and a cache can move to another instance of the same release. ``owner`` is accepted
+    for compatibility, unused, and held weakly so a cache that moved away never keeps its source backend alive.
     """
 
-    def __init__(self, shared_mxq_models: Sequence[qbruntime.Model], owner: Any = None) -> None:
+    def __init__(
+        self,
+        shared_mxq_models: Sequence[qbruntime.Model],
+        owner: Any = None,
+        batch_size: int = 1,
+        *,
+        slots: Optional[Sequence[int]] = None,
+    ) -> None:
+        """Create a cache on ``slots`` (default: every slot ``0 .. batch_size - 1``) of ``batch_size`` KV entries.
+
+        Args:
+            shared_mxq_models: The per-layer ``shared`` MXQs holding the KV cache.
+            owner: Unused compatibility argument (held weakly).
+            batch_size: KV entries per shared MXQ (``k_per_model``), the compiled capacity of the release.
+            slots: Place row ``i`` on KV slot ``slots[i]`` instead of one row per slot. The cache then has
+                ``len(slots)`` rows; slots must be distinct and below ``batch_size``.
+        """
         if not shared_mxq_models:
             raise ValueError("shared_mxq_models must contain at least one Model")
+        k_per_model = int(batch_size)
+        if k_per_model < 1:
+            raise ValueError(f"batch_size must be >= 1, got {k_per_model}")
+        if slots is None:
+            row_slots = list(range(k_per_model))
+        else:
+            row_slots = [int(slot) for slot in slots]
+            if not row_slots:
+                raise ValueError("slots must name at least one KV slot")
+            if len(set(row_slots)) != len(row_slots):
+                raise ValueError(f"slots must be distinct, got {row_slots}")
+            for slot in row_slots:
+                if not 0 <= slot < k_per_model:
+                    raise ValueError(f"slot {slot} is outside the cache's {k_per_model} KV entries")
         self.owner = owner
         self.shared_mxq_models: List[qbruntime.Model] = list(shared_mxq_models)
-        self.shared_layers: list[MobilintLayer] = [MobilintLayer(model, 0) for model in self.shared_mxq_models]
+        self.k_per_model: int = k_per_model
+        self.n_models: int = 1
+        self._row_slots: list[int] = row_slots
+        self.rows: list[list[MobilintLayer]] = [
+            [MobilintLayer(model, slot) for model in self.shared_mxq_models] for slot in row_slots
+        ]
         self._tag_layers()
-        self.layers = [self.shared_layers[0]]
+        self.layers = [self.rows[0][0]]
         self.layer_classes = MobilintLayer
         self.num_hidden_layers = 1
         self.cache_processor = None
+        # Whether the rows were joined from request caches by ``from_rows``.
+        self.joined_rows = False
+
+    @property
+    def shared_layers(self) -> list[MobilintLayer]:
+        """Row 0's per-layer entries: the single-sequence view."""
+        return self.rows[0]
 
     @property
     def batch_size(self) -> int:
-        return 1
+        """Rows of this cache."""
+        return len(self.rows)
 
     @property
     def max_batch_size(self) -> int:
-        return 1
+        """KV entries of every shared MXQ, the most rows one forward can run."""
+        return self.k_per_model
+
+    @property
+    def mxq_models(self) -> List[qbruntime.Model]:
+        """The shared MXQs, under the name topology checks written for :class:`MobilintCache` read."""
+        return self.shared_mxq_models
+
+    def slot_of(self, row: int) -> Tuple[int, int]:
+        """Return ``(model_idx, cache_id)`` of a row; the model index is always ``0`` (one chain of shared MXQs)."""
+        return 0, self._row_slots[self._check_row(row)]
+
+    def model_of(self, row: int) -> qbruntime.Model:
+        """Return the first shared MXQ (the chain's representative) for API parity with :class:`MobilintCache`."""
+        self._check_row(row)
+        return self.shared_mxq_models[0]
+
+    def group_by_model(self, rows: Iterable[int]) -> Dict[int, List[Tuple[int, int]]]:
+        """Group rows by owning model: ``{0: [(row, cache_id), ...]}`` in the input order."""
+        return {0: [(int(row), self.slot_of(row)[1]) for row in rows]}
+
+    @classmethod
+    def from_rows(cls, caches: Sequence["MobilintMixtureOfExpertsCache"]) -> "MobilintMixtureOfExpertsCache":
+        """Return a batch cache whose row ``i`` is ``caches[i]``'s only row, shared rather than copied.
+
+        A serving engine keeps one cache per request and runs the requests of a step together; every request's cache
+        then advances by its own row. The rows keep their slots, so the requests must sit on distinct slots of the
+        same release.
+        """
+        caches = list(caches)
+        if not caches:
+            raise ValueError("from_rows needs at least one cache")
+        first = caches[0]
+        for cache in caches:
+            if type(cache) is not type(first):
+                raise TypeError(f"from_rows joins caches of one type; got {type(first).__name__} and {type(cache).__name__}")
+            if len(cache.rows) != 1:
+                raise ValueError(f"from_rows joins one-row caches; got a cache with {len(cache.rows)} rows")
+            if cache.k_per_model != first.k_per_model or len(cache.shared_mxq_models) != len(
+                first.shared_mxq_models
+            ) or any(mine is not theirs for mine, theirs in zip(cache.shared_mxq_models, first.shared_mxq_models)):
+                raise ValueError("from_rows joins caches of one release instance (the same shared MXQs)")
+        slots = [cache.slot_of(0)[1] for cache in caches]
+        if len(set(slots)) != len(slots):
+            raise ValueError(f"from_rows needs rows on distinct slots, got {slots}")
+        view = cls(first.shared_mxq_models, owner=first.owner, batch_size=first.k_per_model, slots=slots)
+        view.rows = [cache.rows[0] for cache in caches]
+        view.layers = [view.rows[0][0]]
+        view.joined_rows = True
+        return view
+
+    def _all_layers(self) -> Iterator[MobilintLayer]:
+        for row in self.rows:
+            yield from row
+
+    def _check_row(self, row: int) -> int:
+        row = int(row)
+        if not 0 <= row < len(self.rows):
+            raise ValueError(f"row {row} out of range for a MoE cache of {len(self.rows)} rows")
+        return row
+
+    @staticmethod
+    def _shared_models_of(backend: Any) -> list[Any]:
+        """The shared MXQs a backend exposes: a MoE NPU backend (``layers[*].shared``) or an adapter that names them."""
+        models = getattr(backend, "shared_mxq_models", None)
+        if models is None:
+            layers = getattr(backend, "layers", None) or []
+            models = [getattr(layer, "shared", None) for layer in layers]
+        return list(models)
+
+    def bind_rows(self, backend: Any, rows: Iterable[int]) -> None:
+        """Make the shared MXQs of ``backend`` hold the KV of ``rows`` before an infer reads and writes them."""
+        self._bind(self._shared_models_of(backend), rows)
+
+    def _bind(self, shared_models: list[Any], rows: Iterable[int]) -> None:
+        from .cache_residency import bind_cache_layers
+
+        if len(shared_models) != len(self.shared_mxq_models) or any(model is None for model in shared_models):
+            raise ValueError(
+                f"Cannot bind a cache of {len(self.shared_mxq_models)} shared layers to a backend with "
+                f"{len(shared_models)} shared MXQs."
+            )
+        self._sync_shared_layers()
+        row_indices = [self._check_row(row) for row in rows]
+        bind_cache_layers(
+            (layer, model, self._row_slots[row_idx])
+            for row_idx in row_indices
+            for layer, model in zip(self.rows[row_idx], shared_models)
+        )
+        self.shared_mxq_models = shared_models
 
     @property
     def owner(self) -> Any:
@@ -1813,129 +1951,144 @@ class MobilintMixtureOfExpertsCache(Cache):
 
     def _tag_layers(self) -> None:
         # Lets the backend's ``kv_owner`` map a slot's owner layer back to its cache.
-        for layer in self.shared_layers:
+        for layer in self._all_layers():
             layer._owner_cache = weakref.ref(self)
 
     @property
     def is_resident(self) -> bool:
-        return all(layer.is_resident for layer in self.shared_layers)
+        return all(layer.is_resident for layer in self._all_layers())
 
     @property
     def host_nbytes(self) -> int:
-        return sum(layer.host_nbytes for layer in self.shared_layers)
+        return sum(layer.host_nbytes for layer in self._all_layers())
 
     def offload(self) -> None:
         """Save every shared layer's KV to host memory and free the shared MXQs for other caches."""
         self._sync_shared_layers()
-        for layer in self.shared_layers:
+        for layer in self._all_layers():
             layer.offload()
 
     def discard(self) -> None:
         """Drop every shared layer's KV: free the shared MXQs without saving it, and reset the cache."""
-        for layer in self.shared_layers:
+        for layer in self._all_layers():
             residency.discard(layer)
         self.reset()
 
     def bind_shared(self, shared_models: Sequence[Any]) -> None:
-        """Make each shared MXQ hold this cache's KV before a forward, moving the cache to ``shared_models``."""
-        from .cache_residency import bind_cache_layers
-
-        shared_models = list(shared_models)
-        if len(shared_models) != len(self.shared_layers):
-            raise ValueError(
-                f"Cannot bind a cache of {len(self.shared_layers)} shared layers to a model with "
-                f"{len(shared_models)} shared MXQs."
-            )
-        self._sync_shared_layers()
-        bind_cache_layers((layer, model, 0) for layer, model in zip(self.shared_layers, shared_models))
-        self.shared_mxq_models = shared_models
+        """Make each shared MXQ hold this cache's KV (every row on its slot) before a forward, moving the cache to
+        ``shared_models``."""
+        self._bind(list(shared_models), range(len(self.rows)))
 
     def _sync_shared_layers(self) -> None:
-        """Propagate the ``layers[0]`` cursor to every shared layer."""
-        seq_length = self.shared_layers[0].get_seq_length()
-        for layer in self.shared_layers[1:]:
-            layer.set_seq_length(seq_length)
+        """Propagate each row's first-layer cursor to the row's other shared layers."""
+        for row in self.rows:
+            seq_length = row[0].get_seq_length()
+            for layer in row[1:]:
+                layer.set_seq_length(seq_length)
 
     def get_seq_length(self, index: int = 0) -> int:
-        del index
-        return self.shared_layers[0].get_seq_length()
+        return self.rows[self._check_row(index)][0].get_seq_length()
 
     def set_seq_length(self, sequence_lengths: Union[dict[int, int], int], index: int = 0) -> None:
-        del index
+        """Set the sequence length of row ``index`` (an ``int``) or of several rows (``{row: length}``)."""
         if isinstance(sequence_lengths, dict):
-            if list(sequence_lengths) != [0]:
-                raise ValueError(
-                    f"MobilintMixtureOfExpertsCache has a single cache entry; got cache ids {list(sequence_lengths)}"
-                )
-            sequence_lengths = sequence_lengths[0]
-        for layer in self.shared_layers:
+            for row_idx, seq_length in sequence_lengths.items():
+                for layer in self.rows[self._check_row(row_idx)]:
+                    layer.set_seq_length(int(seq_length))
+            return
+        for layer in self.rows[self._check_row(index)]:
             layer.set_seq_length(int(sequence_lengths))
 
     def fake_prefill(self, sequence_lengths: Union[dict[int, int], int], index: int = 0) -> None:
-        """Mark every shared layer as prefilled without restoring KV cache memory (decode TPS benchmarks).
+        """Mark shared layers as prefilled without restoring KV cache memory (decode TPS benchmarks).
 
         The KV contents are whatever the shared MXQs last held, so the decoded tokens are meaningless, but each step
         attends over ``sequence_lengths`` positions and the measured decode cost is the real one. The layers are
-        marked as holding no real KV, so binding them never dumps or loads.
+        marked as holding no real KV, so binding them never dumps or loads. An ``int`` applies to every row (as
+        :meth:`MobilintCache.fake_prefill` does); a ``{row: length}`` mapping applies to the rows it names.
         """
-        for layer in self.shared_layers:
-            layer.fake_prefill(0)
-        self.set_seq_length(sequence_lengths, index=index)
+        del index
+        if isinstance(sequence_lengths, dict):
+            for row_idx, seq_length in sequence_lengths.items():
+                for layer in self.rows[self._check_row(row_idx)]:
+                    layer.fake_prefill(int(seq_length))
+            return
+        for layer in self._all_layers():
+            layer.fake_prefill(int(sequence_lengths))
 
     def update_cache_position(self, cache_position: torch.Tensor, index: int = 0) -> None:
-        del index
         self._sync_shared_layers()
-        for layer in self.shared_layers:
+        for layer in self.rows[self._check_row(index)]:
             layer.update_cache_position(cache_position)
 
-    def update_seen_tokens(self, num_new_seen_tokens: int, index: int = 0) -> None:
-        del index
+    def update_seen_tokens(self, num_new_seen_tokens: Union[dict[int, int], int], index: int = 0) -> None:
+        """Advance row ``index`` by ``num_new_seen_tokens`` tokens, or several rows with ``{row: tokens}``."""
         self._sync_shared_layers()
-        for layer in self.shared_layers:
-            layer.update_seen_tokens(num_new_seen_tokens)
+        if isinstance(num_new_seen_tokens, dict):
+            for row_idx, count in num_new_seen_tokens.items():
+                for layer in self.rows[self._check_row(row_idx)]:
+                    layer.update_seen_tokens(int(count))
+            return
+        for layer in self.rows[self._check_row(index)]:
+            layer.update_seen_tokens(int(num_new_seen_tokens))
 
     def reset(self) -> None:
-        for layer in self.shared_layers:
+        for layer in self._all_layers():
             layer.reset()
 
     def crop(self, max_length: int) -> None:
         if max_length < 0:
             raise ValueError(f"max_length must be non-negative, got {max_length}")
-        self.set_seq_length(min(self.get_seq_length(), int(max_length)))
+        for row_idx in range(len(self.rows)):
+            self.set_seq_length(min(self.get_seq_length(row_idx), int(max_length)), index=row_idx)
 
     def reorder_cache(self, beam_idx: torch.LongTensor) -> None:
-        raise NotImplementedError("MobilintMixtureOfExpertsCache does not support beam search (batch_size=1).")
+        raise NotImplementedError("MobilintMixtureOfExpertsCache does not support beam search.")
 
     def dump_cache_memory(self) -> None:
         self._sync_shared_layers()
-        for layer in self.shared_layers:
+        for layer in self._all_layers():
             layer.dump_cache_memory()
 
     def load_cache_memory(self) -> None:
-        for layer in self.shared_layers:
+        for layer in self._all_layers():
             layer.load_cache_memory()
+
+    def _row_dir(self, cache_dir: str, row_idx: int) -> Path:
+        # A single-row cache keeps the historical ``layer_{l}`` layout; rows of a batch cache get a directory each.
+        return Path(cache_dir) if len(self.rows) == 1 else Path(cache_dir) / f"row_{row_idx}"
 
     def dump_cache_memory_to(self, cache_dir: str, index: int = 0) -> None:
         del index
         self._sync_shared_layers()
-        for layer_idx, layer in enumerate(self.shared_layers):
-            layer_dir = Path(cache_dir) / f"layer_{layer_idx}"
-            layer_dir.mkdir(parents=True, exist_ok=True)
-            layer.dump_cache_memory_to(str(layer_dir))
+        for row_idx, row in enumerate(self.rows):
+            for layer_idx, layer in enumerate(row):
+                layer_dir = self._row_dir(cache_dir, row_idx) / f"layer_{layer_idx}"
+                layer_dir.mkdir(parents=True, exist_ok=True)
+                layer.dump_cache_memory_to(str(layer_dir))
 
     def load_cache_memory_from(self, cache_dir: str, index: int = 0) -> None:
         del index
-        for layer_idx, layer in enumerate(self.shared_layers):
-            layer.load_cache_memory_from(str(Path(cache_dir) / f"layer_{layer_idx}"))
+        for row_idx, row in enumerate(self.rows):
+            for layer_idx, layer in enumerate(row):
+                layer.load_cache_memory_from(str(self._row_dir(cache_dir, row_idx) / f"layer_{layer_idx}"))
 
     def copy(self) -> "MobilintMixtureOfExpertsCache":
         """Return a snapshot: resident layers save their KV first, and the copy is loaded on its first forward."""
         self._sync_shared_layers()
-        copied = MobilintMixtureOfExpertsCache(self.shared_mxq_models, owner=self.owner)
-        copied.shared_layers = [layer.copy() for layer in self.shared_layers]
+        copied = MobilintMixtureOfExpertsCache(
+            self.shared_mxq_models, owner=self.owner, batch_size=self.k_per_model, slots=self._row_slots
+        )
+        copied.rows = [[layer.copy() for layer in row] for row in self.rows]
         copied._tag_layers()
-        copied.layers = [copied.shared_layers[0]]
+        copied.layers = [copied.rows[0][0]]
+        copied.joined_rows = self.joined_rows
         return copied
 
     def __repr__(self) -> str:
-        return f"MobilintMixtureOfExpertsCache(num_layers={len(self.shared_layers)}, seq_length={self.get_seq_length()})"
+        lengths = [self.get_seq_length(row_idx) for row_idx in range(len(self.rows))]
+        shown = lengths[0] if len(self.rows) == 1 else lengths
+        return (
+            f"MobilintMixtureOfExpertsCache(num_layers={len(self.shared_mxq_models)}, k_per_model={self.k_per_model}, "
+            f"slots={self._row_slots}, seq_length={shown})"
+        )

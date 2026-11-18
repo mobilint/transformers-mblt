@@ -3,7 +3,7 @@ import math
 import os
 import time
 import warnings
-from typing import TYPE_CHECKING, Any, Callable, Literal, NamedTuple, Optional, Sequence, Union, cast
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Literal, NamedTuple, Optional, Sequence, Union, cast
 
 import numpy as np
 import qbruntime
@@ -1813,8 +1813,15 @@ class MobilintMixtureOfExpertsModelMixin(MobilintModelMixin):
     parallel across devices, and adds the weighted expert outputs to the residual.
 
     Prefill runs ``npu_prefill_chunk_size`` tokens per shared MXQ call. A trailing partial chunk and every decode
-    step run one token at a time, which uses the preallocated seqlen=1 buffers. Only ``batch_size == 1`` is
-    supported.
+    step run one token at a time, which uses the preallocated seqlen=1 buffers. A release of individual MXQs
+    serves ``batch_size == 1``.
+
+    A BatchLLM MXQ package (``config.moe_mxq_package`` with ``max_batch_size > 1``) runs up to ``max_batch_size``
+    sequences per forward through :meth:`_moe_forward_batch`: every shared MXQ takes the sequences' tokens together
+    with one ``BatchParam`` per sequence, the routed tokens of all sequences are grouped by expert so each selected
+    expert runs once per layer and step, and the post-slice last layer and ``lm_head`` run one row per sequence.
+    Padded rows follow the ``attention_mask`` (left padding, as ``generate`` pads) and every row keeps its own KV
+    length in the cache.
     """
 
     config: MobilintMixtureOfExpertsConfigMixin
@@ -1836,6 +1843,8 @@ class MobilintMixtureOfExpertsModelMixin(MobilintModelMixin):
             shared_output_indices=[config.get_moe_shared_output_indices(layer_idx) for layer_idx in range(num_layers)],
             name_or_path=config.name_or_path,
             mxq_pack_index=config.moe_mxq_pack_index,
+            mxq_package=getattr(config, "moe_mxq_package", None),
+            max_batch_size=int(getattr(config, "max_batch_size", 1) or 1),
         )
 
     def get_mxq_model(self) -> None:
@@ -1843,7 +1852,11 @@ class MobilintMixtureOfExpertsModelMixin(MobilintModelMixin):
         return None
 
     def _bind_moe_cache(self, past_key_values: Optional[MobilintMixtureOfExpertsCache]) -> None:
-        """Make every shared MXQ hold ``past_key_values``' KV (or save and release it for a cacheless forward)."""
+        """Make every shared MXQ hold ``past_key_values``' KV (or save and release it for a cacheless forward).
+
+        Every row of the cache is bound to its KV slot. Without a cache, every slot a forward may write is saved
+        and left unowned.
+        """
         from .cache_residency import bind_cacheless
 
         backend = self.npu_backend
@@ -1851,7 +1864,8 @@ class MobilintMixtureOfExpertsModelMixin(MobilintModelMixin):
         if not shared_models or any(model is None for model in shared_models):
             return  # a backend double without shared MXQ handles
         if past_key_values is None:
-            bind_cacheless([(model, 0) for model in shared_models])
+            slots = range(max(1, int(getattr(backend, "k_per_model", 1) or 1)))
+            bind_cacheless([(model, slot) for model in shared_models for slot in slots])
             return
         past_key_values.bind_shared(shared_models)
 
@@ -1892,6 +1906,42 @@ class MobilintMixtureOfExpertsModelMixin(MobilintModelMixin):
         logits = backend.lm_head_forward(hidden[0, 0])
         return logits
 
+    def _moe_mix_experts(
+        self,
+        layer_idx: int,
+        residual: np.ndarray,
+        gate: np.ndarray,
+        expert_in: np.ndarray,
+        run_experts: Callable[[int, dict[int, np.ndarray]], Iterable[tuple[int, np.ndarray]]],
+    ) -> np.ndarray:
+        """Add the routed experts' weighted outputs to ``residual`` (``[rows, hidden]``, in place) and return it.
+
+        Every ``(row, slot)`` pair of the top-k routing is grouped by expert, so each selected expert runs once on
+        all of its rows (``run_experts(layer_idx, {expert_idx: rows})`` yields ``(expert_idx, outputs)`` in any
+        order), whatever sequence the rows belong to.
+        """
+        experts, weights = self._moe_route(gate)
+        n_tokens, top_k = experts.shape
+        # Group the (token, slot) pairs by expert: ``order`` lists the flattened pair indices sorted by expert, so
+        # each expert's rows are one contiguous slice of a single gather.
+        pairs = experts.reshape(-1)
+        order = np.argsort(pairs, kind="stable")
+        counts = np.bincount(pairs, minlength=gate.shape[-1])
+        bounds = np.concatenate(([0], np.cumsum(counts)))
+        gathered = expert_in[order // top_k, :]
+        expert_inputs = {
+            int(expert_idx): gathered[bounds[expert_idx] : bounds[expert_idx + 1]]
+            for expert_idx in np.flatnonzero(counts)
+        }
+        # Scatter every expert's rows back to pair order, then take each token's weighted sum in one pass.
+        pair_outputs = np.empty((n_tokens * top_k, residual.shape[-1]), dtype=np.float32)
+        for expert_idx, outputs in run_experts(layer_idx, expert_inputs):
+            pair_outputs[order[bounds[expert_idx] : bounds[expert_idx + 1]]] = outputs
+        residual += np.einsum(
+            "tkh,tk->th", pair_outputs.reshape(n_tokens, top_k, -1), weights.astype(np.float32, copy=False)
+        )
+        return residual
+
     def _moe_forward_chunk(
         self, hidden_states: np.ndarray, cache_size: int, kept: Sequence[int]
     ) -> dict[int, np.ndarray]:
@@ -1909,26 +1959,7 @@ class MobilintMixtureOfExpertsModelMixin(MobilintModelMixin):
                     f"shared[{layer_idx}] needs a {chunk_size}-token input but the previous layer is last-only."
                 )
             residual, gate, expert_in = backend.shared_forward_chunk(layer_idx, hidden, cache_size)
-            experts, weights = self._moe_route(gate[0])
-            n_tokens, top_k = experts.shape
-            # Group the (token, slot) pairs by expert: ``order`` lists the flattened pair indices sorted by expert, so
-            # each expert's rows are one contiguous slice of a single gather.
-            pairs = experts.reshape(-1)
-            order = np.argsort(pairs, kind="stable")
-            counts = np.bincount(pairs, minlength=gate.shape[-1])
-            bounds = np.concatenate(([0], np.cumsum(counts)))
-            gathered = expert_in[0, order // top_k, :]
-            expert_inputs = {
-                int(expert_idx): gathered[bounds[expert_idx] : bounds[expert_idx + 1]]
-                for expert_idx in np.flatnonzero(counts)
-            }
-            # Scatter every expert's rows back to pair order, then take each token's weighted sum in one pass.
-            pair_outputs = np.empty((n_tokens * top_k, residual.shape[-1]), dtype=np.float32)
-            for expert_idx, outputs in backend.experts_forward_chunk(layer_idx, expert_inputs):
-                pair_outputs[order[bounds[expert_idx] : bounds[expert_idx + 1]]] = outputs
-            residual[0] += np.einsum(
-                "tkh,tk->th", pair_outputs.reshape(n_tokens, top_k, -1), weights.astype(np.float32, copy=False)
-            )
+            self._moe_mix_experts(layer_idx, residual[0], gate[0], expert_in[0], backend.experts_forward_chunk)
             hidden = residual
 
         logits: dict[int, np.ndarray] = {}
@@ -1948,17 +1979,35 @@ class MobilintMixtureOfExpertsModelMixin(MobilintModelMixin):
         npu_prefill_chunk_size: Optional[int] = None,
         count_npu_time: bool = False,
         logits_to_keep: Union[int, torch.Tensor] = 1,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Chunked MoE prefill / decode with HF-style ``logits_to_keep``; returns ``[1, kept, vocab]`` logits.
+        """Chunked MoE prefill / decode with HF-style ``logits_to_keep``; returns ``[batch, kept, vocab]`` logits.
 
-        A chunk takes the batched path when it holds more than one token and, on a last-only release, keeps no
-        position other than its last one. Otherwise it runs one token at a time and only the kept positions pay for
-        the ``lm_head``.
+        A BatchLLM package release takes :meth:`_moe_forward_batch` (``attention_mask`` marks each row's real
+        tokens; ``None`` means every token is real). On a single-sequence release a chunk takes the batched path
+        when it holds more than one token and, on a last-only release, keeps no position other than its last one.
+        Otherwise it runs one token at a time and only the kept positions pay for the ``lm_head``.
         """
-        if inputs_embeds.dim() != 3 or inputs_embeds.shape[0] != 1:
+        if inputs_embeds.dim() != 3:
+            raise ValueError(f"inputs_embeds must be [batch, seq, hidden]; got {tuple(inputs_embeds.shape)}")
+        if getattr(self.npu_backend, "is_batch", False):
+            return self._moe_forward_batch(
+                inputs_embeds,
+                attention_mask,
+                past_key_values,
+                npu_prefill_chunk_size,
+                count_npu_time=count_npu_time,
+                logits_to_keep=logits_to_keep,
+            )
+        if inputs_embeds.shape[0] != 1:
             raise ValueError(
-                f"{type(self).__name__} supports only batch_size=1 inputs_embeds of shape [1, seq, hidden]; "
-                f"got {tuple(inputs_embeds.shape)}"
+                f"{type(self).__name__} supports only batch_size=1 inputs_embeds of shape [1, seq, hidden] on this "
+                f"release; got {tuple(inputs_embeds.shape)}. Batched generation needs a BatchLLM MXQ package."
+            )
+        if attention_mask is not None and not bool(torch.all(attention_mask == 1)):
+            raise NotImplementedError(
+                f"{type(self).__name__} supports only batch_size=1 without padding on this release; attention_mask "
+                "must be all ones."
             )
         seq_len = int(inputs_embeds.shape[1])
         chunk_size = self.resolve_npu_prefill_chunk_size(npu_prefill_chunk_size)
@@ -2014,3 +2063,138 @@ class MobilintMixtureOfExpertsModelMixin(MobilintModelMixin):
         stacked = np.stack([logits_by_position[position] for position in output_positions])
         # Match the input dtype like MobilintModelMixin.llm_forward (the backend always computes in float32).
         return torch.from_numpy(stacked).unsqueeze(0).to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+
+    # ---- BatchLLM MXQ package ------------------------------------------------------------------------------------
+
+    def _moe_batch_rows(
+        self, inputs_embeds: torch.Tensor, attention_mask: Optional[torch.Tensor]
+    ) -> list[torch.Tensor]:
+        """Split ``[batch, seq, hidden]`` into each row's real tokens.
+
+        A mask of the input's shape marks them (left padding, as ``generate`` pads). Any other mask shape (the
+        decode steps of ``generate`` pass the mask of the whole sequence with one new token) or no mask means every
+        position is real.
+        """
+        batch_size = int(inputs_embeds.shape[0])
+        if attention_mask is not None and tuple(attention_mask.shape) == tuple(inputs_embeds.shape[:2]):
+            mask = attention_mask.detach().to(device=inputs_embeds.device, dtype=torch.bool)
+            rows = [inputs_embeds[row_idx][mask[row_idx]] for row_idx in range(batch_size)]
+        else:
+            rows = [inputs_embeds[row_idx] for row_idx in range(batch_size)]
+        empty = [row_idx for row_idx, row in enumerate(rows) if int(row.shape[0]) == 0]
+        if empty:
+            raise ValueError(f"Batched MoE inputs contain empty sequences after applying attention_mask: rows {empty}")
+        return rows
+
+    def _moe_forward_batch(
+        self,
+        inputs_embeds: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        past_key_values: Optional[MobilintMixtureOfExpertsCache],
+        npu_prefill_chunk_size: Optional[int] = None,
+        count_npu_time: bool = False,
+        logits_to_keep: Union[int, torch.Tensor] = 1,
+    ) -> torch.Tensor:
+        """Run up to ``max_batch_size`` sequences through a BatchLLM package; returns ``[batch, 1, vocab]`` logits.
+
+        Each step feeds every unfinished row its next tokens: at most ``npu_prefill_chunk_size`` (capped by the
+        package's per-sequence width) per row and at most the package's per-step width over all rows, so a batch
+        of long prompts prefills in smaller slices than a single prompt would. A row's logits are its last token's,
+        taken from the step that fed its last token; rows that still prefill in that step contribute nothing. A
+        row's KV slot is its row of ``past_key_values`` (row ``j`` -> slot ``j`` without a cache) and its KV
+        length is that row's own.
+        """
+        backend = self.npu_backend
+        batch_size = int(inputs_embeds.shape[0])
+        capacity = int(backend.max_batch_size)
+        if batch_size > capacity:
+            raise ValueError(
+                f"{type(self).__name__} runs at most {capacity} sequences at once (the MXQ package's compiled batch); "
+                f"got {batch_size}."
+            )
+        rows = self._moe_batch_rows(inputs_embeds, attention_mask)
+        lengths = [int(row.shape[0]) for row in rows]
+        for row_idx, length in enumerate(lengths):
+            positions = self._output_positions_for_logits_to_keep(logits_to_keep, length)
+            if positions != [length - 1]:
+                raise NotImplementedError(
+                    "A BatchLLM MoE package returns only each sequence's last-token logits (logits_to_keep=1); "
+                    f"row {row_idx} asked for positions {positions} of {length}."
+                )
+        if past_key_values is not None:
+            if past_key_values.batch_size < batch_size:
+                raise ValueError(
+                    f"The cache has {past_key_values.batch_size} rows but the batch has {batch_size} sequences."
+                )
+            slots = [past_key_values.slot_of(row_idx)[1] for row_idx in range(batch_size)]
+            base_lengths = [int(past_key_values.get_seq_length(row_idx)) for row_idx in range(batch_size)]
+        else:
+            slots = list(range(batch_size))
+            base_lengths = [0] * batch_size
+        timing_phase: Literal["prefill", "decode"] = (
+            "prefill" if max(lengths) > 1 or any(base == 0 for base in base_lengths) else "decode"
+        )
+        chunk_size = self.resolve_npu_prefill_chunk_size(npu_prefill_chunk_size)
+        item_limit = max(1, min(chunk_size, int(backend.max_item_tokens or chunk_size)))
+        step_limit = max(item_limit, int(backend.max_step_tokens or item_limit * capacity))
+        # Every forward writes the shared MXQs' KV slots of its rows: make them hold this cache's rows first.
+        self._bind_moe_cache(past_key_values)
+
+        embeds = [row.detach().to(device="cpu", dtype=torch.float32).numpy() for row in rows]
+        logits = np.empty((batch_size, self._mxq_static_vocab_size()), dtype=np.float32)
+        fed = [0] * batch_size
+        self.npu_backend.npu_clock.pop_seconds()
+        while any(fed[row_idx] < lengths[row_idx] for row_idx in range(batch_size)):
+            active = [row_idx for row_idx in range(batch_size) if fed[row_idx] < lengths[row_idx]]
+            per_row = max(1, min(item_limit, step_limit // len(active)))
+            counts = [min(per_row, lengths[row_idx] - fed[row_idx]) for row_idx in active]
+            step_input = np.concatenate(
+                [embeds[row_idx][fed[row_idx] : fed[row_idx] + count] for row_idx, count in zip(active, counts)]
+            )
+            params = [
+                qbruntime.BatchParam(
+                    sequence_length=count, cache_size=base_lengths[row_idx] + fed[row_idx], cache_id=slots[row_idx]
+                )
+                for row_idx, count in zip(active, counts)
+            ]
+            step_logits = self._moe_step_batch(step_input, params, counts)
+            for position, (row_idx, count) in enumerate(zip(active, counts)):
+                fed[row_idx] += count
+                if fed[row_idx] == lengths[row_idx]:
+                    logits[row_idx] = step_logits[position]
+            if past_key_values is not None:
+                past_key_values.update_seen_tokens({row_idx: count for row_idx, count in zip(active, counts)})
+
+        npu_seconds = self.npu_backend.npu_clock.pop_seconds()
+        if count_npu_time:
+            self.npu_time = npu_seconds
+            self._record_npu_timing(timing_phase, npu_seconds)
+        else:
+            self.npu_time = None
+        return torch.from_numpy(logits).unsqueeze(1).to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+
+    def _moe_step_batch(self, hidden_states: np.ndarray, params: Sequence[Any], counts: Sequence[int]) -> np.ndarray:
+        """Run one batched step: ``[T, hidden]`` tokens of ``len(params)`` sequences -> ``[len(params), vocab]``.
+
+        Every layer runs its shared MXQ once on all tokens, groups the routed ``(token, slot)`` pairs of every
+        sequence by expert so each selected expert runs once, and adds the weighted expert outputs to the
+        residual. A per-token layer keeps ``T`` rows; the post-slice last layer keeps one row per sequence, so
+        the ``lm_head`` always sees one row per sequence.
+        """
+        backend = self.npu_backend
+        n_tokens = int(hidden_states.shape[0])
+        n_rows = len(params)
+        hidden = hidden_states
+        for layer_idx in range(backend.num_layers):
+            residual, gate, expert_in = backend.shared_forward_batch(layer_idx, hidden, params)
+            expected = n_rows if backend.is_post_slice_layer(layer_idx) else n_tokens
+            if int(residual.shape[0]) != expected:
+                raise RuntimeError(
+                    f"shared[{layer_idx}] returned {int(residual.shape[0])} rows for {n_tokens} tokens of {n_rows} "
+                    f"sequences; expected {expected}."
+                )
+            hidden = self._moe_mix_experts(layer_idx, residual, gate, expert_in, backend.experts_forward_routed)
+        if int(hidden.shape[0]) != n_rows:
+            # No post-slice layer: take each sequence's last token.
+            hidden = hidden[np.cumsum(np.asarray(counts, dtype=np.int64)) - 1]
+        return backend.lm_head_forward_rows(hidden)
