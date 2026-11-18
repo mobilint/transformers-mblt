@@ -75,7 +75,7 @@ LICENCES = {"apache-2.0": "Apache License 2.0", "mit": "MIT License"}
 # base needs --license-file.
 LICENSE_TEXTS = {"apache-2.0": Path(__file__).resolve().parent / "licenses" / "apache-2.0.txt"}
 TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "sentencepiece.bpe.model")
-MIN_TRANSFORMERS_MBLT = "0.7.3"
+MIN_TRANSFORMERS_MBLT = "0.8.0"
 TESTED_QBRUNTIME = "1.5.3"
 
 KINDS: dict[str, dict[str, Any]] = {

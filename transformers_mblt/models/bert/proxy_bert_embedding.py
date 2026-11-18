@@ -9,7 +9,7 @@ _MISSING = {
     "mblt_model_zoo.hf_transformers.models",
     "mblt_model_zoo.hf_transformers.models.bert",
 }
-# Releases before 0.7.3 have these modules without the embedding classes.
+# Releases before 0.8.0 have these modules without the embedding classes.
 _OLD_MODULES = {
     f"{package}.models.bert.{module}"
     for package in ("transformers_mblt", "mblt_model_zoo.hf_transformers")
@@ -47,8 +47,8 @@ except ImportError as exc:
         if not _missing(legacy_exc):
             raise
         raise ImportError(
-            "This model requires transformers-mblt 0.7.3 or later, which adds BERT embedding models. Please run: "
-            "pip install -U 'transformers-mblt>=0.7.3'"
+            "This model requires transformers-mblt 0.8.0 or later, which adds BERT embedding models. Please run: "
+            "pip install -U 'transformers-mblt>=0.8.0'"
         ) from legacy_exc
 
 
